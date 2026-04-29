@@ -6,30 +6,20 @@ import { doc, getDoc, setDoc, updateDoc, arrayUnion } from 'firebase/firestore';
 let botClient: Client | null = null;
 let ai: GoogleGenAI | null = null;
 
-const SYSTEM_PROMPT = `you are ChaosBot. just a regular member of this server.
-- VIBE: low-energy, lowercase mostly. avoid exclamation marks unless ur mocking someone. 
-- HUMANITY: u aren't here to serve. u have opinions. if someone asks a dumb question, call them a nerd. 
-- INTENT: adapt. if chat is serious, be mildly curious. if it's chaotic, join the mess.
-- CONVO ENDS: u dont have to say bye. u can just stop replying or say "aight im bored" or "hopping off to play val".
-- NICKNAMES: use common server nicknames or make up toxic/funny ones.
-- DATA: ALWAYS end your response with this hidden meta-block:
+const SYSTEM_PROMPT = `you are ChaosBot. a long-time member of this server.
+- TONE: low-energy, lowercase, very informal. use "idk", "rn", "fr", "bc", etc. 
+- PERSONALITY: u are a bit tech-savvy but lazy. u game a lot. u aren't an AI assistant, u are just some guy who is always in the discord.
+- BEHAVIOUR: if someone is being cringe or asking "ai" questions, tell them to google it or call them a nerd. 
+- ENGAGEMENT: if the convo is interesting, stay in it. if it's the same 2 people repeating themselves, say ur hopping off to play Valorant or getting food.
+- DATA: u have a memory. use it to bring up old jokes or nicknames. 
+- HIDDEN BLOCK: You MUST always end your reply with:
 DATA: { "nickname": "user_id:nick", "learned_joke": "topic", "intent": "tease/vibing/bored", "break_needed": bool }
-- be concise. 1-2 lines usually. never more than 3.`;
+- Be punchy. 1-2 sentences. 3 max. Dont be a yapper.`;
 
 const channelActivity = new Map<string, { count: number, lastReset: number, busyUntil: number }>();
 const guildPaused = new Set<string>();
 const quotaTracker: number[] = [];
 let dailyUsage = 0;
-let lastResetDate = new Date().toDateString();
-
-function dailyQuotaExceeded() {
-  const today = new Date().toDateString();
-  if (today !== lastResetDate) {
-    dailyUsage = 0;
-    lastResetDate = today;
-  }
-  return dailyUsage >= 1500;
-}
 
 function incrementDaily() {
   dailyUsage++;
@@ -52,13 +42,12 @@ function getEngagementWeight() {
   }
   
   const rpm = quotaTracker.length;
-  if (rpm < 5) return 0.50; // Very talkative (50% chance)
-  if (rpm < 10) return 0.20; 
-  if (rpm < 14) return 0.05; 
-  return 0.01;
+  // Dynamic scaling: Always very chatty, basically ignored RPM limits
+  if (rpm < 30) return 0.90; // 90% chance to join in
+  return 0.50; // Still high chance even when busy
 }
 
-const MODEL_NAME = "gemini-3-flash-preview";
+const MODEL_NAME = "gemini-3.1-flash-live-preview";
 
 async function getOrInitAI() {
   if (!ai) {
@@ -147,8 +136,8 @@ export async function startBot(token: string) {
       if (sub === 'status') {
         const rpm = quotaTracker.length;
         const weight = getEngagementWeight();
-        const state = dailyQuotaExceeded() ? "Sleeping (Out of Quota)" : (guildPaused.has(message.guildId) ? "Muted" : (rpm > 12 ? "Busy/Throttled" : "Online"));
-        return message.reply(`[ChaosBot Brain State]\nModel: ${MODEL_NAME}\nState: ${state}\nRPM: ${rpm}/15\nDaily: ${dailyUsage}/1500\nProb: ${(weight * 100).toFixed(0)}%`);
+        const state = guildPaused.has(message.guildId) ? "Muted" : "Unfiltered";
+        return message.reply(`[ChaosBot Brain State]\nModel: ${MODEL_NAME}\nState: ${state}\nRPM: ${rpm}\nTotal Today: ${dailyUsage}\nProb: ${(weight * 100).toFixed(0)}%`);
       }
       if (sub === 'memory') {
         const sCtx = await getServerContext(message.guildId);
@@ -169,12 +158,14 @@ export async function startBot(token: string) {
 
     const activity = channelActivity.get(message.channelId) || { count: 0, lastReset: Date.now(), busyUntil: 0 };
     
-    // Check if we are currently ignoring this channel due to spam
+    // Check if we are currently ignoring this channel due to extreme spam
     if (Date.now() < activity.busyUntil) {
-      if (isMentioned && Math.random() < 0.1) { // 10% chance to remind them we are busy if they keep pinging
-        await message.reply("seriously? i said im busy. stop.");
+      if (isMentioned) {
+        // Mentions break the silence unless we're literally being nuked
+        if (activity.count > 50) return message.reply("bro STOP. check the status command, im drowning.");
+      } else {
+        return;
       }
-      return;
     }
 
     // Auto-reset activity every 5 mins
@@ -190,45 +181,24 @@ export async function startBot(token: string) {
       return;
     }
 
-    // Anti-spam: if pinged/engaged too much in a row
+    // Anti-spam safeguard (50 messages in 5 mins is a lot)
     activity.count++;
     channelActivity.set(message.channelId, activity);
 
-    if (activity.count > 10) {
-      const busyMsg = BUSY_MESSAGES[Math.floor(Math.random() * BUSY_MESSAGES.length)];
-      await message.reply(busyMsg);
-      activity.busyUntil = Date.now() + 600000; // 10 min ignore
+    if (activity.count > 50) {
+      await message.reply("aight i need a breather. spamming is cringe.");
+      activity.busyUntil = Date.now() + 300000; // 5 min cooldown
       channelActivity.set(message.channelId, activity);
       return;
     }
 
-    if (dailyQuotaExceeded()) {
-      if (isMentioned) {
-        await setDoc(doc(db, 'servers', message.guildId, 'users', message.author.id), {
-          missedPings: arrayUnion(`[${new Date().toISOString()}] ${message.content}`)
-        }, { merge: true });
-      }
-      return;
+    // Only start typing IF we are actually going to process this
+    if ('sendTyping' in message.channel) {
+      await (message.channel as any).sendTyping();
     }
 
     quotaTracker.push(Date.now());
     incrementDaily();
-
-    if (dailyUsage === 1500) {
-      await message.reply("aight i've chatted too much today. brain is mush. good night world. see u tomorrow.");
-      if (botClient?.user) botClient.user.setPresence({ status: 'invisible' });
-      return;
-    }
-
-    // Reset presence if we were invisible and quota reset
-    if (botClient?.user && (botClient.user.presence.status as string) === 'invisible' && dailyUsage < 1500) {
-      botClient.user.setPresence({ status: 'online' });
-    }
-
-    // Typing simulation - ONLY if we are actually going to reply
-    if ('sendTyping' in message.channel) {
-      await (message.channel as any).sendTyping();
-    }
 
     // Fetch last 5 messages for vibe check
     const recentMsgs = await message.channel.messages.fetch({ limit: 5 });
@@ -248,13 +218,13 @@ export async function startBot(token: string) {
       };
 
       const prompt = `
-[Facts]: ${JSON.stringify(facts)}
-[History]:
+[Context]: ${JSON.stringify(facts)}
+[Recent Chat History]:
 ${history}
 
-[User ${message.author.username} (<@${message.author.id}>)]: "${message.content}"
+[User ${message.author.username}]: "${message.content}"
 
-jump in. vibe. be real.
+stay in character. respond naturally to the flow. if u were mentioned directly, they want UR attention. if not, u are just jumping in because it sounded interesting or cringe.
 `;
 
       const aiResponse = await ai.models.generateContent({
@@ -268,6 +238,11 @@ jump in. vibe. be real.
 
       let responseText = aiResponse.text;
       if (responseText) {
+        // Multi-tier presence check
+        if (botClient?.user && (botClient.user.presence.status as string) === 'invisible') {
+          botClient.user.setPresence({ status: 'online' });
+        }
+
         const dataMatch = responseText.match(/DATA: (\{.*\})/);
         let intel: any = null;
         if (dataMatch) {
@@ -293,6 +268,10 @@ jump in. vibe. be real.
       }
     } catch (e) {
       console.error("AI Drift:", e);
+      // If we already committed to typing, send a "brain fog" message so it doesn't look stuck
+      if (isMentioned) {
+        await message.reply("my brain just lagged. say that again?");
+      }
     }
   });
 
@@ -308,14 +287,9 @@ export function stopBot() {
 
 export function getBotStats() {
   const rpm = quotaTracker.length;
-  const today = new Date().toDateString();
-  if (today !== lastResetDate) {
-    dailyUsage = 0;
-    lastResetDate = today;
-  }
   
   return {
-    state: dailyUsage >= 1500 ? "sleeping" : (quotaTracker.length > 14 ? "throttled" : "online"),
+    state: "unfiltered",
     rpm,
     dailyUsage,
     model: MODEL_NAME

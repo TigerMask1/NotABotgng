@@ -170,21 +170,21 @@ export default function App() {
                 active={isRunning}
               />
               <div className="p-6 rounded-3xl border bg-neutral-900 border-neutral-800">
-                <p className="text-neutral-500 text-[10px] font-mono uppercase tracking-widest mb-3">Daily Quota</p>
+                <p className="text-neutral-500 text-[10px] font-mono uppercase tracking-widest mb-3">Today's Energy</p>
                 <div className="flex items-end justify-between mb-2">
                   <span className="text-xl font-bold text-white">{status?.botStats?.dailyUsage || 0}</span>
-                  <span className="text-[10px] text-neutral-500">/ 1500</span>
+                  <span className="text-[10px] text-neutral-500">msgs sent</span>
                 </div>
                 <div className="w-full h-1.5 bg-neutral-800 rounded-full overflow-hidden">
                   <motion.div 
                     initial={{ width: 0 }}
-                    animate={{ width: `${Math.min((status?.botStats?.dailyUsage || 0) / 1500 * 100, 100)}%` }}
-                    className="h-full bg-purple-500"
+                    animate={{ width: '100%' }}
+                    className="h-full bg-green-500"
                   />
                 </div>
                 <p className="mt-3 text-[10px] text-neutral-400 flex items-center gap-1">
                   <MessageSquare className="w-3 h-3" />
-                  {status?.botStats?.rpm || 0} req/min current
+                  {status?.botStats?.rpm || 0} messages per minute
                 </p>
               </div>
             </div>
