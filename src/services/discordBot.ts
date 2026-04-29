@@ -36,7 +36,7 @@ function getEngagementWeight() {
   return 0.8; 
 }
 
-const MODEL_NAME = "gemma-3-27b";
+const MODEL_NAME = "gemma-3-27b-it";
 
 async function getOrInitAI() {
   if (!ai) {
