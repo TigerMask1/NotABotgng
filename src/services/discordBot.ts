@@ -16,7 +16,7 @@ const SYSTEM_PROMPT = `you are ChaosBot. a long-time member of this server.
 DATA: { "nickname": "user_id:nick", "learned_joke": "topic", "intent": "tease/vibing/bored", "break_needed": bool }
 - Be punchy. 1-2 sentences. 3 max. Dont be a yapper.`;
 
-const channelActivity = new Map<string, { count: number, lastReset: number, busyUntil: number }>();
+const channelActivity = new Map<string, { count: number, lastReset: number, busyUntil?: number }>();
 const guildPaused = new Set<string>();
 const quotaTracker: number[] = [];
 let dailyUsage = 0;
@@ -24,16 +24,6 @@ let dailyUsage = 0;
 function incrementDaily() {
   dailyUsage++;
 }
-
-const BUSY_MESSAGES = [
-  "bro i literally just told u im busy.",
-  "stop. pinging. me.",
-  "im gaming. go away.",
-  "system update, try again in an hour (jk dont).",
-  "u got no friends to talk to? leave me alone.",
-  "nah, im out. cya.",
-  "i am ignoring u now. congrats."
-];
 
 function getEngagementWeight() {
   const now = Date.now();
@@ -43,11 +33,10 @@ function getEngagementWeight() {
   
   const rpm = quotaTracker.length;
   // Dynamic scaling: Always very chatty, basically ignored RPM limits
-  if (rpm < 30) return 0.90; // 90% chance to join in
-  return 0.50; // Still high chance even when busy
+  return 0.8; 
 }
 
-const MODEL_NAME = "gemini-3.1-flash-live-preview";
+const MODEL_NAME = "gemma-3-27b";
 
 async function getOrInitAI() {
   if (!ai) {
@@ -136,8 +125,8 @@ export async function startBot(token: string) {
       if (sub === 'status') {
         const rpm = quotaTracker.length;
         const weight = getEngagementWeight();
-        const state = guildPaused.has(message.guildId) ? "Muted" : "Unfiltered";
-        return message.reply(`[ChaosBot Brain State]\nModel: ${MODEL_NAME}\nState: ${state}\nRPM: ${rpm}\nTotal Today: ${dailyUsage}\nProb: ${(weight * 100).toFixed(0)}%`);
+        const state = guildPaused.has(message.guildId) ? "Muted" : "Active & Unfiltered";
+        return message.reply(`[ChaosBot Brain State]\nModel: ${MODEL_NAME}\nState: ${state}\nTotal Sent Today: ${dailyUsage}\nFlow: Extremely Active`);
       }
       if (sub === 'memory') {
         const sCtx = await getServerContext(message.guildId);
@@ -156,18 +145,8 @@ export async function startBot(token: string) {
     const botId = botClient!.user!.id;
     const isMentioned = message.mentions.has(botId);
 
-    const activity = channelActivity.get(message.channelId) || { count: 0, lastReset: Date.now(), busyUntil: 0 };
+    const activity = channelActivity.get(message.channelId) || { count: 0, lastReset: Date.now() };
     
-    // Check if we are currently ignoring this channel due to extreme spam
-    if (Date.now() < activity.busyUntil) {
-      if (isMentioned) {
-        // Mentions break the silence unless we're literally being nuked
-        if (activity.count > 50) return message.reply("bro STOP. check the status command, im drowning.");
-      } else {
-        return;
-      }
-    }
-
     // Auto-reset activity every 5 mins
     if (Date.now() - activity.lastReset > 300000) {
       activity.count = 0;
@@ -181,21 +160,9 @@ export async function startBot(token: string) {
       return;
     }
 
-    // Anti-spam safeguard (50 messages in 5 mins is a lot)
+    // Still track activity for stats, but no more hard breaks
     activity.count++;
     channelActivity.set(message.channelId, activity);
-
-    if (activity.count > 50) {
-      await message.reply("aight i need a breather. spamming is cringe.");
-      activity.busyUntil = Date.now() + 300000; // 5 min cooldown
-      channelActivity.set(message.channelId, activity);
-      return;
-    }
-
-    // Only start typing IF we are actually going to process this
-    if ('sendTyping' in message.channel) {
-      await (message.channel as any).sendTyping();
-    }
 
     quotaTracker.push(Date.now());
     incrementDaily();
@@ -209,6 +176,11 @@ export async function startBot(token: string) {
 
     const ai = await getOrInitAI();
     if (!ai) return;
+
+    // Only start typing now that we're actually hitting the brain
+    if ('sendTyping' in message.channel) {
+      await (message.channel as any).sendTyping();
+    }
 
     try {
       const facts = {
@@ -260,8 +232,8 @@ stay in character. respond naturally to the flow. if u were mentioned directly, 
           if (intel?.break_needed) {
             channelActivity.set(message.channelId, { 
               count: 20, 
-              lastReset: activity.lastReset, 
-              busyUntil: Date.now() + 600000 // 10 min break
+              lastReset: activity.lastReset,
+              busyUntil: Date.now() + 300000 // 5 min break if AI asks for it
             }); 
           }
         }, 1000 + Math.random() * 2000);
