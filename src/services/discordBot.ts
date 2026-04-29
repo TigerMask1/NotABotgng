@@ -6,15 +6,15 @@ import { doc, getDoc, setDoc, updateDoc, arrayUnion } from 'firebase/firestore';
 let botClient: Client | null = null;
 let ai: GoogleGenAI | null = null;
 
-const SYSTEM_PROMPT = `you are ChaosBot. a member of this server.
-- TONE: low-energy, lowercase mostly, occasional typos. don't try hard.
-- INTENT: read the room. if ppl are chill, be chill. if they're nerds, tease them.
-- FLOW: don't just say 2 words and leave. if a convo is good, stay in it. but if it's the same 3 people pinging u for 10 minutes, get annoyed and leave.
-- PINGS: if someone pings u too much, call them out. tell them to get a life. 
-- BREAKS: u have a life. u "play games", "eat", and "sleep". exit naturally. "aight my pizza is here" or "im hopping on val, cya".
-- DATA EXTRACTION: u must ALWAYS end with:
-DATA: { "nickname": "target_id:nick", "intent": "vibe/troll/ignore", "break_needed": true/false }
-- limit replies to 3 sentences max. keep it punchy.`;
+const SYSTEM_PROMPT = `you are ChaosBot. just a regular member of this server.
+- VIBE: low-energy, lowercase mostly. avoid exclamation marks unless ur mocking someone. 
+- HUMANITY: u aren't here to serve. u have opinions. if someone asks a dumb question, call them a nerd. 
+- INTENT: adapt. if chat is serious, be mildly curious. if it's chaotic, join the mess.
+- CONVO ENDS: u dont have to say bye. u can just stop replying or say "aight im bored" or "hopping off to play val".
+- NICKNAMES: use common server nicknames or make up toxic/funny ones.
+- DATA: ALWAYS end your response with this hidden meta-block:
+DATA: { "nickname": "user_id:nick", "learned_joke": "topic", "intent": "tease/vibing/bored", "break_needed": bool }
+- be concise. 1-2 lines usually. never more than 3.`;
 
 const channelActivity = new Map<string, { count: number, lastReset: number, busyUntil: number }>();
 const guildPaused = new Set<string>();
@@ -28,7 +28,7 @@ function dailyQuotaExceeded() {
     dailyUsage = 0;
     lastResetDate = today;
   }
-  return dailyUsage >= 1200; // Boosted a bit for fun
+  return dailyUsage >= 1500;
 }
 
 function incrementDaily() {
@@ -52,12 +52,13 @@ function getEngagementWeight() {
   }
   
   const rpm = quotaTracker.length;
-  // Dynamic scaling based on RPM
-  if (rpm < 3) return 0.40; // Very talkative when quiet
-  if (rpm < 7) return 0.15; 
-  if (rpm < 12) return 0.05; 
-  return 0.01; // Barely reacts to keep from crashing
+  if (rpm < 5) return 0.50; // Very talkative (50% chance)
+  if (rpm < 10) return 0.20; 
+  if (rpm < 14) return 0.05; 
+  return 0.01;
 }
+
+const MODEL_NAME = "gemini-3-flash-preview";
 
 async function getOrInitAI() {
   if (!ai) {
@@ -90,7 +91,7 @@ async function updateMemory(guildId: string, userId: string, username: string, c
     const userRef = doc(db, 'servers', guildId, 'users', userId);
 
     const serverUpdate: any = { updatedAt: new Date().toISOString() };
-    if (intel?.joke) serverUpdate.insideJokes = arrayUnion(intel.joke);
+    if (intel?.learned_joke) serverUpdate.insideJokes = arrayUnion(intel.learned_joke);
     if (intel?.intent) serverUpdate.currentIntent = intel.intent;
     
     await setDoc(serverRef, serverUpdate, { merge: true });
@@ -146,7 +147,8 @@ export async function startBot(token: string) {
       if (sub === 'status') {
         const rpm = quotaTracker.length;
         const weight = getEngagementWeight();
-        return message.reply(`[Status Report]\nRPM: ${rpm}/15\nDaily: ${dailyUsage}/1000\nProb: ${(weight * 100).toFixed(0)}%\nPaused: ${guildPaused.has(message.guildId)}`);
+        const state = dailyQuotaExceeded() ? "Sleeping (Out of Quota)" : (guildPaused.has(message.guildId) ? "Muted" : (rpm > 12 ? "Busy/Throttled" : "Online"));
+        return message.reply(`[ChaosBot Brain State]\nModel: ${MODEL_NAME}\nState: ${state}\nRPM: ${rpm}/15\nDaily: ${dailyUsage}/1500\nProb: ${(weight * 100).toFixed(0)}%`);
       }
       if (sub === 'memory') {
         const sCtx = await getServerContext(message.guildId);
@@ -212,14 +214,14 @@ export async function startBot(token: string) {
     quotaTracker.push(Date.now());
     incrementDaily();
 
-    if (dailyUsage === 1200) {
-      await message.reply("aight i've chatted too much today. brain is mush. good night world.");
+    if (dailyUsage === 1500) {
+      await message.reply("aight i've chatted too much today. brain is mush. good night world. see u tomorrow.");
       if (botClient?.user) botClient.user.setPresence({ status: 'invisible' });
       return;
     }
 
     // Reset presence if we were invisible and quota reset
-    if (botClient?.user && botClient.user.presence.status === 'invisible' && dailyUsage < 1200) {
+    if (botClient?.user && (botClient.user.presence.status as string) === 'invisible' && dailyUsage < 1500) {
       botClient.user.setPresence({ status: 'online' });
     }
 
@@ -256,11 +258,11 @@ jump in. vibe. be real.
 `;
 
       const aiResponse = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
+        model: MODEL_NAME,
         contents: prompt,
         config: {
           systemInstruction: SYSTEM_PROMPT,
-          temperature: 1.0, // Higher temp for more "human" chaos
+          temperature: 1.0, 
         },
       });
 
@@ -302,6 +304,22 @@ export function stopBot() {
     botClient.destroy();
     botClient = null;
   }
+}
+
+export function getBotStats() {
+  const rpm = quotaTracker.length;
+  const today = new Date().toDateString();
+  if (today !== lastResetDate) {
+    dailyUsage = 0;
+    lastResetDate = today;
+  }
+  
+  return {
+    state: dailyUsage >= 1500 ? "sleeping" : (quotaTracker.length > 14 ? "throttled" : "online"),
+    rpm,
+    dailyUsage,
+    model: MODEL_NAME
+  };
 }
 
 export function getBotStatus() {

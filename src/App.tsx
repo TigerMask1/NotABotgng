@@ -156,25 +156,38 @@ export default function App() {
           </motion.div>
 
           {/* Stats/Status Card */}
-          <motion.div 
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 0.1 }}
-            className="flex flex-col gap-4"
-          >
-            <StatusTile 
-              title="AI Intelligence" 
-              value={status?.hasAiKey ? 'Cognizant' : 'Missing DNA'} 
-              icon={<Zap className={status?.hasAiKey ? 'text-yellow-400' : 'text-neutral-600'} />}
-              active={!!status?.hasAiKey}
-            />
-            <StatusTile 
-              title="Persona" 
-              value="CHAOTIC" 
-              icon={<Ghost className="text-orange-400" />}
-              active={true}
-            />
-          </motion.div>
+            <div className="flex flex-col gap-4">
+              <StatusTile 
+                title="AI Intelligence" 
+                value={status?.botStats?.model || 'Searching...'} 
+                icon={<Zap className={status?.hasAiKey ? 'text-yellow-400' : 'text-neutral-600'} />}
+                active={!!status?.hasAiKey}
+              />
+              <StatusTile 
+                title="Brain State" 
+                value={status?.botStats?.state?.toUpperCase() || 'OFFLINE'} 
+                icon={<Cpu className={status?.botStats?.state === 'online' ? 'text-green-400' : 'text-red-400'} />}
+                active={isRunning}
+              />
+              <div className="p-6 rounded-3xl border bg-neutral-900 border-neutral-800">
+                <p className="text-neutral-500 text-[10px] font-mono uppercase tracking-widest mb-3">Daily Quota</p>
+                <div className="flex items-end justify-between mb-2">
+                  <span className="text-xl font-bold text-white">{status?.botStats?.dailyUsage || 0}</span>
+                  <span className="text-[10px] text-neutral-500">/ 1500</span>
+                </div>
+                <div className="w-full h-1.5 bg-neutral-800 rounded-full overflow-hidden">
+                  <motion.div 
+                    initial={{ width: 0 }}
+                    animate={{ width: `${Math.min((status?.botStats?.dailyUsage || 0) / 1500 * 100, 100)}%` }}
+                    className="h-full bg-purple-500"
+                  />
+                </div>
+                <p className="mt-3 text-[10px] text-neutral-400 flex items-center gap-1">
+                  <MessageSquare className="w-3 h-3" />
+                  {status?.botStats?.rpm || 0} req/min current
+                </p>
+              </div>
+            </div>
         </div>
 
         {/* Memory Grid */}

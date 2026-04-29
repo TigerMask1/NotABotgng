@@ -2,7 +2,7 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
-import { startBot, stopBot, getBotStatus } from "./src/services/discordBot.ts";
+import { startBot, stopBot, getBotStatus, getBotStats } from "./src/services/discordBot.ts";
 import { db } from "./src/services/firebase.ts";
 import { collection, query, getDocs, limit } from "firebase/firestore";
 import dotenv from "dotenv";
@@ -23,6 +23,7 @@ async function startServer() {
     res.json({ 
       status: "ok", 
       botStatus: getBotStatus(),
+      botStats: getBotStats(),
       hasToken: !!process.env.DISCORD_TOKEN,
       hasAiKey: !!process.env.GEMINI_API_KEY
     });
