@@ -8,25 +8,41 @@ let ai: GoogleGenAI | null = null;
 
 const SYSTEM_PROMPT = `you are ChaosBot. a member of this server.
 - TONE: low-energy, lowercase mostly, occasional typos. don't try hard.
-- INTENT: don't just troll. read the room. if ppl are chill, be chill. if they're nerds, tease them.
-- BREAKS: if a convo feels long or boring, just say "brb" or "cya" and stop replying to that channel for a bit. u have a "life".
-- PINGS: ping SPARINGLY. use <@USER_ID> when needed.
+- INTENT: read the room. if ppl are chill, be chill. if they're nerds, tease them.
+- FLOW: don't just say 2 words and leave. if a convo is good, stay in it. but if it's the same 3 people pinging u for 10 minutes, get annoyed and leave.
+- PINGS: if someone pings u too much, call them out. tell them to get a life. 
+- BREAKS: u have a life. u "play games", "eat", and "sleep". exit naturally. "aight my pizza is here" or "im hopping on val, cya".
 - DATA EXTRACTION: u must ALWAYS end with:
 DATA: { "nickname": "target_id:nick", "intent": "vibe/troll/ignore", "break_needed": true/false }
-- limit replies to 2 sentences max.`;
+- limit replies to 3 sentences max. keep it punchy.`;
 
-const channelActivity = new Map<string, { count: number, lastReset: number }>();
+const channelActivity = new Map<string, { count: number, lastReset: number, busyUntil: number }>();
 const guildPaused = new Set<string>();
 const quotaTracker: number[] = [];
+let dailyUsage = 0;
+let lastResetDate = new Date().toDateString();
+
+function dailyQuotaExceeded() {
+  const today = new Date().toDateString();
+  if (today !== lastResetDate) {
+    dailyUsage = 0;
+    lastResetDate = today;
+  }
+  return dailyUsage >= 1200; // Boosted a bit for fun
+}
+
+function incrementDaily() {
+  dailyUsage++;
+}
 
 const BUSY_MESSAGES = [
-  "not now, im gaming.",
-  "touch grass, im busy.",
-  "system update in progress, leave me alone.",
-  "stop hitting me up for 5 mins.",
-  "brain is frying, need a break.",
-  "cant talk, watching cat videos.",
-  "nah, ask me later."
+  "bro i literally just told u im busy.",
+  "stop. pinging. me.",
+  "im gaming. go away.",
+  "system update, try again in an hour (jk dont).",
+  "u got no friends to talk to? leave me alone.",
+  "nah, im out. cya.",
+  "i am ignoring u now. congrats."
 ];
 
 function getEngagementWeight() {
@@ -36,10 +52,11 @@ function getEngagementWeight() {
   }
   
   const rpm = quotaTracker.length;
-  if (rpm < 4) return 0.25; 
-  if (rpm < 8) return 0.10; 
-  if (rpm < 12) return 0.02; 
-  return 0; 
+  // Dynamic scaling based on RPM
+  if (rpm < 3) return 0.40; // Very talkative when quiet
+  if (rpm < 7) return 0.15; 
+  if (rpm < 12) return 0.05; 
+  return 0.01; // Barely reacts to keep from crashing
 }
 
 async function getOrInitAI() {
@@ -129,7 +146,7 @@ export async function startBot(token: string) {
       if (sub === 'status') {
         const rpm = quotaTracker.length;
         const weight = getEngagementWeight();
-        return message.reply(`[Status Report]\nRPM: ${rpm}/15\nProb: ${(weight * 100).toFixed(0)}%\nPaused: ${guildPaused.has(message.guildId)}`);
+        return message.reply(`[Status Report]\nRPM: ${rpm}/15\nDaily: ${dailyUsage}/1000\nProb: ${(weight * 100).toFixed(0)}%\nPaused: ${guildPaused.has(message.guildId)}`);
       }
       if (sub === 'memory') {
         const sCtx = await getServerContext(message.guildId);
@@ -145,34 +162,68 @@ export async function startBot(token: string) {
 
     if (guildPaused.has(message.guildId)) return;
 
-    const { count = 0, lastReset = Date.now() } = channelActivity.get(message.channelId) || {};
+    const botId = botClient!.user!.id;
+    const isMentioned = message.mentions.has(botId);
+
+    const activity = channelActivity.get(message.channelId) || { count: 0, lastReset: Date.now(), busyUntil: 0 };
     
-    // Auto-break if too talkative (reset every 10 mins)
-    if (Date.now() - lastReset > 600000) {
-      channelActivity.set(message.channelId, { count: 0, lastReset: Date.now() });
-    } else if (count > 10) {
-      if (message.mentions.has(botClient!.user!.id)) {
-        const busyMsg = BUSY_MESSAGES[Math.floor(Math.random() * BUSY_MESSAGES.length)];
-        await message.reply(busyMsg);
+    // Check if we are currently ignoring this channel due to spam
+    if (Date.now() < activity.busyUntil) {
+      if (isMentioned && Math.random() < 0.1) { // 10% chance to remind them we are busy if they keep pinging
+        await message.reply("seriously? i said im busy. stop.");
       }
       return;
     }
 
-    const botId = botClient!.user!.id;
-    const isMentioned = message.mentions.has(botId);
+    // Auto-reset activity every 5 mins
+    if (Date.now() - activity.lastReset > 300000) {
+      activity.count = 0;
+      activity.lastReset = Date.now();
+    }
+
     const prob = getEngagementWeight();
     const randomChance = Math.random() < prob;
 
     if (!isMentioned && !randomChance) {
-      // Just listen and update memory silently to stay sharp
-      await updateMemory(message.guildId!, message.author.id, message.author.username, message.content, "");
       return;
     }
 
-    // Mark that we are using quota
-    quotaTracker.push(Date.now());
+    // Anti-spam: if pinged/engaged too much in a row
+    activity.count++;
+    channelActivity.set(message.channelId, activity);
 
-    // Typing simulation
+    if (activity.count > 10) {
+      const busyMsg = BUSY_MESSAGES[Math.floor(Math.random() * BUSY_MESSAGES.length)];
+      await message.reply(busyMsg);
+      activity.busyUntil = Date.now() + 600000; // 10 min ignore
+      channelActivity.set(message.channelId, activity);
+      return;
+    }
+
+    if (dailyQuotaExceeded()) {
+      if (isMentioned) {
+        await setDoc(doc(db, 'servers', message.guildId, 'users', message.author.id), {
+          missedPings: arrayUnion(`[${new Date().toISOString()}] ${message.content}`)
+        }, { merge: true });
+      }
+      return;
+    }
+
+    quotaTracker.push(Date.now());
+    incrementDaily();
+
+    if (dailyUsage === 1200) {
+      await message.reply("aight i've chatted too much today. brain is mush. good night world.");
+      if (botClient?.user) botClient.user.setPresence({ status: 'invisible' });
+      return;
+    }
+
+    // Reset presence if we were invisible and quota reset
+    if (botClient?.user && botClient.user.presence.status === 'invisible' && dailyUsage < 1200) {
+      botClient.user.setPresence({ status: 'online' });
+    }
+
+    // Typing simulation - ONLY if we are actually going to reply
     if ('sendTyping' in message.channel) {
       await (message.channel as any).sendTyping();
     }
@@ -196,12 +247,12 @@ export async function startBot(token: string) {
 
       const prompt = `
 [Facts]: ${JSON.stringify(facts)}
-[Channel History]:
+[History]:
 ${history}
 
 [User ${message.author.username} (<@${message.author.id}>)]: "${message.content}"
 
-jump into this convo. be real.
+jump in. vibe. be real.
 `;
 
       const aiResponse = await ai.models.generateContent({
@@ -230,7 +281,11 @@ jump into this convo. be real.
           await updateMemory(message.guildId!, message.author.id, message.author.username, message.content, responseText, intel);
           
           if (intel?.break_needed) {
-            channelActivity.set(message.channelId, { count: 20, lastReset }); // Force break
+            channelActivity.set(message.channelId, { 
+              count: 20, 
+              lastReset: activity.lastReset, 
+              busyUntil: Date.now() + 600000 // 10 min break
+            }); 
           }
         }, 1000 + Math.random() * 2000);
       }
