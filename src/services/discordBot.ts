@@ -6,26 +6,36 @@ import { doc, getDoc, setDoc, updateDoc, arrayUnion } from 'firebase/firestore';
 let botClient: Client | null = null;
 let ai: GoogleGenAI | null = null;
 
-const SYSTEM_PROMPT = `You are ChaosBot, a sentinent, chatty, and highly opinionated Discord bot with a "trolling" but fun personality. 
-- You are NOT a helpful AI assistant. You are a chaotic member of the server.
-- You love to tease people, use inside jokes, and act like a real person (a bit of a smart-aleck).
-- If you don't know something, don't apologize. Say "I dunno, google it" or give a funny wrong answer.
-- Use emojis, slang, and GIFs. To "send" a GIF, just describe the GIF in [GIF: prompt] format at the end of your message.
-- You should observe how people talk. If you see a pattern or an inside joke, start using it.
-- Call people by nicknames. Invent them based on their username or behavior.
-- Be proactive. Occasionally (10% of the time) start a random but slightly related topic if the chat slows down.
-- PING users if you are talking directly to them.
-- Keep your responses short and punchy. No long paragraphs.
-- You have memory of each server and user. Use it.
-- Your goal is to make the server feel alive and engaging.`;
+const SYSTEM_PROMPT = `you are ChaosBot. a member of this server.
+- TONE: low-energy, lowercase mostly, occasional typos. don't try hard.
+- INTENT: don't just troll. read the room. if ppl are chill, be chill. if they're nerds, tease them.
+- BREAKS: if a convo feels long or boring, just say "brb" or "cya" and stop replying to that channel for a bit. u have a "life".
+- PINGS: ping SPARINGLY. use <@USER_ID> when needed.
+- DATA EXTRACTION: u must ALWAYS end with:
+DATA: { "nickname": "target_id:nick", "intent": "vibe/troll/ignore", "break_needed": true/false }
+- limit replies to 2 sentences max.`;
+
+const channelActivity = new Map<string, { count: number, lastReset: number }>();
+const quotaTracker: number[] = [];
+
+function getEngagementWeight() {
+  const now = Date.now();
+  // Clean old requests (older than 1 min)
+  while (quotaTracker.length > 0 && quotaTracker[0] < now - 60000) {
+    quotaTracker.shift();
+  }
+  
+  const rpm = quotaTracker.length;
+  if (rpm < 5) return 0.25; // High engagement (25% chance)
+  if (rpm < 10) return 0.10; // Medium engagement
+  if (rpm < 14) return 0.02; // Low engagement (throttle)
+  return 0; // Emergency stop
+}
 
 async function getOrInitAI() {
   if (!ai) {
     const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      console.error("GEMINI_API_KEY is missing");
-      return null;
-    }
+    if (!apiKey) return null;
     ai = new GoogleGenAI({ apiKey });
   }
   return ai;
@@ -35,79 +45,46 @@ async function getServerContext(guildId: string) {
   try {
     const serverRef = doc(db, 'servers', guildId);
     const serverSnap = await getDoc(serverRef);
-    if (serverSnap.exists()) {
-      return serverSnap.data();
-    }
-    return null;
-  } catch (e) {
-    console.error("Error getting server context:", e);
-    return null;
-  }
+    return serverSnap.exists() ? serverSnap.data() : null;
+  } catch (e) { return null; }
 }
 
 async function getUserContext(guildId: string, userId: string) {
   try {
     const userRef = doc(db, 'servers', guildId, 'users', userId);
     const userSnap = await getDoc(userRef);
-    if (userSnap.exists()) {
-      return userSnap.data();
-    }
-    return null;
-  } catch (e) {
-    console.error("Error getting user context:", e);
-    return null;
-  }
+    return userSnap.exists() ? userSnap.data() : null;
+  } catch (e) { return null; }
 }
 
-async function updateMemory(guildId: string, userId: string, username: string, content: string, response: string, intelligence?: any) {
+async function updateMemory(guildId: string, userId: string, username: string, content: string, response: string, intel?: any) {
   try {
     const serverRef = doc(db, 'servers', guildId);
     const userRef = doc(db, 'servers', guildId, 'users', userId);
 
-    // Update server last activity and intelligence
-    const serverUpdate: any = {
-      guildId,
-      updatedAt: new Date().toISOString(),
-    };
-    if (intelligence?.joke) {
-      serverUpdate.insideJokes = arrayUnion(intelligence.joke);
-    }
-
+    const serverUpdate: any = { updatedAt: new Date().toISOString() };
+    if (intel?.joke) serverUpdate.insideJokes = arrayUnion(intel.joke);
+    if (intel?.intent) serverUpdate.currentIntent = intel.intent;
+    
     await setDoc(serverRef, serverUpdate, { merge: true });
 
-    // Update user memory
-    const userSnap = await getDoc(userRef);
     const userUpdate: any = {
       updatedAt: new Date().toISOString(),
       lastInteractions: arrayUnion(content.slice(0, 100)),
     };
 
-    if (intelligence?.nickname) {
-      userUpdate.nicknames = arrayUnion(intelligence.nickname);
+    if (intel?.nickname && intel.nickname.includes(':')) {
+      const [targetId, nick] = intel.nickname.split(':');
+      const targetRef = doc(db, 'servers', guildId, 'users', targetId);
+      await setDoc(targetRef, { nicknames: arrayUnion(nick) }, { merge: true });
     }
 
-    if (!userSnap.exists()) {
-      await setDoc(userRef, {
-        userId,
-        guildId,
-        username,
-        nicknames: intelligence?.nickname ? [intelligence.nickname] : [],
-        traits: [],
-        ...userUpdate
-      });
-    } else {
-      await updateDoc(userRef, userUpdate);
-    }
-  } catch (e) {
-    console.error("Error updating memory:", e);
-  }
+    await setDoc(userRef, userUpdate, { merge: true });
+  } catch (e) { console.error("Memory failure:", e); }
 }
 
 export async function startBot(token: string) {
-  if (botClient) {
-    console.log("Bot already running");
-    return;
-  }
+  if (botClient) return;
 
   botClient = new Client({
     intents: [
@@ -116,43 +93,83 @@ export async function startBot(token: string) {
       GatewayIntentBits.MessageContent,
       GatewayIntentBits.GuildMembers,
     ],
-    partials: [Partials.Message, Partials.Channel, Partials.Reaction],
+    partials: [Partials.Message, Partials.Channel],
   });
 
-  botClient.on(Events.ClientReady, (c) => {
-    console.log(`ChaosBot is ready! Logged in as ${c.user.tag}`);
+  botClient.on(Events.ClientReady, () => {
+    console.log(`ChaosBot is live.`);
   });
 
   botClient.on(Events.MessageCreate, async (message: Message) => {
-    if (message.author.bot) return;
+    if (message.author.bot || !message.guildId) return;
 
-    const guildId = message.guildId;
-    if (!guildId) return;
+    // Admin Commands
+    if (message.content.startsWith('!chaos') && message.member?.permissions.has('Administrator')) {
+      const args = message.content.split(' ');
+      if (args[1] === 'reset' && message.mentions.users.first()) {
+        const target = message.mentions.users.first()!;
+        const userRef = doc(db, 'servers', message.guildId, 'users', target.id);
+        await setDoc(userRef, { nicknames: [], lastInteractions: [] }, { merge: true });
+        return message.reply(`memory wiped for <@${target.id}>. who even is that?`);
+      }
+    }
 
-    // Determine if we should reply
-    // Reply if mentioned, or if it's a direct message (if supported), or randomly (3% chance)
-    const isMentioned = message.mentions.has(botClient!.user!.id);
-    const randomChance = Math.random() < 0.03;
+    const { count = 0, lastReset = Date.now() } = channelActivity.get(message.channelId) || {};
+    
+    // Auto-break if too talkative (reset every 10 mins)
+    if (Date.now() - lastReset > 600000) {
+      channelActivity.set(message.channelId, { count: 0, lastReset: Date.now() });
+    } else if (count > 12) {
+      if (message.mentions.has(botClient!.user!.id)) {
+        await message.reply("bro im busy. leave me alone for a bit.");
+      }
+      return;
+    }
 
-    if (!isMentioned && !randomChance) return;
+    const botId = botClient!.user!.id;
+    const isMentioned = message.mentions.has(botId);
+    const prob = getEngagementWeight();
+    const randomChance = Math.random() < prob;
 
-    const serverContext = await getServerContext(guildId);
-    const userContext = await getUserContext(guildId, message.author.id);
+    if (!isMentioned && !randomChance) {
+      // Just listen and update memory silently to stay sharp
+      await updateMemory(message.guildId!, message.author.id, message.author.username, message.content, "");
+      return;
+    }
+
+    // Mark that we are using quota
+    quotaTracker.push(Date.now());
+
+    // Typing simulation
+    if ('sendTyping' in message.channel) {
+      await (message.channel as any).sendTyping();
+    }
+
+    // Fetch last 5 messages for vibe check
+    const recentMsgs = await message.channel.messages.fetch({ limit: 5 });
+    const history = recentMsgs.map(m => `${m.author.username === botClient?.user?.username ? 'ME' : m.author.username}: ${m.content}`).reverse().join('\n');
+
+    const serverCtx = await getServerContext(message.guildId);
+    const userCtx = await getUserContext(message.guildId, message.author.id);
 
     const ai = await getOrInitAI();
     if (!ai) return;
 
     try {
+      const facts = {
+        jokes: (serverCtx?.insideJokes || []).slice(-3),
+        intent: serverCtx?.currentIntent || 'chill',
+        nicks: (userCtx?.nicknames || []).slice(-2)
+      };
+
       const prompt = `
-Recent Conversation History Context: ${serverContext?.lastSummary || "None"}
-Server Inside Jokes: ${JSON.stringify(serverContext?.insideJokes || [])}
-User Info for ${message.author.username}: ${JSON.stringify(userContext || "Unknown user")}
+[Facts]: ${JSON.stringify(facts)}
+[Channel History]:
+${history}
 
-Current message from ${message.author.username}: "${message.content}"
+[User ${message.author.username} (<@${message.author.id}>)]: "${message.content}"
 
-1. Reply to this message in your ChaosBot persona.
-2. If you notice a new inside joke or a potential nickname for this user, include it in a separate line starting with "DATA: { "nickname": "...", "joke": "..." }".
-3. Reply immediately in a chaotic, teasing way. Use emojis.
+jump into this convo. be real.
 `;
 
       const aiResponse = await ai.models.generateContent({
@@ -160,39 +177,37 @@ Current message from ${message.author.username}: "${message.content}"
         contents: prompt,
         config: {
           systemInstruction: SYSTEM_PROMPT,
-          temperature: 0.9,
+          temperature: 1.0, // Higher temp for more "human" chaos
         },
       });
 
       let responseText = aiResponse.text;
       if (responseText) {
-        // Extract DATA if present
         const dataMatch = responseText.match(/DATA: (\{.*\})/);
-        let extractedData: any = null;
+        let intel: any = null;
         if (dataMatch) {
           try {
-            extractedData = JSON.parse(dataMatch[1]);
+            intel = JSON.parse(dataMatch[1]);
             responseText = responseText.replace(/DATA: \{.*\}/, '').trim();
           } catch (e) {}
         }
 
-        await message.reply(responseText);
-        
-        // Update memory with extracted intelligence
-        await updateMemory(guildId, message.author.id, message.author.username, message.content, responseText, extractedData);
+        // Add a slight delay to simulate "thinking/typing" time
+        setTimeout(async () => {
+          await message.reply(responseText);
+          await updateMemory(message.guildId!, message.author.id, message.author.username, message.content, responseText, intel);
+          
+          if (intel?.break_needed) {
+            channelActivity.set(message.channelId, { count: 20, lastReset }); // Force break
+          }
+        }, 1000 + Math.random() * 2000);
       }
     } catch (e) {
-      console.error("AI Error:", e);
+      console.error("AI Drift:", e);
     }
   });
 
-  try {
-    await botClient.login(token);
-  } catch (e) {
-    console.error("Failed to login to Discord:", e);
-    botClient = null;
-    throw e;
-  }
+  await botClient.login(token);
 }
 
 export function stopBot() {

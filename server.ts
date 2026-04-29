@@ -3,6 +3,8 @@ import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
 import { startBot, stopBot, getBotStatus } from "./src/services/discordBot.ts";
+import { db } from "./src/services/firebase.ts";
+import { collection, query, getDocs, limit } from "firebase/firestore";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -34,6 +36,27 @@ async function startServer() {
       }
       await startBot(token);
       res.json({ message: "Bot started" });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/memory", async (req, res) => {
+    try {
+      const serversRef = collection(db, 'servers');
+      const q = query(serversRef, limit(10));
+      const querySnapshot = await getDocs(q);
+      const memory: any[] = [];
+      
+      for (const doc of querySnapshot.docs) {
+        const data = doc.data();
+        memory.push({
+          guildId: doc.id,
+          jokes: data.insideJokes || [],
+          mood: data.currentMood || 'neutral'
+        });
+      }
+      res.json(memory);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }

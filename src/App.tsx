@@ -7,6 +7,7 @@ export default function App() {
   const [token, setToken] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [memory, setMemory] = useState<any[]>([]);
 
   const fetchStatus = async () => {
     try {
@@ -18,9 +19,23 @@ export default function App() {
     }
   };
 
+  const fetchMemory = async () => {
+    try {
+      const res = await fetch('/api/memory');
+      const data = await res.json();
+      setMemory(data);
+    } catch (err) {
+      console.error("Failed to fetch memory", err);
+    }
+  };
+
   useEffect(() => {
     fetchStatus();
-    const interval = setInterval(fetchStatus, 5000);
+    fetchMemory();
+    const interval = setInterval(() => {
+      fetchStatus();
+      fetchMemory();
+    }, 10000);
     return () => clearInterval(interval);
   }, []);
 
@@ -78,12 +93,12 @@ export default function App() {
         </header>
 
         {/* Dashboard Grid */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-12">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-12">
           {/* Main Control Card */}
           <motion.div 
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
-            className="p-8 rounded-3xl bg-neutral-900 border border-neutral-800 shadow-2xl relative overflow-hidden group"
+            className="lg:col-span-2 p-8 rounded-3xl bg-neutral-900 border border-neutral-800 shadow-2xl relative overflow-hidden group"
           >
             <div className="absolute inset-0 bg-gradient-to-br from-purple-500/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
             <div className="relative z-10">
@@ -145,7 +160,7 @@ export default function App() {
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ delay: 0.1 }}
-            className="grid grid-cols-2 gap-4"
+            className="flex flex-col gap-4"
           >
             <StatusTile 
               title="AI Intelligence" 
@@ -154,25 +169,51 @@ export default function App() {
               active={!!status?.hasAiKey}
             />
             <StatusTile 
-              title="Memory Unit" 
-              value="Syncing..." 
-              icon={<Database className="text-blue-400" />}
-              active={isRunning}
-            />
-            <StatusTile 
               title="Persona" 
               value="CHAOTIC" 
               icon={<Ghost className="text-orange-400" />}
               active={true}
             />
-            <StatusTile 
-              title="Engagement" 
-              value="Trolling" 
-              icon={<MessageSquare className="text-green-400" />}
-              active={isRunning}
-            />
           </motion.div>
         </div>
+
+        {/* Memory Grid */}
+        <section className="mb-12">
+          <div className="flex items-center justify-between mb-6">
+            <h3 className="text-xl font-bold flex items-center gap-2">
+              <Database className="w-5 h-5 text-blue-400" />
+              Learned Memory
+            </h3>
+            <span className="text-[10px] font-mono text-neutral-500 uppercase tracking-widest">Real-time Sync</span>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {memory.length > 0 ? memory.map((s) => (
+              <div key={s.guildId} className="p-6 rounded-3xl bg-neutral-900 border border-neutral-800">
+                <p className="text-[10px] font-mono text-neutral-500 uppercase mb-3 truncate">ID: {s.guildId}</p>
+                <div className="mb-4">
+                  <span className="text-xs text-neutral-400 block mb-2 font-medium">Inside Jokes:</span>
+                  <div className="flex flex-wrap gap-2">
+                    {s.jokes.length > 0 ? s.jokes.map((j: string, i: number) => (
+                      <span key={i} className="px-2 py-1 bg-blue-500/10 border border-blue-500/20 text-blue-400 text-[10px] rounded-lg">
+                        {j}
+                      </span>
+                    )) : <span className="text-xs text-neutral-600 italic">No jokes learned yet.</span>}
+                  </div>
+                </div>
+                <div>
+                  <span className="text-xs text-neutral-400 block mb-1 font-medium">Current Mood:</span>
+                  <p className="text-sm font-bold text-white capitalize">{s.mood}</p>
+                </div>
+              </div>
+            )) : (
+              <div className="col-span-full py-12 text-center border border-dashed border-neutral-800 rounded-3xl">
+                <Ghost className="w-8 h-8 text-neutral-800 mx-auto mb-3" />
+                <p className="text-neutral-500 text-sm">No servers found. Ignite the bot to start learning.</p>
+              </div>
+            )}
+          </div>
+        </section>
 
         <section className="mt-8 p-8 rounded-3xl bg-purple-500/10 border border-purple-500/20">
           <h3 className="text-lg font-semibold mb-4 text-purple-300">Quick Start Guide</h3>
