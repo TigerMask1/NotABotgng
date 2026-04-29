@@ -189,7 +189,9 @@ export async function startBot(token: string) {
         nicks: (userCtx?.nicknames || []).slice(-2)
       };
 
-      const prompt = `
+      // ✅ SYSTEM_PROMPT now embedded in the prompt string (Gemma 3 27B compatible)
+      const prompt = `${SYSTEM_PROMPT}
+
 [Context]: ${JSON.stringify(facts)}
 [Recent Chat History]:
 ${history}
@@ -203,7 +205,6 @@ stay in character. respond naturally to the flow. if u were mentioned directly, 
         model: MODEL_NAME,
         contents: prompt,
         config: {
-          systemInstruction: SYSTEM_PROMPT,
           temperature: 1.0, 
         },
       });
