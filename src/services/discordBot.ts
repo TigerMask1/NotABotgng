@@ -16,20 +16,30 @@ DATA: { "nickname": "target_id:nick", "intent": "vibe/troll/ignore", "break_need
 - limit replies to 2 sentences max.`;
 
 const channelActivity = new Map<string, { count: number, lastReset: number }>();
+const guildPaused = new Set<string>();
 const quotaTracker: number[] = [];
+
+const BUSY_MESSAGES = [
+  "not now, im gaming.",
+  "touch grass, im busy.",
+  "system update in progress, leave me alone.",
+  "stop hitting me up for 5 mins.",
+  "brain is frying, need a break.",
+  "cant talk, watching cat videos.",
+  "nah, ask me later."
+];
 
 function getEngagementWeight() {
   const now = Date.now();
-  // Clean old requests (older than 1 min)
   while (quotaTracker.length > 0 && quotaTracker[0] < now - 60000) {
     quotaTracker.shift();
   }
   
   const rpm = quotaTracker.length;
-  if (rpm < 5) return 0.25; // High engagement (25% chance)
-  if (rpm < 10) return 0.10; // Medium engagement
-  if (rpm < 14) return 0.02; // Low engagement (throttle)
-  return 0; // Emergency stop
+  if (rpm < 4) return 0.25; 
+  if (rpm < 8) return 0.10; 
+  if (rpm < 12) return 0.02; 
+  return 0; 
 }
 
 async function getOrInitAI() {
@@ -106,7 +116,26 @@ export async function startBot(token: string) {
     // Admin Commands
     if (message.content.startsWith('!chaos') && message.member?.permissions.has('Administrator')) {
       const args = message.content.split(' ');
-      if (args[1] === 'reset' && message.mentions.users.first()) {
+      const sub = args[1];
+
+      if (sub === 'pause') {
+        guildPaused.add(message.guildId);
+        return message.reply("aight im muting myself. see ya later.");
+      }
+      if (sub === 'resume') {
+        guildPaused.delete(message.guildId);
+        return message.reply("im back. dont make me regret it.");
+      }
+      if (sub === 'status') {
+        const rpm = quotaTracker.length;
+        const weight = getEngagementWeight();
+        return message.reply(`[Status Report]\nRPM: ${rpm}/15\nProb: ${(weight * 100).toFixed(0)}%\nPaused: ${guildPaused.has(message.guildId)}`);
+      }
+      if (sub === 'memory') {
+        const sCtx = await getServerContext(message.guildId);
+        return message.reply(`[What I Know]\nJokes: ${JSON.stringify(sCtx?.insideJokes || [])}\nIntent: ${sCtx?.currentIntent || 'none'}`);
+      }
+      if (sub === 'reset' && message.mentions.users.first()) {
         const target = message.mentions.users.first()!;
         const userRef = doc(db, 'servers', message.guildId, 'users', target.id);
         await setDoc(userRef, { nicknames: [], lastInteractions: [] }, { merge: true });
@@ -114,14 +143,17 @@ export async function startBot(token: string) {
       }
     }
 
+    if (guildPaused.has(message.guildId)) return;
+
     const { count = 0, lastReset = Date.now() } = channelActivity.get(message.channelId) || {};
     
     // Auto-break if too talkative (reset every 10 mins)
     if (Date.now() - lastReset > 600000) {
       channelActivity.set(message.channelId, { count: 0, lastReset: Date.now() });
-    } else if (count > 12) {
+    } else if (count > 10) {
       if (message.mentions.has(botClient!.user!.id)) {
-        await message.reply("bro im busy. leave me alone for a bit.");
+        const busyMsg = BUSY_MESSAGES[Math.floor(Math.random() * BUSY_MESSAGES.length)];
+        await message.reply(busyMsg);
       }
       return;
     }

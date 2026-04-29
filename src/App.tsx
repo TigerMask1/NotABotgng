@@ -202,8 +202,8 @@ export default function App() {
                   </div>
                 </div>
                 <div>
-                  <span className="text-xs text-neutral-400 block mb-1 font-medium">Current Mood:</span>
-                  <p className="text-sm font-bold text-white capitalize">{s.mood}</p>
+                  <span className="text-xs text-neutral-400 block mb-1 font-medium">Intent / Mood:</span>
+                  <p className="text-sm font-bold text-white capitalize">{s.intent || 'chill'}</p>
                 </div>
               </div>
             )) : (
