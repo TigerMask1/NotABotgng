@@ -174,6 +174,21 @@ export default function App() {
           </motion.div>
         </div>
 
+        <section className="mt-8 p-8 rounded-3xl bg-purple-500/10 border border-purple-500/20">
+          <h3 className="text-lg font-semibold mb-4 text-purple-300">Quick Start Guide</h3>
+          <ol className="list-decimal list-inside space-y-4 text-sm text-neutral-300">
+            <li>
+              <strong>Invite the Bot:</strong> Use the Discord Developer Portal to generate an invite link with <code className="bg-black/40 px-1.5 py-0.5 rounded">bot</code> and <code className="bg-black/40 px-1.5 py-0.5 rounded">applications.commands</code> scopes, and <code className="bg-black/40 px-1.5 py-0.5 rounded">Administrator</code> permissions.
+            </li>
+            <li>
+              <strong>Interaction:</strong> Ping the bot with <code className="bg-black/40 px-1.5 py-0.5 rounded">@ChaosBot</code> to start chatting. It will also randomly chime in on 3% of all messages.
+            </li>
+            <li>
+              <strong>Learning:</strong> The more people chat, the more the bot learns. It will automatically start assigning nicknames and using inside jokes after a few interactions.
+            </li>
+          </ol>
+        </section>
+
         {/* Info Section */}
         <section className="mt-12 p-8 rounded-3xl bg-neutral-900/50 border border-neutral-800/50 backdrop-blur-sm">
           <div className="flex items-center gap-3 mb-6">
