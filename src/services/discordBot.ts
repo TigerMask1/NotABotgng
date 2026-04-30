@@ -365,6 +365,91 @@ async function updateMemory(guildId: string, userId: string, username: string, c
   }
 }
 
+async function generateAndSend(params: {
+  message: Message,
+  history: string,
+  chatSummary: string,
+  facts: any,
+  isMentioned: boolean,
+  aiClient: any,
+  activity: any
+}) {
+  const { message, history, chatSummary, facts, isMentioned, aiClient, activity } = params;
+  try {
+    const finalPrompt = `${SYSTEM_PROMPT}
+
+---
+[Server Summary]: ${chatSummary}
+[Bot Mood]: ${facts.mood}
+
+[Your Memory]:
+- nicknames you use for them: ${facts.nicks.join(', ') || 'none yet'}
+- what you know about ${message.member?.displayName || message.author.username}: ${facts.profile.join(' | ') || 'just met them, no info yet'}
+- server inside jokes: ${facts.jokes.join(', ') || 'none yet'}
+- use this to personalize naturally. never force it.
+- mood: ${facts.intent}
+
+[Recent Chat History]:
+${history}
+
+[Current Focus]: ${message.member?.displayName || message.author.username}: "${message.content}"
+
+Output your reply + DATA block:`;
+
+    console.log(`[Generation Phase Input]:\n${finalPrompt}`);
+
+    const aiResponse = await aiClient.models.generateContent({
+      model: MODEL_NAME,
+      contents: [{ role: 'user', parts: [{ text: finalPrompt }] }],
+      config: { temperature: 1.0 },
+    });
+
+    const raw = aiResponse.text || '';
+    console.log(`[Generation Phase Output]:\n${raw}`);
+    const { visibleText, intel } = extractDataBlock(raw);
+
+    if (!visibleText) {
+      console.log(`[Pipeline End] AI generated empty visible text.`);
+      return;
+    }
+
+    if (intel?.break_needed) {
+      channelMutedUntil.set(message.channelId, Date.now() + 600000);
+      activity.activeUntil = 0;
+      botClient?.user?.setPresence({ status: 'dnd' });
+    } else if (intel?.stay_active) {
+      activity.activeUntil = Date.now() + 120000;
+    }
+
+    activity.lastRepliedAt = Date.now();
+    channelActivity.set(message.channelId, activity);
+    if (intel?.mood_after) {
+      botMood.set(message.guildId!, intel.mood_after);
+    }
+    botClient?.user?.setPresence({ status: 'online' });
+
+    if ('sendTyping' in message.channel) {
+      await (message.channel as any).sendTyping();
+    }
+
+    const finalResponse = visibleText.trim();
+    const delay = 600 + (finalResponse.length * 15);
+    
+    setTimeout(async () => {
+      // Use reply for direct pings or 20% random
+      const useReply = isMentioned || Math.random() < 0.2;
+      if (useReply) {
+        await message.reply(finalResponse);
+      } else {
+        await (message.channel as any).send(finalResponse);
+      }
+      const displayName = message.member?.displayName || message.author.username;
+      await updateMemory(message.guildId!, message.author.id, displayName, message.content, finalResponse, intel);
+    }, delay);
+
+  } catch (e) { console.error("AI Drift:", e); }
+}
+
 // ─── BOT ENTRY ────────────────────────────────────────────────────────────────
 
 export async function startBot(token: string) {
@@ -439,7 +524,7 @@ export async function startBot(token: string) {
 
     // ── Aggregation Window (Debounce) ──
     // If mentioned, we respond faster, but still wait for the "burst" to conclude.
-    const windowTime = isMentioned ? 1000 : DEBOUNCE_WINDOW_MS;
+    const windowTime = isMentioned ? 500 : DEBOUNCE_WINDOW_MS;
 
     if (pendingTriggers.has(message.channelId)) {
       clearTimeout(pendingTriggers.get(message.channelId));
@@ -455,6 +540,38 @@ export async function startBot(token: string) {
       // Cooldown check
       if (!isMentioned && now - activity.lastRepliedAt < REPLY_COOLDOWN_MS) {
         console.log(`[Skip] Cooldown active for ${message.channelId}. Last reply: ${now - activity.lastRepliedAt}ms ago`);
+        return;
+      }
+
+      // Direct ping = always reply, skip decision phase
+      if (isMentioned) {
+        activity.activeUntil = now + 120000;
+        activity.session = undefined;
+        channelActivity.set(message.channelId, activity);
+        // skip to generation directly
+        const recentMsgs = await message.channel.messages.fetch({ limit: 12 });
+        const history = recentMsgs
+          .map((m: any) => {
+            const name = m.author.id === botClient?.user?.id ? 'ME' : (m.member?.displayName || m.author.username);
+            return `${name}: ${m.content}`;
+          })
+          .reverse()
+          .join('\n');
+        const serverCtx = await getServerContext(message.guildId!);
+        const chatSummary = await getOrUpdateSummary(message.guildId!, history);
+        const userCtx = await getUserContext(message.guildId!, message.author.id);
+        const aiClient = await getOrInitAI();
+        if (!aiClient) return;
+        const currentMood = botMood.get(message.guildId!) || 'chill';
+        const facts = {
+          jokes: (serverCtx?.insideJokes || []).slice(-5),
+          intent: serverCtx?.currentIntent || 'chill',
+          nicks: (userCtx?.nicknames || []).slice(-3),
+          profile: (userCtx?.profile || []).slice(-10),
+          mood: currentMood,
+        };
+        // jump straight to generation
+        await generateAndSend({ message, history, chatSummary, facts, isMentioned, aiClient, activity });
         return;
       }
 
@@ -519,7 +636,8 @@ read the ENTIRE conversation above first, then ask yourself:
 SKIP if:
 - two people are clearly talking to each other and the bot is not part of that flow
 - the bot already replied recently and nobody engaged with it
-- the latest message is filler, one word, or directed at a specific person
+- the latest message is filler or one word AND does not mention the bot
+- the latest message is directed at a specific person who is NOT the bot
 - jumping in would feel forced or annoying
 
 REPLY if:
@@ -548,84 +666,10 @@ when unsure → SKIP. being quiet is always better than being annoying.`;
           return;
         }
 
-        if (isMentioned) {
-          activity.activeUntil = now + 120000;
-          activity.session = undefined;
-        }
-
         console.log(`[Generation Phase Start] Decision was REPLY. Pushing to Generator...`);
 
         // ── Step 2: Generation Phase ──
-        const finalPrompt = `${SYSTEM_PROMPT}
-
----
-[Server Summary]: ${chatSummary}
-[Bot Mood]: ${facts.mood}
-
-[Your Memory]:
-- nicknames you use for them: ${facts.nicks.join(', ') || 'none yet'}
-- what you know about ${message.member?.displayName || message.author.username}: ${facts.profile.join(' | ') || 'just met them, no info yet'}
-- server inside jokes: ${facts.jokes.join(', ') || 'none yet'}
-- use this to personalize naturally. never force it.
-- mood: ${facts.intent}
-
-[Recent Chat History]:
-${history}
-
-[Current Focus]: ${message.member?.displayName || message.author.username}: "${message.content}"
-
-Output your reply + DATA block:`;
-
-        console.log(`[Generation Phase Input]:\n${finalPrompt}`);
-
-        const aiResponse = await aiClient.models.generateContent({
-          model: MODEL_NAME,
-          contents: [{ role: 'user', parts: [{ text: finalPrompt }] }],
-          config: { temperature: 1.0 },
-        });
-
-        const raw = aiResponse.text || '';
-        console.log(`[Generation Phase Output]:\n${raw}`);
-        const { visibleText, intel } = extractDataBlock(raw);
-
-        if (!visibleText) {
-          console.log(`[Pipeline End] AI generated empty visible text.`);
-          return;
-        }
-
-        if (intel?.break_needed) {
-          channelMutedUntil.set(message.channelId, Date.now() + 600000);
-          activity.activeUntil = 0;
-          botClient?.user?.setPresence({ status: 'dnd' });
-        } else if (intel?.stay_active) {
-          activity.activeUntil = Date.now() + 120000;
-        }
-
-        activity.lastRepliedAt = Date.now();
-        channelActivity.set(message.channelId, activity);
-        if (intel?.mood_after) {
-          botMood.set(message.guildId!, intel.mood_after);
-        }
-        botClient?.user?.setPresence({ status: 'online' });
-
-        if ('sendTyping' in message.channel) {
-          await (message.channel as any).sendTyping();
-        }
-
-        const finalResponse = visibleText.trim();
-        const delay = 600 + (finalResponse.length * 15);
-        
-        setTimeout(async () => {
-          // Use reply for direct pings or 20% random
-          const useReply = isMentioned || Math.random() < 0.2;
-          if (useReply) {
-            await message.reply(finalResponse);
-          } else {
-            await (message.channel as any).send(finalResponse);
-          }
-          const displayName = message.member?.displayName || message.author.username;
-          await updateMemory(message.guildId!, message.author.id, displayName, message.content, finalResponse, intel);
-        }, delay);
+        await generateAndSend({ message, history, chatSummary, facts, isMentioned, aiClient, activity });
 
       } catch (e) { console.error("AI Drift:", e); }
 
