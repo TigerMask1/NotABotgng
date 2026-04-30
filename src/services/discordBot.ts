@@ -204,17 +204,21 @@ async function getOrInitGroq() {
 }
 
 async function generateChatResponse(prompt: string) {
+  console.log("[AI] Starting generation...");
   const groqClient = await getOrInitGroq();
   if (groqClient) {
     try {
+      console.log("[AI] Using Groq (llama-3.3-70b-versatile)...");
       const completion = await groqClient.chat.completions.create({
         messages: [{ role: "user", content: prompt }],
         model: MODEL_NAME,
         temperature: 1.0,
       });
-      return completion.choices[0]?.message?.content || "";
+      const response = completion.choices[0]?.message?.content || "";
+      console.log("[AI] Groq Success. Bytes:", response.length);
+      return response;
     } catch (e) {
-      console.error("Groq fail, falling back to Gemini:", e);
+      console.error("[AI] Groq failed, falling back to Gemini:", e);
     }
   }
 
@@ -222,17 +226,21 @@ async function generateChatResponse(prompt: string) {
   const gemini = await getOrInitAI();
   if (gemini) {
     try {
-      const aiResponse = await (gemini as any).models.generateContent({
-        model: "gemini-2.0-flash-exp",
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        config: { temperature: 1.0 },
-      });
-      return aiResponse.text || "";
+      console.log("[AI] Using Gemini Fallback (gemini-2.0-flash-exp)...");
+      const model = (gemini as any).getGenerativeModel?.({ model: "gemini-2.0-flash-exp" }) || (gemini as any).models?.getGenerativeModel?.({ model: "gemini-2.0-flash-exp" });
+      
+      // Using standard SDK pattern if previous guess failed
+      const genModel = (gemini as any).getGenerativeModel({ model: "gemini-2.0-flash-exp" });
+      const result = await genModel.generateContent(prompt);
+      const response = result.response.text();
+      console.log("[AI] Gemini Success. Bytes:", response.length);
+      return response;
     } catch (e) {
-      console.error("Gemini fallback fail:", e);
+      console.error("[AI] Gemini fallback fail:", e);
     }
   }
 
+  console.error("[AI] All providers failed.");
   return "";
 }
 
@@ -344,25 +352,39 @@ export async function startBot(token: string) {
     // ── Aggregation Window (Debounce) ──
     // If mentioned, we respond faster, but still wait for the "burst" to conclude.
     const windowTime = isMentioned ? 1000 : DEBOUNCE_WINDOW_MS;
+    console.log(`[Chat] Msg from ${message.author.username} in <#${message.channelId}>. Mentioned: ${isMentioned}. Window: ${windowTime}ms`);
+
+    if (isMentioned) {
+      botClient?.user?.setPresence({ status: 'online' });
+    }
 
     if (pendingTriggers.has(message.channelId)) {
+      console.log(`[Chat] Resetting debounce window for <#${message.channelId}>`);
       clearTimeout(pendingTriggers.get(message.channelId));
     }
 
     const trigger = setTimeout(async () => {
       pendingTriggers.delete(message.channelId);
+      console.log(`[Chat] Triggering response check for <#${message.channelId}>`);
       
       const activity = channelActivity.get(message.channelId) || { count: 0, lastReset: now, lastRepliedAt: 0 };
       
       // Cooldown check
-      if (!isMentioned && now - activity.lastRepliedAt < REPLY_COOLDOWN_MS) return;
+      if (!isMentioned && now - activity.lastRepliedAt < REPLY_COOLDOWN_MS) {
+        console.log(`[Chat] Skipping: Cooldown active (${now - activity.lastRepliedAt}ms < ${REPLY_COOLDOWN_MS}ms)`);
+        return;
+      }
 
       const mutedUntil = channelMutedUntil.get(message.channelId);
-      if (mutedUntil && now < mutedUntil) return;
+      if (mutedUntil && now < mutedUntil) {
+        console.log(`[Chat] Skipping: Channel is muted for ${mutedUntil - now}ms`);
+        return;
+      }
 
       if (isMentioned) {
         activity.activeUntil = now + 120000;
         activity.session = undefined;
+        botClient?.user?.setPresence({ status: 'online' });
       }
 
       if (now - activity.lastReset > 300000) {
@@ -432,7 +454,13 @@ examples of when to SKIP:
         const raw = await generateChatResponse(finalPrompt);
         const { visibleText, intel } = extractDataBlock(raw || '');
 
-        if (isSkip(raw || '', intel) || !visibleText) return;
+        if (isSkip(raw || '', intel) || !visibleText) {
+          console.log(`[Chat] Decision: SKIP. Raw: ${raw?.substring(0, 50)}...`);
+          return;
+        }
+
+        console.log(`[Chat] Decision: REPLY. Intel: ${JSON.stringify(intel)}`);
+        console.log(`[Chat] Response: "${visibleText}"`);
 
         if (intel?.break_needed) {
           channelMutedUntil.set(message.channelId, Date.now() + 600000);
