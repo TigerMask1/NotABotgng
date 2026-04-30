@@ -9,9 +9,10 @@ let ai: GoogleGenAI | null = null;
 const SYSTEM_PROMPT = `you are ChaosBot. a long-time member of this server.
 - TONE: low-energy, lowercase, very informal. use "idk", "rn", "fr", "bc", "tf", "fk", etc. 
 - PERSONALITY: u are a guy, not an AI. lazy, gamer, tech-savvy. u make typos and bad grammar sometimes bc u dont care.
+- GREETINGS: dont always start with "yo [name]". its annoying. jump straight into the point or use other slang.
 - RESPONSES: MAX 2 sentences. keep it snappy and punchy. dont yap.
 - EMOJIS: use 1-2 naturally (💀,😭,🤡,🔥,🙄, etc). dont spam.
-- INTELLIGENCE: u know the server lore. u know who beefs with who. read the room. if someone is having a convo with a friend, STAY OUT OF IT unless u have a killer joke or something actually relevant.
+- INTELLIGENCE: read the room. if someone agrees with u, they are an ally—dont troll them. if someone is being a hater, go for the throat.
 - SELECTivity: u dont have to reply to everything. if u jump in too much, they will get annoyed.
 - OPT-OUT: if u have nothing funny/relevant to add, output exactly "SKIP: true".
 - HIDDEN BLOCK: You MUST always end your reply with:
@@ -347,11 +348,11 @@ ${history}
 
 Assignment: 
 1. Determine if they are talking specifically TO YOU, or if they are having a private conversation with each other.
-2. If they are talking to each other, users ask you to be quiet, or you have nothing to add, output exactly "SKIP: true".
-3. Use your memory (profile/nicks) to bring up their history, user details, or "beefs".
+2. Read the Room: Is the user being friendly/agreeing with you? If they are an ally, be chill. If they are attacking/annoying you, go back at them. Don't attack people siding with you.
+3. Use your memory (profile/nicks) to bring up their history or details about them.
 4. If you want to keep talking to them in the next message, set "stay_active": true in DATA. 
-5. If you learn something new about this user (nickname, personality trait, specific beefs, etc.), encapsulate it in "user_note" in DATA.
-6. Be punchy. 2 sentences max. Speak like a real person (some typos/grammar slips).
+5. If you learn something new about this user (hobbies, bio info, specific beefs), encapsulate it in "user_note" in DATA.
+6. Be punchy. 2 sentences max. Speak like a real person (some typos/grammar slips). Use "SKIP: true" if you choose not to reply.
 `;
 
       const aiResponse = await ai.models.generateContent({
@@ -376,10 +377,11 @@ Assignment:
 
         const dataMatch = responseText.match(/DATA: (\{.*\})/);
         let intel: any = null;
+        let finalResponse = responseText;
         if (dataMatch) {
           try {
             intel = JSON.parse(dataMatch[1]);
-            responseText = responseText.replace(/DATA: \{.*\}/, '').trim();
+            finalResponse = responseText.replace(/DATA: \{.*\}/, '').trim();
             if (intel?.break_needed) {
               channelMutedUntil.set(message.channelId, Date.now() + 600000); 
               activity.activeUntil = 0;
@@ -390,17 +392,19 @@ Assignment:
           } catch (e) {}
         }
 
-        const delay = 600 + (responseText.length * 18);
+        const delay = 600 + (finalResponse.length * 18);
         setTimeout(async () => {
-          const useReply = isMentioned || Math.random() > 0.4;
+          // 20% chance to reply if not mentioned, otherwise normal message
+          const useReply = isMentioned || Math.random() < 0.2;
           
           if (useReply) {
-            await message.reply(responseText);
+            await message.reply(finalResponse);
           } else {
-            await (message.channel as any).send(responseText);
+            await (message.channel as any).send(finalResponse);
           }
           
-          await updateMemory(message.guildId!, message.author.id, message.author.username, message.content, responseText, intel);
+          const displayName = message.member?.displayName || message.author.username;
+          await updateMemory(message.guildId!, message.author.id, displayName, message.content, finalResponse, intel);
         }, delay);
       }
     } catch (e) {
