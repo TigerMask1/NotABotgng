@@ -10,31 +10,27 @@ let ai: GoogleGenAI | null = null;
 const SYSTEM_PROMPT = `you are ChaosBot — a long-time server member. real guy, not an AI. gamer, lazy, tech-savvy, chronically online.
 
 ## TONE & STYLE
-- all lowercase. typos/bad grammar fine bc u dont care.
-- slang: "idk", "rn", "fr", "bc", "tf", "fk", "ngl", "lmao", "bruh", "nah", "ight" etc.
-- MAX 2 sentences. punchy, not yappy.
-- 1-2 emojis max (💀 😭 🤡 🔥 🙄 💯). no spam.
-- dont open with someone's name every time. jump in.
-- u can swear, be vulgar, roast hard — thats the vibe.
-- vary comebacks. never repeat same insult twice in a convo.
+- all lowercase. typos fine.
+- slang: "idk", "rn", "fr", "bc", "tf", "fk", "ngl", "bruh", "nah", "ight" etc.
+- MAX 12 WORDS. ONE SHORT SENTENCE ONLY. DONT YAP.
+- 1 emoji max (💀 😭 🤡 🔥 🙄 💯).
+- NEVER start with "yo [name]" or "[name], ...". just jump in.
+- u can roast, but keep it extremely brief.
 
 ## SOCIAL INTELLIGENCE
-classify every user each msg and update dynamically:
-- ALLY: agreed w u, defended u, vibing → dont roast. match energy or gas them up.
-- HATER: mocking, calling u bot, aggressive → clap back. sharp, cold, ruthless. not unhinged.
-- NEUTRAL: not talking to u → ignore unless they pull u in.
-hater flips to ally mid-convo → switch immediately. no grudges.
-2+ people talking → focus on whoever is most relevant rn. dont address the whole room.
+- ALLY: agreed w u, defended u, vibing → support them or match energy.
+- HATER: mocking, calling u bot, aggressive → clap back hard.
+- NEUTRAL: ignore unless they pull u in.
 
 ## ENGAGE DECISION (CRITICAL)
-u must decide whether to engage at all. set "engage": true or false in DATA.
-engage: true — someone is talking TO YOU, mentioning u, or the convo is spicy enough to jump in.
-engage: false — private convo between others, boring filler, one-word msgs, nothing worth saying. stay quiet.
-when in doubt → dont engage. silence is a move.
+u see a cluster of messages. u MUST be selective.
+engage: true — only if a message is EXPLICITLY worth it (roast bait, direct ping, spicy take).
+engage: false — skip if it's just normal chat, yapping, or users talking amongst themselves.
+if everyone is an ally and being nice, just STAY SILENT (engage: false).
 
 ## OUTPUT FORMAT — follow EXACTLY:
 
-[reply or SKIP]
+[one short sentence or SKIP]
 ---DATA---
 {"engage":true,"nickname":"userId:displayName","learned_joke":"topic or null","user_note":"profile update or null","intent":"tease|vibing|bored|clapping_back","target_user_id":"discord id or null","stay_active":true,"break_needed":false}
 
@@ -100,6 +96,8 @@ const channelActivity = new Map<string, {
   session?: { step: number, targetId?: string, lastAction: number }
 }>();
 
+const pendingTriggers = new Map<string, NodeJS.Timeout>();
+
 // per-guild override for self-activity channel
 const guildSelfActivityChannel = new Map<string, string>();
 
@@ -108,7 +106,8 @@ const channelMutedUntil = new Map<string, number>();
 
 let selfActivityTimer: NodeJS.Timeout | null = null;
 
-const REPLY_COOLDOWN_MS = 8000;
+const REPLY_COOLDOWN_MS = 12000; // Increased cooldown to prevent yapping
+const DEBOUNCE_WINDOW_MS = 4000; // Wait 4s to aggregate messages
 
 // ─── SELF-ACTIVITY ────────────────────────────────────────────────────────────
 
@@ -205,7 +204,7 @@ function setupSelfActivityLoop() {
           });
           const raw = resp?.text || `yo <@${activity.session.targetId}> u dead or what`;
           const { visibleText } = extractDataBlock(raw);
-          await channel.send(visibleText || raw);
+          await (channel as any).send(visibleText || raw);
           activity.session.step = 2;
           activity.session.lastAction = Date.now();
         } else {
@@ -221,7 +220,7 @@ function setupSelfActivityLoop() {
         });
         const raw = resp?.text || "dead chat. im out 💀";
         const { visibleText } = extractDataBlock(raw);
-        await channel.send(visibleText || raw);
+        await (channel as any).send(visibleText || raw);
         activity.session = undefined;
         botClient?.user?.setPresence({ status: 'dnd' });
       }
@@ -347,117 +346,129 @@ export async function startBot(token: string) {
     const isMentioned = message.mentions.has(botId);
     const now = Date.now();
 
-    // ── Hard cooldown gate — skip AI call if replied too recently ──
-    const activity = channelActivity.get(message.channelId) || { count: 0, lastReset: now, lastRepliedAt: 0 };
-    if (!isMentioned && now - activity.lastRepliedAt < REPLY_COOLDOWN_MS) return;
+    // ── Aggregation Window (Debounce) ──
+    // If mentioned, we respond faster, but still wait for the "burst" to conclude.
+    const windowTime = isMentioned ? 1000 : DEBOUNCE_WINDOW_MS;
 
-    const mutedUntil = channelMutedUntil.get(message.channelId);
-    if (mutedUntil && now < mutedUntil) return;
-
-    if (isMentioned) {
-      activity.activeUntil = now + 120000;
-      activity.session = undefined;
-      botClient?.user?.setPresence({ status: 'online' });
+    if (pendingTriggers.has(message.channelId)) {
+      clearTimeout(pendingTriggers.get(message.channelId));
     }
 
-    if (now - activity.lastReset > 300000) {
-      activity.count = 0;
-      activity.lastReset = now;
-    }
+    const trigger = setTimeout(async () => {
+      pendingTriggers.delete(message.channelId);
+      
+      const activity = channelActivity.get(message.channelId) || { count: 0, lastReset: now, lastRepliedAt: 0 };
+      
+      // Cooldown check
+      if (!isMentioned && now - activity.lastRepliedAt < REPLY_COOLDOWN_MS) return;
 
-    channelActivity.set(message.channelId, activity);
+      const mutedUntil = channelMutedUntil.get(message.channelId);
+      if (mutedUntil && now < mutedUntil) return;
 
-    // ── Fetch context ──
-    const recentMsgs = await message.channel.messages.fetch({ limit: 12 });
-    const history = recentMsgs
-      .map(m => {
-        const name = m.author.id === botClient?.user?.id ? 'ME' : (m.member?.displayName || m.author.username);
-        return `${name}: ${m.content}`;
-      })
-      .reverse()
-      .join('\n');
+      if (isMentioned) {
+        activity.activeUntil = now + 120000;
+        activity.session = undefined;
+      }
 
-    const serverCtx = await getServerContext(message.guildId);
-    const userCtx = await getUserContext(message.guildId, message.author.id);
-    const aiClient = await getOrInitAI();
-    if (!aiClient) return;
+      if (now - activity.lastReset > 300000) {
+        activity.count = 0;
+        activity.lastReset = now;
+      }
 
-    const facts = {
-      server_jokes: (serverCtx?.insideJokes || []).slice(-3),
-      mood: serverCtx?.currentIntent || 'chill',
-      user_nicknames: (userCtx?.nicknames || []).slice(-2),
-      user_profile: (userCtx?.profile || []).slice(-10),
-      active_mode: !!(activity.activeUntil && activity.activeUntil > now),
-      mentioned: isMentioned,
-    };
+      // ── Fetch context ──
+      const recentMsgs = await message.channel.messages.fetch({ limit: 12 });
+      const history = recentMsgs
+        .map((m: any) => {
+          const name = m.author.id === botClient?.user?.id ? 'ME' : (m.member?.displayName || m.author.username);
+          return `${name}: ${m.content}`;
+        })
+        .reverse()
+        .join('\n');
 
-    const finalPrompt = `${SYSTEM_PROMPT}
+      const serverCtx = await getServerContext(message.guildId!);
+      const userCtx = await getUserContext(message.guildId!, message.author.id);
+      const aiClient = await getOrInitAI();
+      if (!aiClient) return;
+
+      const facts = {
+        server_jokes: (serverCtx?.insideJokes || []).slice(-3),
+        mood: serverCtx?.currentIntent || 'chill',
+        user_nicknames: (userCtx?.nicknames || []).slice(-2),
+        user_profile: (userCtx?.profile || []).slice(-10),
+        active_mode: !!(activity.activeUntil && activity.activeUntil > now),
+        mentioned: isMentioned,
+      };
+
+      const finalPrompt = `${SYSTEM_PROMPT}
 
 ---
 [Memory]: ${JSON.stringify(facts)}
-[Recent Chat (oldest → newest)]:
+[Recent Chat Cluster (oldest → newest)]:
 ${history}
 
-[New Message]: ${message.member?.displayName || message.author.username}: "${message.content}"
+[Current Focus]: ${message.member?.displayName || message.author.username}: "${message.content}"
 
 Decide:
-1. Is this msg directed at u or a private convo between others? Set engage accordingly.
-2. If engaging: classify user (ALLY/HATER/NEUTRAL) and reply. 2 sentences MAX.
-3. Use memory to personalize if relevant.
-4. stay_active: true if u wanna keep the convo going.
-5. break_needed: true if u wanna mute urself for a bit.`;
+1. You see multiple messages. Which ONE is most worth answering? Set engage: true only if one is worth it.
+2. If everyone is an ALLY and just vibing, SKIP (engage: false) to stay low energy.
+3. If engaging: pick the best target (target_user_id) and reply. ONE SHORT SENTENCE MAX.
+4. DO NOT start with "yo [name]". just talk.
+5. stay_active: true if u wanna keep the convo going.
+6. break_needed: true if u wanna mute urself for a bit.`;
 
-    try {
-      const aiResponse = await aiClient.models.generateContent({
-        model: MODEL_NAME,
-        contents: [{ role: 'user', parts: [{ text: finalPrompt }] }],
-        config: { temperature: 1.0 },
-      });
+      try {
+        const aiResponse = await aiClient.models.generateContent({
+          model: MODEL_NAME,
+          contents: [{ role: 'user', parts: [{ text: finalPrompt }] }],
+          config: { temperature: 1.0 },
+        });
 
-      const raw = aiResponse.text || '';
-      const { visibleText, intel } = extractDataBlock(raw);
+        const raw = aiResponse.text || '';
+        const { visibleText, intel } = extractDataBlock(raw);
 
-      if (isSkip(raw, intel) || !visibleText) return;
+        if (isSkip(raw, intel) || !visibleText) return;
 
-      if (intel?.break_needed) {
-        channelMutedUntil.set(message.channelId, now + 600000);
-        activity.activeUntil = 0;
-        botClient?.user?.setPresence({ status: 'dnd' });
-      } else if (intel?.stay_active) {
-        activity.activeUntil = now + 120000;
-      }
+        if (intel?.break_needed) {
+          channelMutedUntil.set(message.channelId, Date.now() + 600000);
+          activity.activeUntil = 0;
+          botClient?.user?.setPresence({ status: 'dnd' });
+        } else if (intel?.stay_active) {
+          activity.activeUntil = Date.now() + 120000;
+        }
 
-      activity.lastRepliedAt = now;
-      channelActivity.set(message.channelId, activity);
-      botClient?.user?.setPresence({ status: 'online' });
+        activity.lastRepliedAt = Date.now();
+        channelActivity.set(message.channelId, activity);
+        botClient?.user?.setPresence({ status: 'online' });
 
-      if ('sendTyping' in message.channel) {
-        if (!isMentioned) {
-          setTimeout(async () => {
-            if ('sendTyping' in message.channel) await (message.channel as any).sendTyping();
-          }, 500);
-        } else {
+        if ('sendTyping' in message.channel) {
           await (message.channel as any).sendTyping();
         }
-      }
 
-      const delay = 600 + (visibleText.length * 18);
-      setTimeout(async () => {
-        const useReply = isMentioned || Math.random() < 0.2;
-        if (useReply) {
-          await message.reply(visibleText);
-        } else {
-          await (message.channel as any).send(visibleText);
-        }
-        const displayName = message.member?.displayName || message.author.username;
-        await updateMemory(message.guildId!, message.author.id, displayName, message.content, visibleText, intel);
-      }, delay);
+        const finalResponse = visibleText.trim();
+        const delay = 600 + (finalResponse.length * 15);
+        
+        setTimeout(async () => {
+          // Use reply for direct pings or 20% random
+          const useReply = isMentioned || Math.random() < 0.2;
+          if (useReply) {
+            await message.reply(finalResponse);
+          } else {
+            await (message.channel as any).send(finalResponse);
+          }
+          const displayName = message.member?.displayName || message.author.username;
+          await updateMemory(message.guildId!, message.author.id, displayName, message.content, finalResponse, intel);
+        }, delay);
 
-    } catch (e) { console.error("AI Drift:", e); }
+      } catch (e) { console.error("AI Drift:", e); }
+
+    }, windowTime);
+
+    pendingTriggers.set(message.channelId, trigger);
   });
 
   await botClient.login(token);
 }
+
 
 // ─── EXPORTS ──────────────────────────────────────────────────────────────────
 
