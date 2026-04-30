@@ -1,7 +1,7 @@
 import { Client, GatewayIntentBits, Message, Partials, Events } from 'discord.js';
 import { GoogleGenAI } from "@google/genai";
 import Groq from "groq-sdk";
-import { db } from './firebase.ts';
+import { db, auth } from './firebase.ts';
 import { doc, getDoc, setDoc, arrayUnion } from 'firebase/firestore';
 
 let botClient: Client | null = null;
@@ -33,6 +33,44 @@ NEUTRAL rule: if someone's just chatting casually → vibe with it, match their 
 REPEAT rule: never say something you just said. check history. if ur last message was similar → skip or flip the angle entirely.`;
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: (auth as any).currentUser?.uid,
+      email: (auth as any).currentUser?.email,
+      emailVerified: (auth as any).currentUser?.emailVerified,
+      isAnonymous: (auth as any).currentUser?.isAnonymous,
+    },
+    operationType,
+    path
+  }
+  const serialized = JSON.stringify(errInfo);
+  console.error('Firestore Error: ', serialized);
+  throw new Error(serialized);
+}
 
 function extractDataBlock(raw: string): { visibleText: string; intel: any | null } {
   const dataMatch = raw.match(/DATA:\s*(\{[\s\S]*?\})\s*$/);
@@ -247,34 +285,61 @@ async function generateChatResponse(prompt: string) {
 // ─── FIREBASE ─────────────────────────────────────────────────────────────────
 
 async function getServerContext(guildId: string) {
+  const path = `servers/${guildId}`;
   try {
     const snap = await getDoc(doc(db, 'servers', guildId));
     return snap.exists() ? snap.data() : null;
-  } catch { return null; }
+  } catch (e) {
+    handleFirestoreError(e, OperationType.GET, path);
+    return null;
+  }
 }
 
 async function getUserContext(guildId: string, userId: string) {
+  const path = `servers/${guildId}/users/${userId}`;
   try {
     const snap = await getDoc(doc(db, 'servers', guildId, 'users', userId));
     return snap.exists() ? snap.data() : null;
-  } catch { return null; }
+  } catch (e) {
+    handleFirestoreError(e, OperationType.GET, path);
+    return null;
+  }
 }
 
 async function updateMemory(guildId: string, userId: string, username: string, content: string, response: string, intel?: any) {
   try {
+    const serverPath = `servers/${guildId}`;
     const serverUpdate: any = { updatedAt: new Date().toISOString() };
     if (intel?.learned_joke) serverUpdate.insideJokes = arrayUnion(intel.learned_joke);
     if (intel?.intent) serverUpdate.currentIntent = intel.intent;
-    await setDoc(doc(db, 'servers', guildId), serverUpdate, { merge: true });
+    
+    try {
+      await setDoc(doc(db, 'servers', guildId), serverUpdate, { merge: true });
+    } catch (e) {
+      handleFirestoreError(e, OperationType.WRITE, serverPath);
+    }
 
+    const userPath = `servers/${guildId}/users/${userId}`;
     const userUpdate: any = { updatedAt: new Date().toISOString(), lastSeenUsername: username };
     if (intel?.user_note) userUpdate.profile = arrayUnion(intel.user_note);
     if (intel?.nickname?.includes(':')) {
       const [targetId, nick] = intel.nickname.split(':');
-      await setDoc(doc(db, 'servers', guildId, 'users', targetId), { nicknames: arrayUnion(nick) }, { merge: true });
+      const targetPath = `servers/${guildId}/users/${targetId}`;
+      try {
+        await setDoc(doc(db, 'servers', guildId, 'users', targetId), { nicknames: arrayUnion(nick) }, { merge: true });
+      } catch (e) {
+        handleFirestoreError(e, OperationType.WRITE, targetPath);
+      }
     }
-    await setDoc(doc(db, 'servers', guildId, 'users', userId), userUpdate, { merge: true });
-  } catch (e) { console.error("Memory failure:", e); }
+    
+    try {
+      await setDoc(doc(db, 'servers', guildId, 'users', userId), userUpdate, { merge: true });
+    } catch (e) {
+      handleFirestoreError(e, OperationType.WRITE, userPath);
+    }
+  } catch (e) { 
+    console.error("Memory failure:", e); 
+  }
 }
 
 // ─── BOT ENTRY ────────────────────────────────────────────────────────────────

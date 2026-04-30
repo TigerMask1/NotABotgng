@@ -6,19 +6,33 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // Servers and users
-    // This bot is designed to be managed via server-side logic (Express).
-    // If we wanted the dashboard to read directly, we would add rules here.
-    // For now, only the server needs access. 
-    // In many cases, using the client SDK on a server-side environment (like this)
-    // results in the request being authenticated if the environment has credentials,
-    // but here we are using the public config.
-    
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Server-side environment check: Since this is a server-side bot using client SDK without explicit auth,
+    // we allow public access for now BUT we should stick to strict keys and sizes.
+    // In a prod app, you'd use Firebase Admin or Auth to secure this.
+
     match /servers/{guildId} {
-      allow read, write: if true; // In a real app, restrict this to the bot's service account or admin
+      allow get: if isValidId(guildId);
+      allow list: if false; // No blanket listing
       
+      allow create, update: if isValidId(guildId) &&
+        request.resource.data.keys().hasAll(['updatedAt']) &&
+        request.resource.data.updatedAt is string;
+
       match /users/{userId} {
-        allow read, write: if true;
+        allow get: if isValidId(userId);
+        allow list: if false;
+
+        allow create, update: if isValidId(userId) &&
+          request.resource.data.keys().hasAll(['updatedAt']);
       }
     }
   }
