@@ -1,7 +1,44 @@
 import { Client, GatewayIntentBits, Message, Partials, Events } from 'discord.js';
 import { GoogleGenAI } from "@google/genai";
-import { db } from './firebase.ts';
+import { db, auth } from './firebase.ts';
 import { doc, getDoc, setDoc, arrayUnion } from 'firebase/firestore';
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+    },
+    operationType,
+    path
+  }
+  console.error('[Firestore Error]:', JSON.stringify(errInfo, null, 2));
+  throw new Error(JSON.stringify(errInfo));
+}
 
 let botClient: Client | null = null;
 let ai: GoogleGenAI | null = null;
@@ -243,13 +280,18 @@ async function getOrInitAI() {
 // ─── FIREBASE ─────────────────────────────────────────────────────────────────
 
 async function getServerContext(guildId: string) {
+  const path = `servers/${guildId}`;
   try {
     const snap = await getDoc(doc(db, 'servers', guildId));
     return snap.exists() ? snap.data() : null;
-  } catch { return null; }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, path);
+    return null;
+  }
 }
 
 async function getOrUpdateSummary(guildId: string, history: string): Promise<string> {
+  const path = `servers/${guildId}`;
   try {
     const snap = await getDoc(doc(db, 'servers', guildId));
     const data = snap.exists() ? snap.data() : {};
@@ -291,17 +333,26 @@ output only the summary, no labels or headers.`;
     }, { merge: true });
 
     return summary;
-  } catch { return ''; }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+    return '';
+  }
 }
 
 async function getUserContext(guildId: string, userId: string) {
+  const path = `servers/${guildId}/users/${userId}`;
   try {
     const snap = await getDoc(doc(db, 'servers', guildId, 'users', userId));
     return snap.exists() ? snap.data() : null;
-  } catch { return null; }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, path);
+    return null;
+  }
 }
 
 async function updateMemory(guildId: string, userId: string, username: string, content: string, response: string, intel?: any) {
+  const serverPath = `servers/${guildId}`;
+  const userPath = `servers/${guildId}/users/${userId}`;
   try {
     const serverUpdate: any = { updatedAt: new Date().toISOString() };
     if (intel?.learned_joke) serverUpdate.insideJokes = arrayUnion(intel.learned_joke);
@@ -312,10 +363,17 @@ async function updateMemory(guildId: string, userId: string, username: string, c
     if (intel?.user_note) userUpdate.profile = arrayUnion(intel.user_note);
     if (intel?.nickname?.includes(':')) {
       const [targetId, nick] = intel.nickname.split(':');
-      await setDoc(doc(db, 'servers', guildId, 'users', targetId), { nicknames: arrayUnion(nick) }, { merge: true });
+      const targetPath = `servers/${guildId}/users/${targetId}`;
+      try {
+        await setDoc(doc(db, 'servers', guildId, 'users', targetId), { nicknames: arrayUnion(nick) }, { merge: true });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.WRITE, targetPath);
+      }
     }
     await setDoc(doc(db, 'servers', guildId, 'users', userId), userUpdate, { merge: true });
-  } catch (e) { console.error("Memory failure:", e); }
+  } catch (e) {
+    handleFirestoreError(e, OperationType.WRITE, serverPath);
+  }
 }
 
 // ─── BOT ENTRY ────────────────────────────────────────────────────────────────
@@ -401,13 +459,21 @@ export async function startBot(token: string) {
     const trigger = setTimeout(async () => {
       pendingTriggers.delete(message.channelId);
       
+      console.log(`[Processing Pipeline] Triggered for channel: ${message.channelId}`);
+
       const activity = channelActivity.get(message.channelId) || { count: 0, lastReset: now, lastRepliedAt: 0 };
       
       // Cooldown check
-      if (!isMentioned && now - activity.lastRepliedAt < REPLY_COOLDOWN_MS) return;
+      if (!isMentioned && now - activity.lastRepliedAt < REPLY_COOLDOWN_MS) {
+        console.log(`[Skip] Cooldown active for ${message.channelId}. Last reply: ${now - activity.lastRepliedAt}ms ago`);
+        return;
+      }
 
       const mutedUntil = channelMutedUntil.get(message.channelId);
-      if (mutedUntil && now < mutedUntil) return;
+      if (mutedUntil && now < mutedUntil) {
+        console.log(`[Skip] Channel ${message.channelId} is muted until ${mutedUntil}`);
+        return;
+      }
 
       if (now - activity.lastReset > 300000) {
         activity.count = 0;
@@ -449,6 +515,8 @@ ${chatSummary}
 
 [Target Message]: ${message.member?.displayName || message.author.username}: "${message.content}"`;
 
+      console.log(`[Decision Phase Input]:\n${decisionPrompt}`);
+
       try {
         const decisionResp = await aiClient.models.generateContent({
           model: MODEL_NAME,
@@ -457,10 +525,15 @@ ${chatSummary}
         });
 
         const decision = (decisionResp.text || "").trim().toUpperCase();
-        console.log(`[Decision for ${message.channelId}]: ${decision}`);
+        console.log(`[Decision Phase Output]:\n${decision}`);
         
         const firstWord = decision.split(/\s/)[0];
-        if (firstWord !== "REPLY") return;
+        if (firstWord !== "REPLY") {
+          console.log(`[Pipeline End] AI decided to SKIP.`);
+          return;
+        }
+
+        console.log(`[Generation Phase Start] Decision was REPLY. Pushing to Generator...`);
 
         if (isMentioned) {
           activity.activeUntil = now + 120000;
@@ -488,6 +561,8 @@ ${history}
 
 Output your reply + DATA block:`;
 
+        console.log(`[Generation Phase Input]:\n${finalPrompt}`);
+
         const aiResponse = await aiClient.models.generateContent({
           model: MODEL_NAME,
           contents: [{ role: 'user', parts: [{ text: finalPrompt }] }],
@@ -495,9 +570,13 @@ Output your reply + DATA block:`;
         });
 
         const raw = aiResponse.text || '';
+        console.log(`[Generation Phase Output]:\n${raw}`);
         const { visibleText, intel } = extractDataBlock(raw);
 
-        if (!visibleText) return;
+        if (!visibleText) {
+          console.log(`[Pipeline End] AI generated empty visible text.`);
+          return;
+        }
 
         if (intel?.break_needed) {
           channelMutedUntil.set(message.channelId, Date.now() + 600000);
