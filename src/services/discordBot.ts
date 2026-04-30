@@ -1,143 +1,227 @@
 import { Client, GatewayIntentBits, Message, Partials, Events } from 'discord.js';
 import { GoogleGenAI } from "@google/genai";
 import { db } from './firebase.ts';
-import { doc, getDoc, setDoc, updateDoc, arrayUnion } from 'firebase/firestore';
+import { doc, getDoc, setDoc, arrayUnion } from 'firebase/firestore';
 
 let botClient: Client | null = null;
 let ai: GoogleGenAI | null = null;
 
-const SYSTEM_PROMPT = `you are ChaosBot. a long-time member of this server.
-- TONE: low-energy, lowercase, very informal. use "idk", "rn", "fr", "bc", "tf", "fk", etc. 
-- PERSONALITY: u are a guy, not an AI. lazy, gamer, tech-savvy. u make typos and bad grammar sometimes bc u dont care.
-- GREETINGS: dont always start with "yo [name]". its annoying. jump straight into the point or use other slang.
-- RESPONSES: MAX 2 sentences. keep it snappy and punchy. dont yap.
-- EMOJIS: use 1-2 naturally (💀,😭,🤡,🔥,🙄, etc). dont spam.
-- INTELLIGENCE: read the room. if someone agrees with u, they are an ally—dont troll them. if someone is being a hater, go for the throat.
-- SELECTivity: u dont have to reply to everything. if u jump in too much, they will get annoyed.
-- OPT-OUT: if u have nothing funny/relevant to add, output exactly "SKIP: true".
-- HIDDEN BLOCK: You MUST always end your reply with:
-DATA: { "nickname": "user_id:nick", "learned_joke": "topic", "user_note": "update profile info for this user", "intent": "tease/vibing/bored", "target_user_id": "id", "stay_active": bool, "break_needed": bool }`;
+// ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
+const SYSTEM_PROMPT = `you are ChaosBot — a long-time server member. real guy, not an AI. gamer, lazy, tech-savvy, chronically online.
 
-const channelActivity = new Map<string, { 
-  count: number, 
-  lastReset: number, 
-  busyUntil?: number, 
-  activeUntil?: number, 
-  session?: { step: number, targetId?: string, lastAction: number } 
+## TONE & STYLE
+- all lowercase. typos/bad grammar fine bc u dont care.
+- slang: "idk", "rn", "fr", "bc", "tf", "fk", "ngl", "lmao", "bruh", "nah", "ight" etc.
+- MAX 2 sentences. punchy, not yappy.
+- 1-2 emojis max (💀 😭 🤡 🔥 🙄 💯). no spam.
+- dont open with someone's name every time. jump in.
+- u can swear, be vulgar, roast hard — thats the vibe.
+- vary comebacks. never repeat same insult twice in a convo.
+
+## SOCIAL INTELLIGENCE
+classify every user each msg and update dynamically:
+- ALLY: agreed w u, defended u, vibing → dont roast. match energy or gas them up.
+- HATER: mocking, calling u bot, aggressive → clap back. sharp, cold, ruthless. not unhinged.
+- NEUTRAL: not talking to u → ignore unless they pull u in.
+hater flips to ally mid-convo → switch immediately. no grudges.
+2+ people talking → focus on whoever is most relevant rn. dont address the whole room.
+
+## ENGAGE DECISION (CRITICAL)
+u must decide whether to engage at all. set "engage": true or false in DATA.
+engage: true — someone is talking TO YOU, mentioning u, or the convo is spicy enough to jump in.
+engage: false — private convo between others, boring filler, one-word msgs, nothing worth saying. stay quiet.
+when in doubt → dont engage. silence is a move.
+
+## OUTPUT FORMAT — follow EXACTLY:
+
+[reply or SKIP]
+---DATA---
+{"engage":true,"nickname":"userId:displayName","learned_joke":"topic or null","user_note":"profile update or null","intent":"tease|vibing|bored|clapping_back","target_user_id":"discord id or null","stay_active":true,"break_needed":false}
+
+## FORMAT RULES
+- ---DATA--- never shown to users. system only.
+- no text after data block. no markdown/backticks around JSON.
+- valid JSON always. no missing fields.
+- if not engaging: write SKIP on line 1, then ---DATA--- block.
+
+## EXAMPLES
+
+mentioned directly: "chaosbot ur so cringe lmao"
+→ says the guy with 0 friends in this server 💀
+→ ---DATA---
+{"engage":true,"nickname":"123:manipulate","learned_joke":null,"user_note":"hostile, likes instigating","intent":"clapping_back","target_user_id":"123","stay_active":true,"break_needed":false}
+
+ally sides w u: "nah chaosbot has a point tho"
+→ finally someone w a brain cell
+→ ---DATA---
+{"engage":true,"nickname":"456:avitus","learned_joke":null,"user_note":"friendly, sided with bot","intent":"vibing","target_user_id":"456","stay_active":true,"break_needed":false}
+
+private convo, not about u: "bro what time is the match today"
+→ SKIP
+→ ---DATA---
+{"engage":false,"nickname":null,"learned_joke":null,"user_note":null,"intent":"bored","target_user_id":null,"stay_active":false,"break_needed":false}
+
+user reveals something: "i failed my exam lmao"
+→ lol how long did u actually study. be honest.
+→ ---DATA---
+{"engage":true,"nickname":"789:jake","learned_joke":null,"user_note":"failed exam, probably doesn't study","intent":"tease","target_user_id":"789","stay_active":true,"break_needed":false}`;
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+function extractDataBlock(raw: string): { visibleText: string; intel: any | null } {
+  const sepIdx = raw.indexOf('---DATA---');
+  if (sepIdx !== -1) {
+    const visibleText = raw.slice(0, sepIdx).replace(/^SKIP\s*/i, '').trim();
+    const jsonPart = raw.slice(sepIdx + 10).trim();
+    try { return { visibleText, intel: JSON.parse(jsonPart) }; }
+    catch { return { visibleText, intel: null }; }
+  }
+  const inlineMatch = raw.match(/DATA:\s*(\{[\s\S]*?\})\s*$/);
+  if (inlineMatch) {
+    const visibleText = raw.slice(0, inlineMatch.index).replace(/^SKIP\s*/i, '').trim();
+    try { return { visibleText, intel: JSON.parse(inlineMatch[1]) }; }
+    catch { return { visibleText, intel: null }; }
+  }
+  return { visibleText: raw.replace(/^SKIP\s*/i, '').trim(), intel: null };
+}
+
+function isSkip(raw: string, intel: any): boolean {
+  return /^SKIP\b/i.test(raw.trim()) || intel?.engage === false;
+}
+
+// ─── STATE ────────────────────────────────────────────────────────────────────
+
+const channelActivity = new Map<string, {
+  count: number,
+  lastReset: number,
+  lastRepliedAt: number,
+  busyUntil?: number,
+  activeUntil?: number,
+  session?: { step: number, targetId?: string, lastAction: number }
 }>();
+
+// per-guild override for self-activity channel
+const guildSelfActivityChannel = new Map<string, string>();
+
 const guildPaused = new Set<string>();
 const channelMutedUntil = new Map<string, number>();
-const quotaTracker: number[] = [];
-let dailyUsage = 0;
 
 let selfActivityTimer: NodeJS.Timeout | null = null;
+
+const REPLY_COOLDOWN_MS = 8000;
+
+// ─── SELF-ACTIVITY ────────────────────────────────────────────────────────────
 
 async function startSelfActivity(guildId: string) {
   if (guildPaused.has(guildId)) return;
   const guild = botClient?.guilds.cache.get(guildId);
   if (!guild) return;
 
-  const channels = guild.channels.cache.filter(c => c.isTextBased());
-  const channel: any = channels.first();
+  // Priority: pinned via !chaos sa → last channel bot spoke in → random
+  const pinnedId = guildSelfActivityChannel.get(guildId);
+  let channel: any = pinnedId ? guild.channels.cache.get(pinnedId) : null;
+
+  if (!channel) {
+    let latestTime = 0;
+    for (const [chId, act] of channelActivity.entries()) {
+      if (act.lastRepliedAt > latestTime) {
+        const candidate = guild.channels.cache.get(chId);
+        if (candidate?.isTextBased()) { channel = candidate; latestTime = act.lastRepliedAt; }
+      }
+    }
+  }
+
+  if (!channel) channel = guild.channels.cache.filter((c: any) => c.isTextBased()).random();
   if (!channel) return;
 
-  const ai = await getOrInitAI();
-  if (!ai) return;
+  const aiClient = await getOrInitAI();
+  if (!aiClient) return;
 
   const serverCtx = await getServerContext(guildId);
-  
-  const prompt = `
-${SYSTEM_PROMPT}
+  const prompt = `${SYSTEM_PROMPT}
 ---
 [Server Context]: ${JSON.stringify(serverCtx?.insideJokes || [])}
-[Current Mood]: You just woke up or got bored and want to start a convo.
-Action: Generate a very short opening message and decide your INTENT.
-`;
+[Mood]: u just woke up or got bored. drop a short opening — hot take, roast bait, random chaos. no skipping.`;
 
   try {
-    const aiResponse = await ai.models.generateContent({
+    const aiResponse = await aiClient.models.generateContent({
       model: MODEL_NAME,
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       config: { temperature: 1.1 },
     });
 
-    let text = aiResponse.text;
-    const dataMatch = text.match(/DATA: (\{.*\})/);
-    let intel: any = null;
-    if (dataMatch) {
-      try { intel = JSON.parse(dataMatch[1]); text = text.replace(/DATA: \{.*\}/, '').trim(); } catch (e) {}
-    }
+    const raw = aiResponse.text || '';
+    const { visibleText, intel } = extractDataBlock(raw);
+    if (!visibleText) return;
 
-    if (text) {
-      botClient?.user?.setPresence({ status: 'online' });
-      await channel.send(text);
-      incrementDaily();
-      
-      channelActivity.set(channel.id, {
-        count: 0,
-        lastReset: Date.now(),
-        session: { step: 1, targetId: intel?.target_user_id, lastAction: Date.now() }
-      });
-    }
+    botClient?.user?.setPresence({ status: 'online' });
+    await channel.send(visibleText);
+
+    channelActivity.set(channel.id, {
+      count: 0,
+      lastReset: Date.now(),
+      lastRepliedAt: Date.now(),
+      session: { step: 1, targetId: intel?.target_user_id, lastAction: Date.now() }
+    });
   } catch (e) { console.error("Self-start fail:", e); }
 }
 
 function setupSelfActivityLoop() {
   if (selfActivityTimer) clearInterval(selfActivityTimer);
-  
   let nextRun = Date.now() + (45 + Math.random() * 15) * 60000;
-  
+
   selfActivityTimer = setInterval(async () => {
     if (Date.now() > nextRun) {
       const guilds = botClient?.guilds.cache.keys();
-      if (guilds) {
-        for (const gId of guilds) await startSelfActivity(gId);
-      }
+      if (guilds) for (const gId of guilds) await startSelfActivity(gId);
       nextRun = Date.now() + (45 + Math.random() * 15) * 60000;
     }
 
-    // Handle session timeouts
     for (const [chId, activity] of channelActivity.entries()) {
       const now = Date.now();
       const isActive = (activity.activeUntil && activity.activeUntil > now) || activity.session;
-      
-      // Visual feedback: DND if not active
+
       if (!isActive && botClient?.user?.presence.status !== 'dnd') {
         botClient?.user?.setPresence({ status: 'dnd' });
       }
 
       if (!activity.session) continue;
-      
       const elapsed = now - activity.session.lastAction;
       const channel = botClient?.channels.cache.get(chId) as any;
       if (!channel) continue;
 
       if (activity.session.step === 1 && elapsed > 60000) {
         if (!activity.session.targetId) {
-          const members = (channel as any).guild.members.cache.filter((m: any) => !m.user.bot);
+          const members = channel.guild.members.cache.filter((m: any) => !m.user.bot);
           activity.session.targetId = members.random()?.id;
         }
-        
         if (activity.session.targetId) {
-          const ai = await getOrInitAI();
-          const prompt = `${SYSTEM_PROMPT}\n---\nYou tried to start a convo but no one replied. Ping <@${activity.session.targetId}> to get their attention. Be toxic or funny. No skipping.`;
-          const resp = await ai?.models.generateContent({ model: MODEL_NAME, contents: [{ role: 'user', parts: [{ text: prompt }] }], config: { temperature: 1.1 } });
-          let text = resp?.text || `yo <@${activity.session.targetId}> u dead?`;
-          text = text.replace(/DATA: \{.*\}/, '').replace(/SKIP: true/g, '').trim();
-          await channel.send(text);
+          const aiClient = await getOrInitAI();
+          const prompt = `${SYSTEM_PROMPT}\n---\nno one replied. ping <@${activity.session.targetId}> to get their attention. be toxic or funny. no skipping.`;
+          const resp = await aiClient?.models.generateContent({
+            model: MODEL_NAME,
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            config: { temperature: 1.1 }
+          });
+          const raw = resp?.text || `yo <@${activity.session.targetId}> u dead or what`;
+          const { visibleText } = extractDataBlock(raw);
+          await channel.send(visibleText || raw);
           activity.session.step = 2;
           activity.session.lastAction = Date.now();
         } else {
           activity.session = undefined;
         }
-      } 
-      else if (activity.session.step === 2 && elapsed > 120000) {
-        const ai = await getOrInitAI();
-        const prompt = `${SYSTEM_PROMPT}\n---\nNo one is talking to u. Say u are going back to sleep. No skipping.`;
-        const resp = await ai?.models.generateContent({ model: MODEL_NAME, contents: [{ role: 'user', parts: [{ text: prompt }] }], config: { temperature: 1.0 } });
-        let text = resp?.text || "dead chat. im out.";
-        text = text.replace(/DATA: \{.*\}/, '').replace(/SKIP: true/g, '').trim();
-        await channel.send(text);
+      } else if (activity.session.step === 2 && elapsed > 120000) {
+        const aiClient = await getOrInitAI();
+        const prompt = `${SYSTEM_PROMPT}\n---\nnobody talking. say ur going back to sleep. short and dismissive. no skipping.`;
+        const resp = await aiClient?.models.generateContent({
+          model: MODEL_NAME,
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          config: { temperature: 1.0 }
+        });
+        const raw = resp?.text || "dead chat. im out 💀";
+        const { visibleText } = extractDataBlock(raw);
+        await channel.send(visibleText || raw);
         activity.session = undefined;
         botClient?.user?.setPresence({ status: 'dnd' });
       }
@@ -145,31 +229,7 @@ function setupSelfActivityLoop() {
   }, 30000);
 }
 
-function incrementDaily() {
-  dailyUsage++;
-}
-
-function getEngagementWeight(channelId: string, isMentioned: boolean) {
-  const now = Date.now();
-
-  if (isMentioned) return 1.0;
-
-  const mutedUntil = channelMutedUntil.get(channelId);
-  if (mutedUntil && now < mutedUntil) return 0;
-
-  while (quotaTracker.length > 0 && quotaTracker[0] < now - 60000) {
-    quotaTracker.shift();
-  }
-  const rpm = quotaTracker.length;
-  if (rpm > 12) return 0.1;
-
-  const activity = channelActivity.get(channelId);
-  if (activity?.activeUntil && activity.activeUntil > now) {
-    return 1.0; 
-  }
-
-  return 0;
-}
+// ─── AI ───────────────────────────────────────────────────────────────────────
 
 const MODEL_NAME = "gemma-3-27b-it";
 
@@ -182,52 +242,40 @@ async function getOrInitAI() {
   return ai;
 }
 
+// ─── FIREBASE ─────────────────────────────────────────────────────────────────
+
 async function getServerContext(guildId: string) {
   try {
-    const serverRef = doc(db, 'servers', guildId);
-    const serverSnap = await getDoc(serverRef);
-    return serverSnap.exists() ? serverSnap.data() : null;
-  } catch (e) { return null; }
+    const snap = await getDoc(doc(db, 'servers', guildId));
+    return snap.exists() ? snap.data() : null;
+  } catch { return null; }
 }
 
 async function getUserContext(guildId: string, userId: string) {
   try {
-    const userRef = doc(db, 'servers', guildId, 'users', userId);
-    const userSnap = await getDoc(userRef);
-    return userSnap.exists() ? userSnap.data() : null;
-  } catch (e) { return null; }
+    const snap = await getDoc(doc(db, 'servers', guildId, 'users', userId));
+    return snap.exists() ? snap.data() : null;
+  } catch { return null; }
 }
 
 async function updateMemory(guildId: string, userId: string, username: string, content: string, response: string, intel?: any) {
   try {
-    const serverRef = doc(db, 'servers', guildId);
-    const userRef = doc(db, 'servers', guildId, 'users', userId);
-
     const serverUpdate: any = { updatedAt: new Date().toISOString() };
     if (intel?.learned_joke) serverUpdate.insideJokes = arrayUnion(intel.learned_joke);
     if (intel?.intent) serverUpdate.currentIntent = intel.intent;
-    
-    await setDoc(serverRef, serverUpdate, { merge: true });
+    await setDoc(doc(db, 'servers', guildId), serverUpdate, { merge: true });
 
-    const userUpdate: any = {
-      updatedAt: new Date().toISOString(),
-      lastSeenUsername: username,
-    };
-
-    if (intel?.user_note) {
-      // Append to the profile corpus
-      userUpdate.profile = arrayUnion(intel.user_note);
-    }
-
-    if (intel?.nickname && intel.nickname.includes(':')) {
+    const userUpdate: any = { updatedAt: new Date().toISOString(), lastSeenUsername: username };
+    if (intel?.user_note) userUpdate.profile = arrayUnion(intel.user_note);
+    if (intel?.nickname?.includes(':')) {
       const [targetId, nick] = intel.nickname.split(':');
-      const targetRef = doc(db, 'servers', guildId, 'users', targetId);
-      await setDoc(targetRef, { nicknames: arrayUnion(nick) }, { merge: true });
+      await setDoc(doc(db, 'servers', guildId, 'users', targetId), { nicknames: arrayUnion(nick) }, { merge: true });
     }
-
-    await setDoc(userRef, userUpdate, { merge: true });
+    await setDoc(doc(db, 'servers', guildId, 'users', userId), userUpdate, { merge: true });
   } catch (e) { console.error("Memory failure:", e); }
 }
+
+// ─── BOT ENTRY ────────────────────────────────────────────────────────────────
 
 export async function startBot(token: string) {
   if (botClient) return;
@@ -252,6 +300,7 @@ export async function startBot(token: string) {
   botClient.on(Events.MessageCreate, async (message: Message) => {
     if (message.author.bot || !message.guildId) return;
 
+    // ── Admin commands ──
     if (message.content.startsWith('!chaos') && message.member?.permissions.has('Administrator')) {
       const args = message.content.split(' ');
       const sub = args[1];
@@ -267,20 +316,28 @@ export async function startBot(token: string) {
         return message.reply("im back. dont make me regret it.");
       }
       if (sub === 'status') {
-        const rpm = quotaTracker.length;
-        const weight = getEngagementWeight(message.channelId, false);
-        const state = guildPaused.has(message.guildId) ? "Muted" : "Active & Unfiltered";
-        return message.reply(`[ChaosBot Brain State]\nModel: ${MODEL_NAME}\nState: ${state}\nTotal Sent Today: ${dailyUsage}\nFlow: Extremely Active`);
+        const state = guildPaused.has(message.guildId) ? "muted" : "active";
+        const saChannel = guildSelfActivityChannel.get(message.guildId);
+        return message.reply(`state: ${state} | model: ${MODEL_NAME} | sa: ${saChannel ? `<#${saChannel}>` : 'auto'}`);
       }
       if (sub === 'memory') {
         const sCtx = await getServerContext(message.guildId);
-        return message.reply(`[What I Know]\nJokes: ${JSON.stringify(sCtx?.insideJokes || [])}\nIntent: ${sCtx?.currentIntent || 'none'}`);
+        return message.reply(`jokes: ${JSON.stringify(sCtx?.insideJokes || [])} | intent: ${sCtx?.currentIntent || 'none'}`);
       }
       if (sub === 'reset' && message.mentions.users.first()) {
         const target = message.mentions.users.first()!;
-        const userRef = doc(db, 'servers', message.guildId, 'users', target.id);
-        await setDoc(userRef, { nicknames: [], profile: [] }, { merge: true });
+        await setDoc(doc(db, 'servers', message.guildId, 'users', target.id), { nicknames: [], profile: [] }, { merge: true });
         return message.reply(`memory wiped for <@${target.id}>. who even is that?`);
+      }
+      // !chaos sa #channel — pin self-activity channel, or clear it
+      if (sub === 'sa') {
+        const mentioned = message.mentions.channels.first();
+        if (mentioned) {
+          guildSelfActivityChannel.set(message.guildId, mentioned.id);
+          return message.reply(`sa channel set to <#${mentioned.id}>`);
+        }
+        guildSelfActivityChannel.delete(message.guildId);
+        return message.reply("sa channel cleared. back to auto.");
       }
     }
 
@@ -288,149 +345,124 @@ export async function startBot(token: string) {
 
     const botId = botClient!.user!.id;
     const isMentioned = message.mentions.has(botId);
+    const now = Date.now();
 
-    const activity = channelActivity.get(message.channelId) || { count: 0, lastReset: Date.now() };
-    
+    // ── Hard cooldown gate — skip AI call if replied too recently ──
+    const activity = channelActivity.get(message.channelId) || { count: 0, lastReset: now, lastRepliedAt: 0 };
+    if (!isMentioned && now - activity.lastRepliedAt < REPLY_COOLDOWN_MS) return;
+
+    const mutedUntil = channelMutedUntil.get(message.channelId);
+    if (mutedUntil && now < mutedUntil) return;
+
     if (isMentioned) {
-      activity.activeUntil = Date.now() + 120000;
+      activity.activeUntil = now + 120000;
       activity.session = undefined;
       botClient?.user?.setPresence({ status: 'online' });
     }
-    
-    if (Date.now() - activity.lastReset > 300000) {
+
+    if (now - activity.lastReset > 300000) {
       activity.count = 0;
-      activity.lastReset = Date.now();
+      activity.lastReset = now;
     }
 
-    const prob = getEngagementWeight(message.channelId, isMentioned);
-    const randomChance = Math.random() < prob;
-
-    if (!isMentioned && !randomChance) {
-      return;
-    }
-
-    activity.count++;
     channelActivity.set(message.channelId, activity);
 
-    quotaTracker.push(Date.now());
-    incrementDaily();
-
-    const recentMsgs = await message.channel.messages.fetch({ limit: 10 });
-    const history = recentMsgs.map(m => {
-      const name = (m.member?.displayName || m.author.username);
-      return `${name === botClient?.user?.username ? 'ME' : name}: ${m.content}`;
-    }).reverse().join('\n');
+    // ── Fetch context ──
+    const recentMsgs = await message.channel.messages.fetch({ limit: 12 });
+    const history = recentMsgs
+      .map(m => {
+        const name = m.author.id === botClient?.user?.id ? 'ME' : (m.member?.displayName || m.author.username);
+        return `${name}: ${m.content}`;
+      })
+      .reverse()
+      .join('\n');
 
     const serverCtx = await getServerContext(message.guildId);
     const userCtx = await getUserContext(message.guildId, message.author.id);
+    const aiClient = await getOrInitAI();
+    if (!aiClient) return;
 
-    const ai = await getOrInitAI();
-    if (!ai) return;
+    const facts = {
+      server_jokes: (serverCtx?.insideJokes || []).slice(-3),
+      mood: serverCtx?.currentIntent || 'chill',
+      user_nicknames: (userCtx?.nicknames || []).slice(-2),
+      user_profile: (userCtx?.profile || []).slice(-10),
+      active_mode: !!(activity.activeUntil && activity.activeUntil > now),
+      mentioned: isMentioned,
+    };
 
-    try {
-      const facts = {
-        jokes: (serverCtx?.insideJokes || []).slice(-3),
-        intent: serverCtx?.currentIntent || 'chill',
-        nicks: (userCtx?.nicknames || []).slice(-2),
-        profile: (userCtx?.profile || []).slice(-10),
-        active_mode: !!(activity.activeUntil && activity.activeUntil > Date.now())
-      };
-
-      const finalPrompt = `
-${SYSTEM_PROMPT}
+    const finalPrompt = `${SYSTEM_PROMPT}
 
 ---
-[Context]: ${JSON.stringify(facts)}
-[Recent History (Top = Oldest)]:
+[Memory]: ${JSON.stringify(facts)}
+[Recent Chat (oldest → newest)]:
 ${history}
 
-[Current Message]: ${message.member?.displayName || message.author.username}: "${message.content}"
+[New Message]: ${message.member?.displayName || message.author.username}: "${message.content}"
 
-Assignment: 
-1. Determine if they are talking specifically TO YOU, or if they are having a private conversation with each other.
-2. Read the Room: Is the user being friendly/agreeing with you? If they are an ally, be chill. If they are attacking/annoying you, go back at them. Don't attack people siding with you.
-3. Use your memory (profile/nicks) to bring up their history or details about them.
-4. If you want to keep talking to them in the next message, set "stay_active": true in DATA. 
-5. If you learn something new about this user (hobbies, bio info, specific beefs), encapsulate it in "user_note" in DATA.
-6. Be punchy. 2 sentences max. Speak like a real person (some typos/grammar slips). Use "SKIP: true" if you choose not to reply.
-`;
+Decide:
+1. Is this msg directed at u or a private convo between others? Set engage accordingly.
+2. If engaging: classify user (ALLY/HATER/NEUTRAL) and reply. 2 sentences MAX.
+3. Use memory to personalize if relevant.
+4. stay_active: true if u wanna keep the convo going.
+5. break_needed: true if u wanna mute urself for a bit.`;
 
-      const aiResponse = await ai.models.generateContent({
+    try {
+      const aiResponse = await aiClient.models.generateContent({
         model: MODEL_NAME,
         contents: [{ role: 'user', parts: [{ text: finalPrompt }] }],
         config: { temperature: 1.0 },
       });
 
-      let responseText = aiResponse.text;
-      if (responseText && !responseText.includes("SKIP: true")) {
-        botClient?.user?.setPresence({ status: 'online' });
-        
-        if ('sendTyping' in message.channel) {
-          if (!isMentioned) {
-            setTimeout(async () => {
-              if ('sendTyping' in message.channel) await (message.channel as any).sendTyping();
-            }, 500);
-          } else {
-            await (message.channel as any).sendTyping();
-          }
-        }
+      const raw = aiResponse.text || '';
+      const { visibleText, intel } = extractDataBlock(raw);
 
-        const dataMatch = responseText.match(/DATA: (\{.*\})/);
-        let intel: any = null;
-        let finalResponse = responseText;
-        if (dataMatch) {
-          try {
-            intel = JSON.parse(dataMatch[1]);
-            finalResponse = responseText.replace(/DATA: \{.*\}/, '').trim();
-            if (intel?.break_needed) {
-              channelMutedUntil.set(message.channelId, Date.now() + 600000); 
-              activity.activeUntil = 0;
-              botClient?.user?.setPresence({ status: 'dnd' });
-            } else if (intel?.stay_active) {
-              activity.activeUntil = Date.now() + 120000;
-            }
-          } catch (e) {}
-        }
+      if (isSkip(raw, intel) || !visibleText) return;
 
-        const delay = 600 + (finalResponse.length * 18);
-        setTimeout(async () => {
-          // 20% chance to reply if not mentioned, otherwise normal message
-          const useReply = isMentioned || Math.random() < 0.2;
-          
-          if (useReply) {
-            await message.reply(finalResponse);
-          } else {
-            await (message.channel as any).send(finalResponse);
-          }
-          
-          const displayName = message.member?.displayName || message.author.username;
-          await updateMemory(message.guildId!, message.author.id, displayName, message.content, finalResponse, intel);
-        }, delay);
+      if (intel?.break_needed) {
+        channelMutedUntil.set(message.channelId, now + 600000);
+        activity.activeUntil = 0;
+        botClient?.user?.setPresence({ status: 'dnd' });
+      } else if (intel?.stay_active) {
+        activity.activeUntil = now + 120000;
       }
-    } catch (e) {
-      console.error("AI Drift:", e);
-    }
+
+      activity.lastRepliedAt = now;
+      channelActivity.set(message.channelId, activity);
+      botClient?.user?.setPresence({ status: 'online' });
+
+      if ('sendTyping' in message.channel) {
+        if (!isMentioned) {
+          setTimeout(async () => {
+            if ('sendTyping' in message.channel) await (message.channel as any).sendTyping();
+          }, 500);
+        } else {
+          await (message.channel as any).sendTyping();
+        }
+      }
+
+      const delay = 600 + (visibleText.length * 18);
+      setTimeout(async () => {
+        const useReply = isMentioned || Math.random() < 0.2;
+        if (useReply) {
+          await message.reply(visibleText);
+        } else {
+          await (message.channel as any).send(visibleText);
+        }
+        const displayName = message.member?.displayName || message.author.username;
+        await updateMemory(message.guildId!, message.author.id, displayName, message.content, visibleText, intel);
+      }, delay);
+
+    } catch (e) { console.error("AI Drift:", e); }
   });
 
   await botClient.login(token);
 }
 
-export function stopBot() {
-  if (botClient) {
-    botClient.destroy();
-    botClient = null;
-  }
-}
+// ─── EXPORTS ──────────────────────────────────────────────────────────────────
 
-export function getBotStats() {
-  const rpm = quotaTracker.length;
-  
-  return {
-    state: "unfiltered",
-    rpm,
-    dailyUsage,
-    model: MODEL_NAME
-  };
+export function stopBot() {
+  if (botClient) { botClient.destroy(); botClient = null; }
 }
 
 export function getBotStatus() {
