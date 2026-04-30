@@ -27,6 +27,7 @@ not always the latest one. the BEST one.
 
 SKIP if:
 - two people are clearly talking to each other and the bot is not part of that flow
+- someone says "not you", "i'm talking to X", "not talking to you", or any phrase that explicitly excludes the bot
 - the bot already replied recently and nobody engaged with it
 - the latest message is filler or one word AND does not mention the bot
 - the latest message is directed at a specific person who is NOT the bot
@@ -532,11 +533,6 @@ export async function startBot(token: string) {
       const mutedUntil = channelMutedUntil.get(message.channelId);
       if (mutedUntil && now < mutedUntil) return;
 
-      if (isMentioned) {
-        activity.activeUntil = now + 120000;
-        activity.session = undefined;
-      }
-
       if (now - activity.lastReset > 300000) {
         activity.count = 0;
         activity.lastReset = now;
@@ -559,6 +555,7 @@ export async function startBot(token: string) {
       if (!aiClient) return;
 
       const currentMood = botMood.get(message.guildId!) || 'chill';
+      const senderName = message.member?.displayName || message.author.username;
       const facts = {
         jokes: (serverCtx?.insideJokes || []).slice(-5),
         intent: serverCtx?.currentIntent || 'chill',
@@ -567,53 +564,136 @@ export async function startBot(token: string) {
         mood: currentMood,
       };
 
-      // ── Direct ping shortcut — skip decision phase entirely ──
-      if (isMentioned) {
-        activity.activeUntil = now + 120000;
-        activity.session = undefined;
-        channelActivity.set(message.channelId, activity);
-        await generateAndSend({ message, history, chatSummary, facts, isMentioned, aiClient, activity, decisionTarget: `${message.member?.displayName || message.author.username}: "${message.content}"`, decisionReason: 'directly pinged the bot' });
-        return;
+      // ── Log summary and user knowledge ──
+      console.log(`[Server Summary]: ${chatSummary || 'none yet'}`);
+      console.log(`[User Knowledge - ${senderName}]: ${facts.profile.join(' | ') || 'none yet'}`);
+
+      // ── Withdrawn mode check ──
+      const withdrawnUntil = channelMutedUntil.get(`withdrawn:${message.channelId}`);
+      const isWithdrawn = !!(withdrawnUntil && now < withdrawnUntil);
+      if (isWithdrawn) {
+        // Only break withdrawn if directly pinged with real content
+        const cleanMsg = message.content.replace(/<@!?\d+>/g, '').trim();
+        const isRealPing = isMentioned && cleanMsg.length > 3;
+        if (!isRealPing) {
+          console.log(`[Skip] Withdrawn mode active until ${new Date(withdrawnUntil!).toISOString()}`);
+          return;
+        }
+        channelMutedUntil.delete(`withdrawn:${message.channelId}`);
+        console.log(`[Withdrawn] Re-invited, clearing withdrawn mode`);
       }
 
-      // ── Step 1: Decision Phase ──
-      const decisionPrompt = `[Server Summary]:
-${chatSummary}
+      // ── Single Decision Call — handles everything ──
+      const withdrawnContext = isWithdrawn
+        ? `[Mode]: WITHDRAWN — someone told bot to back off recently. higher skip chance. only engage if clearly invited back.`
+        : `[Mode]: NORMAL`;
 
+      const decisionPrompt = `you are ChaosBot deciding what to do with this discord message.
+
+${withdrawnContext}
 [Bot Mood]: ${facts.mood}
+[Server Summary]: ${chatSummary || 'none yet'}
+[User Knowledge - ${senderName}]: ${facts.profile.join(' | ') || 'none yet'}
 
-[Recent Conversation — read this fully before deciding]:
+[Recent Conversation]:
 ${history}
 
-[Message that triggered this]:
-${message.member?.displayName || message.author.username}: "${message.content}"
+[Triggering Message]:
+${senderName}: "${message.content}"
+[Was bot directly pinged?]: ${isMentioned ? 'YES' : 'NO'}
 
 ---
-${DECISION_PROMPT}`;
+first, figure out what's actually going on:
+- who is talking to who in this conversation? look at pings, flow, who's been responding to who
+- if someone pinged another user earlier and that user is offline, messages after might still be for that person not the bot
+- is this message actually for the bot, or is it for someone else?
+- if pinged: is this person genuinely talking to the bot, or just reacting (fr, ok, lol, yeah) to something the bot said?
+- is the bot being excluded or told to back off?
+
+then output ONLY this JSON:
+{
+  "action": "REPLY" | "SKIP" | "WITHDRAW",
+  "target_msg": "the exact message from history you're replying to, or empty",
+  "reason": "one line explanation",
+  "predicted_audience": "bot" | "user:NAME" | "group" | "unknown"
+}
+
+action meanings:
+- REPLY = engage. pick the best message to respond to from history.
+- SKIP = stay quiet. not your convo, just a reaction, or nothing worth adding.
+- WITHDRAW = someone excluded the bot or called it out. bot will say something then go quiet for a bit.
+
+REPLY rules:
+- pinged with real content → almost always REPLY
+- pinged but just reacting (fr/ok/yeah/lol/💀) to bot's last msg → SKIP
+- someone greeting or saying hi → REPLY warmly
+- two people clearly in their own chat → SKIP
+- people talking ABOUT the bot (mocking, hyping, testing) → REPLY
+- something funny the bot can land on → REPLY
+- message clearly for someone else → SKIP
+- already replied a lot and nobody engaging → SKIP
+
+WITHDRAW rules:
+- "not you", "i'm talking to X", "shut up", "i didn't ask you/the bot" → WITHDRAW
+- only if it's clearly directed at the bot, not just general frustration`;
 
       try {
         const decisionResp = await aiClient.models.generateContent({
           model: MODEL_NAME,
           contents: [{ role: 'user', parts: [{ text: decisionPrompt }] }],
-          config: { temperature: 0.7 },
+          config: { temperature: 0.5 },
         });
 
-        const decisionRaw = (decisionResp.text || "").trim();
-        const firstWord = decisionRaw.split(/\s/)[0].toUpperCase();
-        console.log(`[Decision for ${message.channelId}]: ${decisionRaw}`);
-
-        if (firstWord !== "REPLY") return;
-
-        const decisionParts = decisionRaw.split('|').map((s: string) => s.trim());
-        let decisionTarget = decisionParts[1] || `${message.member?.displayName || message.author.username}: "${message.content}"`;
-        const decisionReason = decisionParts[2] || 'directly addressed';
-
-        // Ignore if AI picked its own previous message as the target
-        if (decisionTarget.trimStart().startsWith('ME:')) {
-          decisionTarget = `${message.member?.displayName || message.author.username}: "${message.content}"`;
+        const decisionRaw = (decisionResp.text || '').trim().replace(/```json|```/g, '').trim();
+        let parsed: any = {};
+        try { parsed = JSON.parse(decisionRaw); } catch {
+          // fallback: check if raw text starts with SKIP
+          const upper = decisionRaw.toUpperCase();
+          parsed.action = upper.includes('REPLY') ? 'REPLY' : upper.includes('WITHDRAW') ? 'WITHDRAW' : 'SKIP';
         }
 
-        // Fallback — skip if already replied to this exact target recently
+        const action = (parsed.action || 'SKIP').toUpperCase();
+        console.log(`[Decision]: action=${action} | target="${parsed.target_msg?.slice(0, 60) || ''}" | audience=${parsed.predicted_audience || '?'} | reason=${parsed.reason || ''}`);
+
+        // ── WITHDRAW — bot says what it feels like then goes quiet ──
+        if (action === 'WITHDRAW') {
+          console.log(`[Withdrawn] Entering withdrawn mode for 5 mins`);
+          channelMutedUntil.set(`withdrawn:${message.channelId}`, now + 300000);
+          botMood.set(message.guildId!, 'withdrawn');
+
+          const withdrawPrompt = `${SYSTEM_PROMPT}
+
+someone just told you to back off or said "not you" or excluded you from the convo.
+say whatever feels right in that moment — maybe you're unbothered, maybe slightly salty, maybe just meh.
+could be "aight" or "my bad" or "didn't ask me either" or just nothing dramatic.
+1 sentence max. lowercase. no DATA block.
+
+[Recent Chat]:
+${history}
+[Message that triggered this]:
+${senderName}: "${message.content}"`;
+
+          try {
+            const resp = await aiClient.models.generateContent({
+              model: MODEL_NAME,
+              contents: [{ role: 'user', parts: [{ text: withdrawPrompt }] }],
+              config: { temperature: 1.1 },
+            });
+            const text = (resp.text || 'aight').replace(/DATA:[\s\S]*$/i, '').trim();
+            await (message.channel as any).send(text);
+          } catch { await (message.channel as any).send('aight'); }
+          return;
+        }
+
+        if (action !== 'REPLY') return;
+
+        // ── REPLY ──
+        let decisionTarget = parsed.target_msg || `${senderName}: "${message.content}"`;
+        if (decisionTarget.trimStart().startsWith('ME:')) {
+          decisionTarget = `${senderName}: "${message.content}"`;
+        }
+
+        // Duplicate reply guard
         const channelReplied = recentlyRepliedTargets.get(message.channelId) || new Set<string>();
         const targetKey = decisionTarget.slice(0, 80);
         if (channelReplied.has(targetKey)) {
@@ -621,10 +701,7 @@ ${DECISION_PROMPT}`;
           return;
         }
         channelReplied.add(targetKey);
-        if (channelReplied.size > 10) {
-          const first = channelReplied.values().next().value;
-          channelReplied.delete(first);
-        }
+        if (channelReplied.size > 10) channelReplied.delete(channelReplied.values().next().value);
         recentlyRepliedTargets.set(message.channelId, channelReplied);
 
         if (isMentioned) {
@@ -632,9 +709,9 @@ ${DECISION_PROMPT}`;
           activity.session = undefined;
         }
 
-        await generateAndSend({ message, history, chatSummary, facts, isMentioned, aiClient, activity, decisionTarget, decisionReason });
+        await generateAndSend({ message, history, chatSummary, facts, isMentioned, aiClient, activity, decisionTarget, decisionReason: parsed.reason || 'engaged' });
 
-      } catch (e) { console.error("AI Drift:", e); }
+      } catch (e) { console.error("Decision fail:", e); }
 
     }, windowTime);
 
