@@ -495,15 +495,40 @@ export async function startBot(token: string) {
       };
 
       // ── Step 1: Decision Phase ──
-      const decisionPrompt = `${DECISION_PROMPT}
+      const decisionPrompt = `[Server Summary]:
+${chatSummary}
 
-[Server Summary]: ${chatSummary}
 [Bot Mood]: ${facts.mood}
-[Memory]:
-- current intent: ${facts.intent}
-- history check: ${history}
 
-[Target Message]: ${message.member?.displayName || message.author.username}: "${message.content}"`;
+[Recent Conversation — read this fully before deciding]:
+${history}
+
+[Message that triggered this]:
+${message.member?.displayName || message.author.username}: "${message.content}"
+
+---
+you are deciding whether to reply to the above conversation as the bot.
+output ONLY the word REPLY or SKIP. nothing else.
+
+read the ENTIRE conversation above first, then ask yourself:
+1. who is talking to who in this conversation overall?
+2. has the bot been genuinely invited into this or is it on the outside?
+3. would jumping in right now feel natural or intrusive to anyone reading?
+4. does the bot actually have something worth adding or would it just be noise?
+
+SKIP if:
+- two people are clearly talking to each other and the bot is not part of that flow
+- the bot already replied recently and nobody engaged with it
+- the latest message is filler, one word, or directed at a specific person
+- jumping in would feel forced or annoying
+
+REPLY if:
+- someone directly pinged or named the bot
+- someone asked something open to the whole chat
+- there is a genuinely funny or relevant thing to add that fits the flow naturally
+- someone responded to the bot and the conversation is still going
+
+when unsure → SKIP. being quiet is always better than being annoying.`;
 
       console.log(`[Decision Phase Input]:\n${decisionPrompt}`);
 
