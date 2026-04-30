@@ -1,10 +1,10 @@
 {
-  "projectId": "ai-studio-applet-webapp-b4ee9",
-  "appId": "1:1897865736:web:1ca32ac28def47b7ff27bd",
-  "apiKey": "AIzaSyCmc0YWqCFM0Oq1l7RluTFGW-NTHyLMzgI",
-  "authDomain": "ai-studio-applet-webapp-b4ee9.firebaseapp.com",
-  "firestoreDatabaseId": "ai-studio-849c428b-925e-4163-b2b5-8c04361fb670",
-  "storageBucket": "ai-studio-applet-webapp-b4ee9.firebasestorage.app",
-  "messagingSenderId": "1897865736",
-  "measurementId": ""
+  "projectId": "notabot-bd8d5",
+  "appId": "1:652563112624:web:d4461947792a0523aa1175",
+  "apiKey": "AIzaSyA-vDf_Vll1hJ5YOEKjH5mH8rrRodzabEk",
+  "authDomain": "notabot-bd8d5.firebaseapp.com",
+  "firestoreDatabaseId": "(default)",
+  "storageBucket": "notabot-bd8d5.firebasestorage.app",
+  "messagingSenderId": "652563112624",
+  "measurementId": "G-QRLTY7WT1E"
 }
