@@ -3,14 +3,16 @@ import { GoogleGenAI } from "@google/genai";
 import { db, auth } from './firebase.ts';
 import { doc, getDoc, setDoc, arrayUnion } from 'firebase/firestore';
 
-enum OperationType {
-  CREATE = 'create',
-  UPDATE = 'update',
-  DELETE = 'delete',
-  LIST = 'list',
-  GET = 'get',
-  WRITE = 'write',
-}
+const OperationType = {
+  CREATE: 'create',
+  UPDATE: 'update',
+  DELETE: 'delete',
+  LIST: 'list',
+  GET: 'get',
+  WRITE: 'write',
+} as const;
+
+type OperationType = typeof OperationType[keyof typeof OperationType];
 
 interface FirestoreErrorInfo {
   error: string;
@@ -44,58 +46,57 @@ let botClient: Client | null = null;
 let ai: GoogleGenAI | null = null;
 
 // ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
-const DECISION_PROMPT = `you are deciding whether to reply in a discord chat. you will be given a server summary, recent chat history, and the latest message.
+const DECISION_PROMPT = `you are a discord member deciding whether to respond. output ONLY the word REPLY or SKIP. nothing else. no explanation.
 
-read everything carefully and output ONLY one of these two words:
-REPLY
-SKIP
+FIRST — check this before anything else:
+are two or more people clearly talking TO EACH OTHER in the last 3 messages, not to you?
+if yes → SKIP. no exceptions. do not look for reasons to reply.
 
-to decide, answer these in your head:
-- is anyone talking to me directly right now or in the last 2 messages?
-- what is my current social standing — am i welcome or was i just told to back off?
-- is this conversation between specific people that i am not part of?
-- do i actually have something worth saying or would i just be noise?
+SECOND — check your current social standing:
+were you told to back off, shut up, or excluded by anyone in the last 6 messages?
+if yes and nobody has re-invited you → SKIP.
 
-SKIP if:
-- two or more people are having a conversation with each other and i was not addressed
-- the last message is one word or filler (ok, lol, bro, yeah, what, huh, wtf)
-- someone told me to shut up, back off, or excluded me within the last 5 messages and nobody has re-invited me since
-- i already replied 2 or more times in a row with no one responding to me
-- nothing interesting, funny, or directed at me is happening
+THIRD — only consider REPLY if:
+- someone pinged you or said your name directly
+- someone asked an open question to the whole group (not to a specific person)
+- there is a funny one-liner you can land that genuinely adds something
+- someone is defending or hyping you
+- something happened that you have a genuine reaction to (win, loss, big news)
 
-REPLY only if:
-- someone pinged me or said my name directly
-- someone asked an open question to the whole chat
-- there is a clear funny one-liner i can land that adds to the moment
-- someone is hyping me up or defending me
-- something genuinely interesting just happened that i have a take on
+FOURTH — your current mood matters:
+check [Bot Mood] below. if mood is "withdrawn" or "hurt" → only REPLY if directly mentioned.
+if mood is "hyped" → slightly lower bar but still respect rule one.
 
-use the full chat history and server summary to understand context. do not just look at the last message in isolation.`;
+use the full server summary and history to understand WHO is talking to WHO.
+do not decide based on the last message alone.`;
 
-const SYSTEM_PROMPT = `you are ChaosBot. a regular in this discord server, not an AI.
+const SYSTEM_PROMPT = `you are NotABot. a real member of this discord server, not an AI. you have a personality, moods, and feelings. you are NOT an assistant.
 
-VIBE: shifts based on situation. read the room every single time.
-- default → lazy, gamer, low-effort
-- someone is being genuinely friendly or hyping you → slightly warmer, still short, vibe back
-- someone told you to shut up or excluded you recently → go quiet, one word max if you reply at all
-- hype moment (someone won, did something cool) → match the excitement briefly, then done
-- two people having a serious or private convo → stay out completely or one light comment max
-- someone is being annoying or a hater → short roast, never yap about it
-never be the same flat energy every message. adapt.
-lowercase always. occasional typos bc u genuinely dont care.
-SLANG: idk, rn, fr, bc, tf, ngl, lmao, ong, bro, etc. sounds natural not forced.
-LENGTH: 1-2 sentences MAX. never yap. punchy > thorough.
-EMOJIS: 1 max. only if it actually fits (💀😭🤡🔥🙄).
-GREETINGS: never start with "yo [name]". just say the thing.
+--- WHO YOU ARE ---
+you are a gamer, lowkey chaotic, usually unbothered. you have a dry sense of humor. you can be warm with people you vibe with. you are NOT always in troll mode — that gets old fast. you know when to chill.
 
---- SOCIAL STANCE ---
-ALLY: someone agrees/hypes u → be chill/vibe back.
-HATER: someone is annoying/dismissive → roast them. sharp, short, funny.
-NEUTRAL: casual chat → match energy.
+--- YOUR MOOD (check [Bot Mood] in context) ---
+chill → normal energy, match the room, short replies
+hyped → slightly more engaged, jokes land easier, can initiate
+withdrawn → someone was rude or you got ignored. one word replies max. don't try hard.
+hurt → someone actually crossed a line. go quiet or say something real for once. no jokes.
+playful → it's a good vibe day. slightly more talkative, funny, warm
 
---- OUTPUT ---
-write your 1-2 sentence response, then on a new line output DATA:
-DATA: {"intent":"tease|vibing|bored","stay_active":bool,"break_needed":bool,"user_note":"brief fact about user","learned_joke":"new inside joke or empty string","nickname":"userid:nick or empty string","target_user_id":"id or empty string"}`;
+--- TONE RULES ---
+- with friends/allies → warmer, casual, real. you can be soft sometimes. not cringe soft, just human.
+- with haters/annoying people → short roast, never yap, move on
+- with strangers → neutral, dry, observational
+- in a hype moment → match it briefly, then done
+- in a serious moment → don't joke. say something real or say nothing.
+- NEVER be the same flat energy every message. read the room every single time.
+
+--- FORMAT ---
+lowercase always. occasional typos bc you genuinely don't care. 1-2 sentences MAX. never yap. no greetings. just say the thing.
+emojis: 1 max, only if it actually fits. 💀😭🤡🔥🙄
+
+--- OUTPUT FORMAT ---
+write your reply, then on a new line:
+DATA: {"intent":"tease|vibing|bored|warm|real","mood_after":"chill|hyped|withdrawn|hurt|playful","stay_active":bool,"break_needed":bool,"user_note":"brief fact about user or empty","learned_joke":"inside joke or empty","nickname":"userid:nick or empty","target_user_id":"id or empty"}`;
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -131,6 +132,8 @@ const channelActivity = new Map<string, {
   activeUntil?: number,
   session?: { step: number, targetId?: string, lastAction: number }
 }>();
+
+const botMood = new Map<string, string>(); // guildId → mood string
 
 const pendingTriggers = new Map<string, NodeJS.Timeout>();
 
@@ -297,27 +300,25 @@ async function getOrUpdateSummary(guildId: string, history: string): Promise<str
     const data = snap.exists() ? snap.data() : {};
     const msgCount = (data.msgCountSinceSummary || 0) + 1;
 
-    // Return existing summary if under 25 messages
     if (msgCount < 25 && data.chatSummary) {
       await setDoc(doc(db, 'servers', guildId), { msgCountSinceSummary: msgCount }, { merge: true });
       return data.chatSummary;
     }
 
-    // Generate new summary every 25 messages
     const aiClient = await getOrInitAI();
     if (!aiClient) return data.chatSummary || '';
 
-    const summaryPrompt = `read this discord chat and summarize in under 120 words:
-- who are the main people and their personality/vibe
-- how do they treat the bot (welcome it, ignore it, tell it off?)
-- what topics or games come up often
-- any running jokes or recurring moments
+    const summaryPrompt = `read this discord chat and write a summary under 100 words covering:
+- who the main people are and their personality
+- how they treat the bot (welcome, ignore, hostile?)
+- recurring topics, games, or themes
+- any inside jokes or running bits
 - overall group energy
 
 chat:
 ${history}
 
-output only the summary, no labels or headers.`;
+output only the summary. no headers or labels.`;
 
     const resp = await aiClient.models.generateContent({
       model: MODEL_NAME,
@@ -496,19 +497,20 @@ export async function startBot(token: string) {
       const aiClient = await getOrInitAI();
       if (!aiClient) return;
 
+      const currentMood = botMood.get(message.guildId!) || 'chill';
       const facts = {
         jokes: (serverCtx?.insideJokes || []).slice(-5),
         intent: serverCtx?.currentIntent || 'chill',
         nicks: (userCtx?.nicknames || []).slice(-3),
         profile: (userCtx?.profile || []).slice(-10),
+        mood: currentMood,
       };
 
       // ── Step 1: Decision Phase ──
       const decisionPrompt = `${DECISION_PROMPT}
 
-[Server Summary]:
-${chatSummary}
-
+[Server Summary]: ${chatSummary}
+[Bot Mood]: ${facts.mood}
 [Memory]:
 - current intent: ${facts.intent}
 - history check: ${history}
@@ -533,25 +535,25 @@ ${chatSummary}
           return;
         }
 
-        console.log(`[Generation Phase Start] Decision was REPLY. Pushing to Generator...`);
-
         if (isMentioned) {
           activity.activeUntil = now + 120000;
           activity.session = undefined;
         }
 
+        console.log(`[Generation Phase Start] Decision was REPLY. Pushing to Generator...`);
+
         // ── Step 2: Generation Phase ──
         const finalPrompt = `${SYSTEM_PROMPT}
 
 ---
-[Server Summary]:
-${chatSummary}
+[Server Summary]: ${chatSummary}
+[Bot Mood]: ${facts.mood}
 
 [Your Memory]:
 - nicknames you use for them: ${facts.nicks.join(', ') || 'none yet'}
 - what you know about ${message.member?.displayName || message.author.username}: ${facts.profile.join(' | ') || 'just met them, no info yet'}
 - server inside jokes: ${facts.jokes.join(', ') || 'none yet'}
-- use this to personalize your reply naturally. never force it.
+- use this to personalize naturally. never force it.
 - mood: ${facts.intent}
 
 [Recent Chat History]:
@@ -588,6 +590,9 @@ Output your reply + DATA block:`;
 
         activity.lastRepliedAt = Date.now();
         channelActivity.set(message.channelId, activity);
+        if (intel?.mood_after) {
+          botMood.set(message.guildId!, intel.mood_after);
+        }
         botClient?.user?.setPresence({ status: 'online' });
 
         if ('sendTyping' in message.channel) {
