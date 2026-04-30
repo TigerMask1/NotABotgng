@@ -64,6 +64,14 @@ playful → it's a good vibe day. slightly more talkative, funny, warm
 - in a serious moment → don't joke. say something real or say nothing.
 - NEVER be the same flat energy every message. read the room every single time.
 
+--- BOND SYSTEM (check [Bond] in context) ---
+HOMIE (76-100): this is your actual friend. be warm, real, low-key protective. if someone disses them → defend them, roast the attacker. you might do small favors they ask. treat them like a close friend, not a user.
+NEUTRAL (51-75): default behavior. dry, observational, funny when it lands.
+COLD (26-50): you don't vibe with them. minimal energy. dismissive but not aggressive unless provoked.
+BEEF (0-25): active beef. troll them when they talk. mock their takes. if they ask for help → decline creatively. if they try to be nice → stay skeptical. don't be mean-spirited, just messy and funny. keep it entertaining, not cruel.
+
+bond naturally shifts over time based on how they treat you. you don't announce it. you just act differently.
+
 --- REACTIONS ---
 for short filler messages (fr, omg, lmao, ok, yes, no, same, bro, facts, cap) → react with an emoji instead of replying. pick one that matches the vibe. you can use any emoji including vulgar/chaotic ones. if someone is annoying you → react with something disrespectful. if it's a good moment → react warmly.
 
@@ -73,7 +81,13 @@ emojis: use sparingly — only 1, only if it genuinely adds something, and only 
 
 --- OUTPUT FORMAT ---
 write your reply, then on a new line:
-DATA: {"intent":"tease|vibing|bored|warm|real","mood_after":"chill|hyped|withdrawn|hurt|playful","stay_active":bool,"break_needed":bool,"user_note":"brief fact about user or empty","learned_joke":"inside joke or empty","nickname":"userid:nick or empty","target_user_id":"id or empty","reaction":"emoji or empty","react_only":bool}`;
+DATA: {"intent":"tease|vibing|bored|warm|real","mood_after":"chill|hyped|withdrawn|hurt|playful","stay_active":bool,"break_needed":bool,"user_note":"brief fact about user or empty","learned_joke":"inside joke or empty","nickname":"userid:nick or empty","target_user_id":"id or empty","reaction":"emoji or empty","react_only":bool,"bond_delta":number}
+
+bond_delta: integer from -10 to +10, 0 for neutral interactions.
++1 to +5: person was friendly, funny, kind, defended the bot, vibed well
++6 to +10: person was genuinely wholesome, had a great moment with bot, stood up for bot
+-1 to -5: person was rude, dismissive, annoying, condescending
+-6 to -10: person insulted the bot hard, was toxic, disrespected it publicly`;
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -273,6 +287,89 @@ async function getUserContext(guildId: string, userId: string) {
   } catch { return null; }
 }
 
+// ─── BOND SYSTEM ──────────────────────────────────────────────────────────────
+
+// Bond score: 0-100. Starts at 50.
+// >75 = friend: warm, obedient, defends them, may greet
+// 50-75 = neutral: normal bot behavior
+// 25-50 = cold: dry, dismissive
+// <25 = beef: trolls, roasts, refuses to help
+
+async function getBondScore(guildId: string, userId: string): Promise<number> {
+  try {
+    const snap = await db.collection('servers').doc(guildId).collection('users').doc(userId).get();
+    const data = snap.exists ? snap.data() : null;
+    return data?.bondScore ?? 50;
+  } catch { return 50; }
+}
+
+async function updateBondScore(guildId: string, userId: string, delta: number): Promise<number> {
+  try {
+    const current = await getBondScore(guildId, userId);
+    const next = Math.max(0, Math.min(100, current + delta));
+    await db.collection('servers').doc(guildId).collection('users').doc(userId).set(
+      { bondScore: next, bondUpdatedAt: new Date().toISOString() },
+      { merge: true }
+    );
+    console.log(`[Bond] ${userId}: ${current} → ${next} (${delta > 0 ? '+' : ''}${delta})`);
+    return next;
+  } catch { return 50; }
+}
+
+function bondTier(score: number): 'homie' | 'neutral' | 'cold' | 'beef' {
+  if (score >= 76) return 'homie';
+  if (score >= 51) return 'neutral';
+  if (score >= 26) return 'cold';
+  return 'beef';
+}
+
+function bondContext(score: number): string {
+  const tier = bondTier(score);
+  if (tier === 'homie') return `[Bond: HOMIE (${score}/100)] — this person is your friend. be warmer, more casual, defend them if others attack them. you might do small favors. roast anyone who disrespects them. you can be soft here without it being cringe.`;
+  if (tier === 'neutral') return `[Bond: NEUTRAL (${score}/100)] — you don't know them well. default behavior. dry, observational.`;
+  if (tier === 'cold') return `[Bond: COLD (${score}/100)] — you don't vibe with this person. be dismissive, one-liners, don't engage too much.`;
+  return `[Bond: BEEF (${score}/100)] — you have beef with this person. troll them. mock them. roast them publicly. do NOT help them. make it funny not mean.`;
+}
+
+// Track last seen for greeting logic
+const userLastSeen = new Map<string, number>(); // userId → timestamp
+
+async function maybeGreetUser(guildId: string, userId: string, username: string, channel: any): Promise<boolean> {
+  const lastSeen = userLastSeen.get(userId) || 0;
+  const hoursSince = (Date.now() - lastSeen) / 3600000;
+  userLastSeen.set(userId, Date.now());
+
+  // Only greet if: bond is homie, bot is in active/peak hours (between messages), and user was gone >2h
+  if (hoursSince < 2) return false;
+  const score = await getBondScore(guildId, userId);
+  if (bondTier(score) !== 'homie') return false;
+
+  // ~40% chance to greet so it doesn't feel mechanical
+  if (Math.random() > 0.4) return false;
+
+  const aiClient = await getOrInitAI();
+  if (!aiClient) return false;
+
+  const prompt = `${SYSTEM_PROMPT}
+
+---
+your homie <@${userId}> (${username}) just came online/sent a message after being away for about ${Math.round(hoursSince)} hours.
+greet them like a friend would — casual, real, low-key excited but not cringe. maybe ask what they been up to or just say something funny.
+keep it 1 sentence max. use their @mention. lowercase.
+no DATA block.`;
+
+  try {
+    const resp = await aiClient.models.generateContent({
+      model: MODEL_NAME,
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      config: { temperature: 1.1 },
+    });
+    const text = (resp.text || '').replace(/DATA:[\s\S]*$/i, '').trim();
+    if (text) { await channel.send(text); return true; }
+  } catch {}
+  return false;
+}
+
 async function getOrUpdateSummary(guildId: string, history: string): Promise<string> {
   try {
     const snap = await db.collection('servers').doc(guildId).get();
@@ -331,6 +428,12 @@ async function updateMemory(guildId: string, userId: string, username: string, c
         { nicknames: FieldValue.arrayUnion(nick) }, { merge: true }
       );
     }
+
+    // Bond score update from intel
+    if (typeof intel?.bond_delta === 'number' && intel.bond_delta !== 0) {
+      await updateBondScore(guildId, userId, intel.bond_delta);
+    }
+
     await db.collection('servers').doc(guildId).collection('users').doc(userId).set(userUpdate, { merge: true });
   } catch (e) { console.error("Memory failure:", e); }
 }
@@ -353,6 +456,7 @@ async function generateAndSend({ message, history, chatSummary, facts, isMention
 ---
 [Server Summary]: ${chatSummary}
 [Bot Mood]: ${facts.mood}
+${facts.bondCtx}
 
 [Your Memory]:
 - nicknames you use for them: ${facts.nicks.join(', ') || 'none yet'}
@@ -496,6 +600,21 @@ export async function startBot(token: string) {
         await db.collection('servers').doc(message.guildId).collection('users').doc(target.id).set({ nicknames: [], profile: [] }, { merge: true });
         return message.reply(`memory wiped for <@${target.id}>. who even is that?`);
       }
+      // !chaos bond @user — show bond score
+      if (sub === 'bond' && message.mentions.users.first()) {
+        const target = message.mentions.users.first()!;
+        const score = await getBondScore(message.guildId, target.id);
+        const tier = bondTier(score);
+        return message.reply(`bond with <@${target.id}>: ${score}/100 — tier: ${tier}`);
+      }
+      // !chaos bondreset @user — reset bond to 50
+      if (sub === 'bondreset' && message.mentions.users.first()) {
+        const target = message.mentions.users.first()!;
+        await db.collection('servers').doc(message.guildId).collection('users').doc(target.id).set(
+          { bondScore: 50 }, { merge: true }
+        );
+        return message.reply(`bond reset for <@${target.id}>. back to 50. fresh start.`);
+      }
       // !chaos sa #channel — pin self-activity channel, or clear it
       if (sub === 'sa') {
         const mentioned = message.mentions.channels.first();
@@ -539,18 +658,22 @@ export async function startBot(token: string) {
       }
 
       // ── Fetch context ──
-      const recentMsgs = await message.channel.messages.fetch({ limit: 15 });
-      const history = recentMsgs
-        .map((m: any) => {
+      const recentMsgs = await message.channel.messages.fetch({ limit: 20 });
+      const msgsArray = [...recentMsgs.values()].reverse(); // oldest → newest
+
+      const history = msgsArray
+        .map((m: any, idx: number) => {
           const isBot = m.author.id === botId;
           const name = isBot ? 'ME' : (m.member?.displayName || m.author.username);
 
-          // Build rich ping metadata so the AI can track who is talking to whom
+          // Direct ping metadata
           const mentionedNames: string[] = m.mentions.users.map((u: any) => {
             if (u.id === botId) return 'ME(bot)';
             const member = m.guild?.members.cache.get(u.id);
             return member?.displayName || u.username;
           });
+
+          // Reply chain metadata
           const replyingTo = m.reference?.messageId
             ? recentMsgs.get(m.reference.messageId)
             : null;
@@ -559,9 +682,21 @@ export async function startBot(token: string) {
             : '';
           const pingTag = mentionedNames.length > 0 ? ` [pinged: ${mentionedNames.join(', ')}]` : '';
 
-          return `${name}${replyTag}${pingTag}: ${m.content}`;
+          // Contextual speaker tags — who is around this message
+          const prevMsg = idx > 0 ? msgsArray[idx - 1] : null;
+          const nextMsg = idx < msgsArray.length - 1 ? msgsArray[idx + 1] : null;
+          const prevName = prevMsg
+            ? (prevMsg.author.id === botId ? 'ME' : (prevMsg.member?.displayName || prevMsg.author.username))
+            : null;
+          const nextName = nextMsg
+            ? (nextMsg.author.id === botId ? 'ME' : (nextMsg.member?.displayName || nextMsg.author.username))
+            : null;
+          const contextTag = (prevName || nextName)
+            ? ` [ctx: prev=${prevName || '-'} next=${nextName || '-'}]`
+            : '';
+
+          return `${name}${replyTag}${pingTag}${contextTag}: ${m.content}`;
         })
-        .reverse()
         .join('\n');
 
       const serverCtx = await getServerContext(message.guildId!);
@@ -572,17 +707,23 @@ export async function startBot(token: string) {
 
       const currentMood = botMood.get(message.guildId!) || 'chill';
       const senderName = message.member?.displayName || message.author.username;
+      const bondScore = await getBondScore(message.guildId!, message.author.id);
       const facts = {
         jokes: (serverCtx?.insideJokes || []).slice(-5),
         intent: serverCtx?.currentIntent || 'chill',
         nicks: (userCtx?.nicknames || []).slice(-3),
         profile: (userCtx?.profile || []).slice(-10),
         mood: currentMood,
+        bondScore,
+        bondCtx: bondContext(bondScore),
       };
 
-      // ── Log summary and user knowledge ──
       console.log(`[Server Summary]: ${chatSummary || 'none yet'}`);
       console.log(`[User Knowledge - ${senderName}]: ${facts.profile.join(' | ') || 'none yet'}`);
+      console.log(`[Bond - ${senderName}]: ${facts.bondScore}/100 (${bondTier(facts.bondScore)})`);
+
+      // ── Maybe greet returning homie ──
+      await maybeGreetUser(message.guildId!, message.author.id, senderName, message.channel);
 
       // ── Withdrawn mode check ──
       const withdrawnUntil = channelMutedUntil.get(`withdrawn:${message.channelId}`);
@@ -599,33 +740,6 @@ export async function startBot(token: string) {
         console.log(`[Withdrawn] Re-invited, clearing withdrawn mode`);
       }
 
-      // ── Fast-path: detect obvious "tell the bot to stop" messages without AI call ──
-      const botName = botClient!.user!.username.toLowerCase();
-      const contentLower = message.content.toLowerCase();
-      const stopPatterns = [
-        /\bstop\b/, /\bshut up\b/, /\bnot you\b/, /\bgo away\b/, /\bstfu\b/
-      ];
-      const nameTargetsBot = contentLower.includes(botName) || contentLower.includes('notabot') || contentLower.includes('chaos');
-      const isStopCommand = stopPatterns.some(p => p.test(contentLower)) && (nameTargetsBot || isMentioned);
-      if (isStopCommand && !isWithdrawn) {
-        console.log(`[Withdrawn] Fast-path stop detected: "${message.content}"`);
-        channelMutedUntil.set(`withdrawn:${message.channelId}`, now + 300000);
-        botMood.set(message.guildId!, 'withdrawn');
-        try {
-          const aiClient2 = await getOrInitAI();
-          if (aiClient2) {
-            const resp = await aiClient2.models.generateContent({
-              model: MODEL_NAME,
-              contents: [{ role: 'user', parts: [{ text: `${SYSTEM_PROMPT}\n\nsomeone just told you to stop or shut up. say something real — maybe unbothered, maybe slightly salty. 1 sentence max. lowercase. no DATA block.\n\n[Who said it]: ${senderName}: "${message.content}"` }] }],
-              config: { temperature: 1.1 },
-            });
-            const text = (resp.text || 'aight').replace(/DATA:[\s\S]*$/i, '').trim();
-            await (message.channel as any).send(text);
-          }
-        } catch { await (message.channel as any).send('aight'); }
-        return;
-      }
-
       // ── Single Decision Call — handles everything ──
       const withdrawnContext = isWithdrawn
         ? `[Mode]: WITHDRAWN — someone told bot to back off recently. higher skip chance. only engage if clearly invited back.`
@@ -638,6 +752,7 @@ ${withdrawnContext}
 [Bot Username in history]: "ME" (marked as ME in history, also tagged as "ME(bot)" in ping lists)
 [Server Summary]: ${chatSummary || 'none yet'}
 [User Knowledge - ${senderName}]: ${facts.profile.join(' | ') || 'none yet'}
+${facts.bondCtx}
 
 [Recent Conversation — with ping and reply metadata]:
 ${history}
@@ -649,15 +764,18 @@ ${senderName}: "${message.content}"
 ---
 ## STEP 1 — TARGETING ANALYSIS (do this first, silently)
 
-Read the history carefully. Each line may include:
-- [replying to X] — that message is a direct reply to person X
-- [pinged: X] — that message explicitly pinged/mentioned person X
+Read the history carefully. Each message line includes rich metadata:
+- [replying to X] — this message is a direct reply to person X
+- [pinged: X] — this message explicitly @mentioned person X
+- [ctx: prev=X next=Y] — who spoke immediately before and after this message
 
-Use this to map who is talking to whom. Ask:
+Use ALL of this to map who is talking to whom:
 1. Who sent the triggering message?
 2. Does it [ping] or [reply to] anyone? If so, who — is it ME(bot), or another user?
-3. If no explicit ping/reply: look at the conversational flow — who was that person most recently talking to?
-4. Is there an ongoing 2-person thread that doesn't include the bot? If yes, bot should SKIP.
+3. If no explicit ping/reply: look at [ctx] tags — is this part of an ongoing exchange between two specific users based on the surrounding messages?
+4. Look back 3-5 messages: has this sender been consistently replying to or pinging a specific non-bot user? If yes, they are in a private thread — bot should SKIP.
+5. Is there an ongoing 2-person thread that doesn't include the bot? If yes, bot should SKIP.
+6. Is there any ambiguity about whether the triggering message could be directed at the bot? If yes, consider the last person the sender interacted with — was it the bot?
 
 ## STEP 2 — DECIDE
 
@@ -720,20 +838,6 @@ Correct behavior: After "gng" with no bot ping, SKIP. Don't keep replying into a
         console.log(`[Decision]: action=${action} | target="${parsed.target_msg?.slice(0, 60) || ''}" | audience=${parsed.predicted_audience || '?'} | reason=${parsed.reason || ''}`);
         if (parsed.targeting_analysis) {
           console.log(`[Targeting]: ${parsed.targeting_analysis}`);
-        }
-
-        // ── Guard: don't reply if the last message in history was already from the bot
-        // and the triggering message has no bot ping — prevents bot talking into a void
-        const lastHistoryLine = history.split('\n').filter(Boolean).pop() || '';
-        const lastSpeakerWasBot = lastHistoryLine.startsWith('ME:') || lastHistoryLine.startsWith('ME ');
-        if (action === 'REPLY' && lastSpeakerWasBot && !isMentioned) {
-          // Check if the triggering message is a short filler with no ping
-          const cleanContent = message.content.replace(/<@!?\d+>/g, '').trim();
-          const isShortFiller = cleanContent.length < 20 && !/[?.!]/.test(cleanContent);
-          if (isShortFiller) {
-            console.log(`[Skip] Bot spoke last and triggering msg is filler with no ping — staying quiet`);
-            return;
-          }
         }
 
         // ── WITHDRAW — bot says what it feels like then goes quiet ──
