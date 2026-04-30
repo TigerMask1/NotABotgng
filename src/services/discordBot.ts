@@ -1,7 +1,7 @@
 import { Client, GatewayIntentBits, Message, Partials, Events } from 'discord.js';
 import { GoogleGenAI } from "@google/genai";
-import { db, auth } from './firebase.ts';
-import { doc, getDoc, setDoc, arrayUnion } from 'firebase/firestore';
+import { db } from './firebase.ts';
+import { FieldValue } from 'firebase-admin/firestore';
 
 const OperationType = {
   CREATE: 'create',
@@ -18,23 +18,11 @@ interface FirestoreErrorInfo {
   error: string;
   operationType: OperationType;
   path: string | null;
-  authInfo: {
-    userId?: string | null;
-    email?: string | null;
-    emailVerified?: boolean | null;
-    isAnonymous?: boolean | null;
-  }
 }
 
 function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
   const errInfo: FirestoreErrorInfo = {
     error: error instanceof Error ? error.message : String(error),
-    authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-      emailVerified: auth.currentUser?.emailVerified,
-      isAnonymous: auth.currentUser?.isAnonymous,
-    },
     operationType,
     path
   }
@@ -285,8 +273,8 @@ async function getOrInitAI() {
 async function getServerContext(guildId: string) {
   const path = `servers/${guildId}`;
   try {
-    const snap = await getDoc(doc(db, 'servers', guildId));
-    return snap.exists() ? snap.data() : null;
+    const snap = await db.doc(path).get();
+    return snap.exists ? snap.data() : null;
   } catch (error) {
     handleFirestoreError(error, OperationType.GET, path);
     return null;
@@ -296,12 +284,12 @@ async function getServerContext(guildId: string) {
 async function getOrUpdateSummary(guildId: string, history: string): Promise<string> {
   const path = `servers/${guildId}`;
   try {
-    const snap = await getDoc(doc(db, 'servers', guildId));
-    const data = snap.exists() ? snap.data() : {};
+    const snap = await db.doc(path).get();
+    const data = snap.exists ? (snap.data() || {}) : {};
     const msgCount = (data.msgCountSinceSummary || 0) + 1;
 
     if (msgCount < 25 && data.chatSummary) {
-      await setDoc(doc(db, 'servers', guildId), { msgCountSinceSummary: msgCount }, { merge: true });
+      await db.doc(path).set({ msgCountSinceSummary: msgCount }, { merge: true });
       return data.chatSummary;
     }
 
@@ -327,7 +315,7 @@ output only the summary. no headers or labels.`;
     });
 
     const summary = resp.text?.trim() || '';
-    await setDoc(doc(db, 'servers', guildId), {
+    await db.doc(path).set({
       chatSummary: summary,
       msgCountSinceSummary: 0,
       summaryUpdatedAt: new Date().toISOString()
@@ -343,8 +331,8 @@ output only the summary. no headers or labels.`;
 async function getUserContext(guildId: string, userId: string) {
   const path = `servers/${guildId}/users/${userId}`;
   try {
-    const snap = await getDoc(doc(db, 'servers', guildId, 'users', userId));
-    return snap.exists() ? snap.data() : null;
+    const snap = await db.doc(path).get();
+    return snap.exists ? snap.data() : null;
   } catch (error) {
     handleFirestoreError(error, OperationType.GET, path);
     return null;
@@ -356,22 +344,22 @@ async function updateMemory(guildId: string, userId: string, username: string, c
   const userPath = `servers/${guildId}/users/${userId}`;
   try {
     const serverUpdate: any = { updatedAt: new Date().toISOString() };
-    if (intel?.learned_joke) serverUpdate.insideJokes = arrayUnion(intel.learned_joke);
+    if (intel?.learned_joke) serverUpdate.insideJokes = FieldValue.arrayUnion(intel.learned_joke);
     if (intel?.intent) serverUpdate.currentIntent = intel.intent;
-    await setDoc(doc(db, 'servers', guildId), serverUpdate, { merge: true });
+    await db.doc(serverPath).set(serverUpdate, { merge: true });
 
     const userUpdate: any = { updatedAt: new Date().toISOString(), lastSeenUsername: username };
-    if (intel?.user_note) userUpdate.profile = arrayUnion(intel.user_note);
+    if (intel?.user_note) userUpdate.profile = FieldValue.arrayUnion(intel.user_note);
     if (intel?.nickname?.includes(':')) {
       const [targetId, nick] = intel.nickname.split(':');
       const targetPath = `servers/${guildId}/users/${targetId}`;
       try {
-        await setDoc(doc(db, 'servers', guildId, 'users', targetId), { nicknames: arrayUnion(nick) }, { merge: true });
+        await db.doc(targetPath).set({ nicknames: FieldValue.arrayUnion(nick) }, { merge: true });
       } catch (err) {
         handleFirestoreError(err, OperationType.WRITE, targetPath);
       }
     }
-    await setDoc(doc(db, 'servers', guildId, 'users', userId), userUpdate, { merge: true });
+    await db.doc(userPath).set(userUpdate, { merge: true });
   } catch (e) {
     handleFirestoreError(e, OperationType.WRITE, serverPath);
   }
@@ -428,7 +416,7 @@ export async function startBot(token: string) {
       }
       if (sub === 'reset' && message.mentions.users.first()) {
         const target = message.mentions.users.first()!;
-        await setDoc(doc(db, 'servers', message.guildId, 'users', target.id), { nicknames: [], profile: [] }, { merge: true });
+        await db.doc(`servers/${message.guildId}/users/${target.id}`).set({ nicknames: [], profile: [] }, { merge: true });
         return message.reply(`memory wiped for <@${target.id}>. who even is that?`);
       }
       // !chaos sa #channel — pin self-activity channel, or clear it

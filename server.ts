@@ -4,7 +4,6 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { startBot, stopBot, getBotStatus } from "./src/services/discordBot.ts";
 import { db } from "./src/services/firebase.ts";
-import { collection, query, getDocs, limit } from "firebase/firestore";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -43,9 +42,7 @@ async function startServer() {
 
   app.get("/api/memory", async (req, res) => {
     try {
-      const serversRef = collection(db, 'servers');
-      const q = query(serversRef, limit(10));
-      const querySnapshot = await getDocs(q);
+      const querySnapshot = await db.collection('servers').limit(10).get();
       const memory: any[] = [];
       
       for (const doc of querySnapshot.docs) {
