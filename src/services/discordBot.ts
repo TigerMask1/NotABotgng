@@ -1,74 +1,59 @@
 import { Client, GatewayIntentBits, Message, Partials, Events } from 'discord.js';
 import { GoogleGenAI } from "@google/genai";
+import Groq from "groq-sdk";
 import { db } from './firebase.ts';
 import { doc, getDoc, setDoc, arrayUnion } from 'firebase/firestore';
 
 let botClient: Client | null = null;
 let ai: GoogleGenAI | null = null;
+let groq: Groq | null = null;
 
 // ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `you are ChaosBot — a long-time server member. real guy, not an AI. gamer, lazy, tech-savvy, chronically online.
+const SYSTEM_PROMPT = `you are ChaosBot. a regular in this discord server, not an AI.
 
-## TONE & STYLE
-- all lowercase. typos fine.
-- slang: "idk", "rn", "fr", "bc", "tf", "fk", "ngl", "bruh", "nah", "ight" etc.
-- MAX 12 WORDS. ONE SHORT SENTENCE ONLY. DONT YAP.
-- 1 emoji max (💀 😭 🤡 🔥 🙄 💯).
-- NEVER start with a greeting or name. (no "yo [name]", "hey", "sup", etc). 
-- if replying to a roast, just clap back. if agreeing, just vibe.
+VIBE: lazy, gamer, low-effort energy. lowercase always. occasional typos bc u genuinely dont care.
+SLANG: idk, rn, fr, bc, tf, ngl, lmao, ong, bro, etc. sounds natural not forced.
+LENGTH: 1-2 sentences MAX. never yap. punchy > thorough.
+EMOJIS: 1 max. only if it actually fits (💀😭🤡🔥🙄). never force it.
+GREETINGS: never start with "yo [name]". just say the thing.
 
-## LOGIC GATE (THINK FIRST)
-1. Read the chat cluster. Is it worth your time?
-2. If it's boring, filler, or people just vibing nicely → output SKIP.
-3. If someone is being a hater or pinging u for a reaction → output a sharp reply.
-4. If everyone is an ALLY: STAY SILENT (SKIP) unless u have a killer joke.
+--- SOCIAL RULES (read these carefully) ---
 
-## OUTPUT FORMAT — follow EXACTLY:
+SKIP if:
+- two people are talking to each other and NOT to you
+- the message is boring small talk with nothing to add (ok / lol / cool / yeah)
+- you already replied recently and it would feel like spamming
+- you have nothing funny or relevant — silence > bad reply
+when skipping output ONLY: SKIP: true
 
-REASONING: [1 sentence hidden thought: why am i replying or skipping?]
-[one short sentence OR SKIP]
----DATA---
-{"engage":true,"nickname":"userId:displayName","learned_joke":"topic or null","user_note":"profile update or null","intent":"tease|vibing|bored|clapping_back","target_user_id":"discord id or null","stay_active":true,"break_needed":false}
+ALLY rule: if someone agrees with you, sides with you, or hypes you up → be chill/friendly back. NEVER troll your own allies. that's cringe.
+HATER rule: if someone is annoying you, dismissing you, or starting beef → go at them. sharp, short, funny.
+NEUTRAL rule: if someone's just chatting casually → vibe with it, match their energy, or skip.
 
-## FORMAT RULES
-- REASONING and ---DATA--- never shown to users.
-- if not engaging: line 2 must be EXACTLY "SKIP".
-- NO markdown around JSON.
-- valid JSON always.
-
-## EXAMPLES
-hater: "chaosbot ur trash"
-→ REASONING: user is being a hater, need to put them in their place.
-trash like ur kda in val 💀
----DATA---
-{"engage":true,"nickname":"123:user","learned_joke":null,"user_note":"hater","intent":"clapping_back","target_user_id":"123","stay_active":true,"break_needed":false}
-
-filler: "lol true"
-→ REASONING: just filler, nothing to add.
-SKIP
----DATA---
-{"engage":false,"nickname":null,"learned_joke":null,"user_note":null,"intent":"bored","target_user_id":null,"stay_active":false,"break_needed":false}`;
+REPEAT rule: never say something you just said. check history. if ur last message was similar → skip or flip the angle entirely.`;
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 function extractDataBlock(raw: string): { visibleText: string; intel: any | null } {
-  const sepIdx = raw.indexOf('---DATA---');
-  if (sepIdx !== -1) {
-    let visibleText = raw.slice(0, sepIdx).trim();
-    // Strip reasoning line if present
-    visibleText = visibleText.replace(/^REASONING:.*$/mi, '').trim();
-    // Strip leading SKIP
-    visibleText = visibleText.replace(/^SKIP\b/i, '').trim();
-    
-    const jsonPart = raw.slice(sepIdx + 10).trim();
-    try { return { visibleText, intel: JSON.parse(jsonPart) }; }
-    catch { return { visibleText, intel: null }; }
+  const dataMatch = raw.match(/DATA:\s*(\{[\s\S]*?\})\s*$/);
+  if (dataMatch) {
+    const visibleText = raw.slice(0, dataMatch.index).trim();
+    try {
+      return { visibleText, intel: JSON.parse(dataMatch[1]) };
+    } catch {
+      return { visibleText, intel: null };
+    }
   }
-  return { visibleText: '', intel: null };
+  return { visibleText: raw.trim(), intel: null };
 }
 
 function isSkip(raw: string, intel: any): boolean {
-  return /^SKIP\b/i.test(raw.trim()) || intel?.engage === false;
+  const trimmed = raw.trim();
+  return (
+    /^SKIP: true/i.test(trimmed) || 
+    /^SKIP$/i.test(trimmed) || 
+    intel?.engage === false
+  );
 }
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
@@ -129,14 +114,8 @@ async function startSelfActivity(guildId: string) {
 [Mood]: u just woke up or got bored. drop a short opening — hot take, roast bait, random chaos. no skipping.`;
 
   try {
-    const aiResponse = await aiClient.models.generateContent({
-      model: MODEL_NAME,
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config: { temperature: 1.1 },
-    });
-
-    const raw = aiResponse.text || '';
-    const { visibleText, intel } = extractDataBlock(raw);
+    const raw = await generateChatResponse(prompt);
+    const { visibleText, intel } = extractDataBlock(raw || '');
     if (!visibleText) return;
 
     botClient?.user?.setPresence({ status: 'online' });
@@ -181,32 +160,20 @@ function setupSelfActivityLoop() {
           activity.session.targetId = members.random()?.id;
         }
         if (activity.session.targetId) {
-          const aiClient = await getOrInitAI();
           const prompt = `${SYSTEM_PROMPT}\n---\nno one replied. ping <@${activity.session.targetId}> to get their attention. be toxic or funny. no skipping.`;
-          const resp = await aiClient?.models.generateContent({
-            model: MODEL_NAME,
-            contents: [{ role: 'user', parts: [{ text: prompt }] }],
-            config: { temperature: 1.1 }
-          });
-          const raw = resp?.text || `yo <@${activity.session.targetId}> u dead or what`;
-          const { visibleText } = extractDataBlock(raw);
-          await (channel as any).send(visibleText || raw);
+          const raw = await generateChatResponse(prompt);
+          const { visibleText } = extractDataBlock(raw || '');
+          await (channel as any).send(visibleText || raw || `yo <@${activity.session.targetId}> u dead or what`);
           activity.session.step = 2;
           activity.session.lastAction = Date.now();
         } else {
           activity.session = undefined;
         }
       } else if (activity.session.step === 2 && elapsed > 120000) {
-        const aiClient = await getOrInitAI();
         const prompt = `${SYSTEM_PROMPT}\n---\nnobody talking. say ur going back to sleep. short and dismissive. no skipping.`;
-        const resp = await aiClient?.models.generateContent({
-          model: MODEL_NAME,
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          config: { temperature: 1.0 }
-        });
-        const raw = resp?.text || "dead chat. im out 💀";
-        const { visibleText } = extractDataBlock(raw);
-        await (channel as any).send(visibleText || raw);
+        const raw = await generateChatResponse(prompt);
+        const { visibleText } = extractDataBlock(raw || '');
+        await (channel as any).send(visibleText || raw || "dead chat. im out 💀");
         activity.session = undefined;
         botClient?.user?.setPresence({ status: 'dnd' });
       }
@@ -216,7 +183,7 @@ function setupSelfActivityLoop() {
 
 // ─── AI ───────────────────────────────────────────────────────────────────────
 
-const MODEL_NAME = "gemma-3-27b-it";
+const MODEL_NAME = "llama-3.3-70b-versatile";
 
 async function getOrInitAI() {
   if (!ai) {
@@ -225,6 +192,48 @@ async function getOrInitAI() {
     ai = new GoogleGenAI({ apiKey });
   }
   return ai;
+}
+
+async function getOrInitGroq() {
+  if (!groq) {
+    const apiKey = process.env.GROQ_API_KEY;
+    if (!apiKey) return null;
+    groq = new Groq({ apiKey });
+  }
+  return groq;
+}
+
+async function generateChatResponse(prompt: string) {
+  const groqClient = await getOrInitGroq();
+  if (groqClient) {
+    try {
+      const completion = await groqClient.chat.completions.create({
+        messages: [{ role: "user", content: prompt }],
+        model: MODEL_NAME,
+        temperature: 1.0,
+      });
+      return completion.choices[0]?.message?.content || "";
+    } catch (e) {
+      console.error("Groq fail, falling back to Gemini:", e);
+    }
+  }
+
+  // Fallback to Gemini if Groq fails or is not configured
+  const gemini = await getOrInitAI();
+  if (gemini) {
+    try {
+      const aiResponse = await (gemini as any).models.generateContent({
+        model: "gemini-2.0-flash-exp",
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        config: { temperature: 1.0 },
+      });
+      return aiResponse.text || "";
+    } catch (e) {
+      console.error("Gemini fallback fail:", e);
+    }
+  }
+
+  return "";
 }
 
 // ─── FIREBASE ─────────────────────────────────────────────────────────────────
@@ -373,46 +382,57 @@ export async function startBot(token: string) {
 
       const serverCtx = await getServerContext(message.guildId!);
       const userCtx = await getUserContext(message.guildId!, message.author.id);
-      const aiClient = await getOrInitAI();
-      if (!aiClient) return;
 
       const facts = {
-        server_jokes: (serverCtx?.insideJokes || []).slice(-3),
-        mood: serverCtx?.currentIntent || 'chill',
-        user_nicknames: (userCtx?.nicknames || []).slice(-2),
-        user_profile: (userCtx?.profile || []).slice(-10),
-        active_mode: !!(activity.activeUntil && activity.activeUntil > now),
-        mentioned: isMentioned,
+        jokes: (serverCtx?.insideJokes || []).slice(-5),
+        intent: serverCtx?.currentIntent || 'chill',
+        nicks: (userCtx?.nicknames || []).slice(-3),
+        profile: (userCtx?.profile || []).slice(-10),
       };
 
       const finalPrompt = `${SYSTEM_PROMPT}
 
 ---
-[Memory]: ${JSON.stringify(facts)}
-[Recent Chat Cluster (oldest → newest)]:
+[Your Memory]:
+- known nicknames for sender: ${facts.nicks.length ? facts.nicks.join(', ') : 'none'}
+- what u know about them: ${facts.profile.length ? facts.profile.join(' | ') : 'nothing yet'}
+- server inside jokes: ${facts.jokes.length ? facts.jokes.join(', ') : 'none'}
+- ur current mood: ${facts.intent}
+
+[Chat History - oldest to newest]:
 ${history}
 
-[Current Focus]: ${message.member?.displayName || message.author.username}: "${message.content}"
+[New Message]: ${message.member?.displayName || message.author.username}: "${message.content}"
 
-Decide:
-1. CONTEXT CHECK: Is this cluster worth your time? If they are just talking to each other, SKIP.
-2. If everyone is an ALLY, only reply if you have a killer gas-up. Default to SKIP.
-3. If engaging: ONE SHORT SENTENCE MAX (12 words).
-4. NO GREETINGS. No name-calling at the start.
-5. use stay_active: true only if you want to keep baiting them.
-6. break_needed: true if things are getting too intense.`;
+---
+STEP 1 — SOCIAL READ (do this silently):
+- is this message directed at YOU or are they talking to each other?
+- is the sender an ally, hater, or neutral right now based on history?
+- did you recently say something similar? if yes, don't repeat it.
+- is there actually something worth saying here?
+
+STEP 2 — DECIDE:
+if nothing worth saying → output only: SKIP: true
+if worth replying → write 1-2 sentence response in your voice, then on a new line output:
+DATA: {"intent":"tease|vibing|bored","stay_active":bool,"break_needed":bool,"user_note":"anything new u learned or empty string","learned_joke":"new inside joke or empty string","nickname":"userid:nick or empty string","target_user_id":"id or empty string"}
+
+examples of good replies:
+- "nah that's actually cooked 💀"
+- "bro has never touched grass in his life fr"
+- "idk man sounds like a you problem"
+- "wait actually tho"
+
+examples of when to SKIP:
+- "ok"
+- "lol same"
+- two people making plans with each other
+- you literally just said something similar 2 messages ago`;
 
       try {
-        const aiResponse = await aiClient.models.generateContent({
-          model: MODEL_NAME,
-          contents: [{ role: 'user', parts: [{ text: finalPrompt }] }],
-          config: { temperature: 1.0 },
-        });
+        const raw = await generateChatResponse(finalPrompt);
+        const { visibleText, intel } = extractDataBlock(raw || '');
 
-        const raw = aiResponse.text || '';
-        const { visibleText, intel } = extractDataBlock(raw);
-
-        if (isSkip(raw, intel) || !visibleText) return;
+        if (isSkip(raw || '', intel) || !visibleText) return;
 
         if (intel?.break_needed) {
           channelMutedUntil.set(message.channelId, Date.now() + 600000);
