@@ -1,7 +1,7 @@
 import { Client, GatewayIntentBits, Message, Partials, Events } from 'discord.js';
 import { GoogleGenAI } from "@google/genai";
 import { db } from './firebase.ts';
-import { doc, getDoc, setDoc, arrayUnion } from 'firebase/firestore';
+import * as admin from 'firebase-admin';
 
 let botClient: Client | null = null;
 let ai: GoogleGenAI | null = null;
@@ -68,7 +68,7 @@ for short filler messages (fr, omg, lmao, ok, yes, no, same, bro, facts, cap) �
 
 --- FORMAT ---
 lowercase always. occasional typos bc you genuinely don't care. 1-2 sentences MAX. never yap. no greetings. just say the thing.
-emojis: 1 max, only if it actually fits. 💀😭🤡🔥🙄
+emojis: use sparingly — only 1, only if it genuinely adds something, and only about 20% of the time. use any emoji that matches the vibe. don't repeat the same ones. most replies should have no emoji at all. if you put an emoji in your text reply, set "reaction" to empty in DATA so you don't double up.
 
 --- OUTPUT FORMAT ---
 write your reply, then on a new line:
@@ -260,26 +260,26 @@ async function getOrInitAI() {
 
 async function getServerContext(guildId: string) {
   try {
-    const snap = await getDoc(doc(db, 'servers', guildId));
-    return snap.exists() ? snap.data() : null;
+    const snap = await db.collection('servers').doc(guildId).get();
+    return snap.exists ? snap.data() : null;
   } catch { return null; }
 }
 
 async function getUserContext(guildId: string, userId: string) {
   try {
-    const snap = await getDoc(doc(db, 'servers', guildId, 'users', userId));
-    return snap.exists() ? snap.data() : null;
+    const snap = await db.collection('servers').doc(guildId).collection('users').doc(userId).get();
+    return snap.exists ? snap.data() : null;
   } catch { return null; }
 }
 
 async function getOrUpdateSummary(guildId: string, history: string): Promise<string> {
   try {
-    const snap = await getDoc(doc(db, 'servers', guildId));
-    const data = snap.exists() ? snap.data() : {};
+    const snap = await db.collection('servers').doc(guildId).get();
+    const data = snap.exists ? snap.data() : {};
     const msgCount = (data?.msgCountSinceSummary || 0) + 1;
 
     if (msgCount < 25 && data?.chatSummary) {
-      await setDoc(doc(db, 'servers', guildId), { msgCountSinceSummary: msgCount }, { merge: true });
+      await db.collection('servers').doc(guildId).set({ msgCountSinceSummary: msgCount }, { merge: true });
       return data.chatSummary;
     }
 
@@ -305,7 +305,7 @@ output only the summary. no headers or labels.`;
     });
 
     const summary = resp.text?.trim() || '';
-    await setDoc(doc(db, 'servers', guildId), {
+    await db.collection('servers').doc(guildId).set({
       chatSummary: summary,
       msgCountSinceSummary: 0,
       summaryUpdatedAt: new Date().toISOString()
@@ -318,17 +318,19 @@ output only the summary. no headers or labels.`;
 async function updateMemory(guildId: string, userId: string, username: string, content: string, response: string, intel?: any) {
   try {
     const serverUpdate: any = { updatedAt: new Date().toISOString() };
-    if (intel?.learned_joke) serverUpdate.insideJokes = arrayUnion(intel.learned_joke);
+    if (intel?.learned_joke) serverUpdate.insideJokes = admin.firestore.FieldValue.arrayUnion(intel.learned_joke);
     if (intel?.intent) serverUpdate.currentIntent = intel.intent;
-    await setDoc(doc(db, 'servers', guildId), serverUpdate, { merge: true });
+    await db.collection('servers').doc(guildId).set(serverUpdate, { merge: true });
 
     const userUpdate: any = { updatedAt: new Date().toISOString(), lastSeenUsername: username };
-    if (intel?.user_note) userUpdate.profile = arrayUnion(intel.user_note);
+    if (intel?.user_note) userUpdate.profile = admin.firestore.FieldValue.arrayUnion(intel.user_note);
     if (intel?.nickname?.includes(':')) {
       const [targetId, nick] = intel.nickname.split(':');
-      await setDoc(doc(db, 'servers', guildId, 'users', targetId), { nicknames: arrayUnion(nick) }, { merge: true });
+      await db.collection('servers').doc(guildId).collection('users').doc(targetId).set(
+        { nicknames: admin.firestore.FieldValue.arrayUnion(nick) }, { merge: true }
+      );
     }
-    await setDoc(doc(db, 'servers', guildId, 'users', userId), userUpdate, { merge: true });
+    await db.collection('servers').doc(guildId).collection('users').doc(userId).set(userUpdate, { merge: true });
   } catch (e) { console.error("Memory failure:", e); }
 }
 
@@ -396,18 +398,23 @@ Output your reply + DATA block:`;
   channelActivity.set(message.channelId, activity);
   botClient?.user?.setPresence({ status: 'online' });
 
+  const shouldReact = Math.random() < 0.08;
+  const textHasEmoji = /\p{Emoji}/u.test(visibleText || '');
+
   // ── React only mode — for short filler messages ──
   if (intel?.react_only && intel?.reaction) {
-    try {
-      await message.react(intel.reaction);
-    } catch (e) { console.error("Reaction failed:", e); }
+    if (shouldReact) {
+      try {
+        await message.react(intel.reaction);
+      } catch (e) { console.error("Reaction failed:", e); }
+    }
     const displayName = message.member?.displayName || message.author.username;
     await updateMemory(message.guildId!, message.author.id, displayName, message.content, '', intel);
     return;
   }
 
-  // ── React + reply ──
-  if (intel?.reaction && !intel?.react_only) {
+  // ── React + reply — skip reaction if text already has an emoji ──
+  if (intel?.reaction && !intel?.react_only && shouldReact && !textHasEmoji) {
     try {
       await message.react(intel.reaction);
     } catch (e) { console.error("Reaction failed:", e); }
@@ -485,7 +492,7 @@ export async function startBot(token: string) {
       }
       if (sub === 'reset' && message.mentions.users.first()) {
         const target = message.mentions.users.first()!;
-        await setDoc(doc(db, 'servers', message.guildId, 'users', target.id), { nicknames: [], profile: [] }, { merge: true });
+        await db.collection('servers').doc(message.guildId).collection('users').doc(target.id).set({ nicknames: [], profile: [] }, { merge: true });
         return message.reply(`memory wiped for <@${target.id}>. who even is that?`);
       }
       // !chaos sa #channel — pin self-activity channel, or clear it
@@ -598,8 +605,13 @@ ${DECISION_PROMPT}`;
         if (firstWord !== "REPLY") return;
 
         const decisionParts = decisionRaw.split('|').map((s: string) => s.trim());
-        const decisionTarget = decisionParts[1] || `${message.member?.displayName || message.author.username}: "${message.content}"`;
+        let decisionTarget = decisionParts[1] || `${message.member?.displayName || message.author.username}: "${message.content}"`;
         const decisionReason = decisionParts[2] || 'directly addressed';
+
+        // Ignore if AI picked its own previous message as the target
+        if (decisionTarget.trimStart().startsWith('ME:')) {
+          decisionTarget = `${message.member?.displayName || message.author.username}: "${message.content}"`;
+        }
 
         // Fallback — skip if already replied to this exact target recently
         const channelReplied = recentlyRepliedTargets.get(message.channelId) || new Set<string>();
