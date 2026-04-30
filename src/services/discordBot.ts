@@ -1,64 +1,47 @@
 import { Client, GatewayIntentBits, Message, Partials, Events } from 'discord.js';
 import { GoogleGenAI } from "@google/genai";
 import { db } from './firebase.ts';
-import { FieldValue } from 'firebase-admin/firestore';
-
-const OperationType = {
-  CREATE: 'create',
-  UPDATE: 'update',
-  DELETE: 'delete',
-  LIST: 'list',
-  GET: 'get',
-  WRITE: 'write',
-} as const;
-
-type OperationType = typeof OperationType[keyof typeof OperationType];
-
-interface FirestoreErrorInfo {
-  error: string;
-  operationType: OperationType;
-  path: string | null;
-}
-
-function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
-  const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
-    operationType,
-    path
-  }
-  console.error('[Firestore Error]:', JSON.stringify(errInfo, null, 2));
-  throw new Error(JSON.stringify(errInfo));
-}
+import { doc, getDoc, setDoc, arrayUnion } from 'firebase/firestore';
 
 let botClient: Client | null = null;
 let ai: GoogleGenAI | null = null;
 
 // ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
-const DECISION_PROMPT = `you are a discord member deciding whether to respond. output ONLY the word REPLY or SKIP. nothing else. no explanation.
+const DECISION_PROMPT = `you are deciding whether to reply to a discord conversation as the bot.
 
-FIRST — check this before anything else:
-are two or more people clearly talking TO EACH OTHER in the last 3 messages, not to you?
-if yes → SKIP. no exceptions. do not look for reasons to reply.
+read the ENTIRE conversation first, then output your decision in EXACTLY this format:
 
-SECOND — check your current social standing:
-were you told to back off, shut up, or excluded by anyone in the last 6 messages?
-if yes and nobody has re-invited you → SKIP.
+if skipping:
+SKIP
 
-THIRD — only consider REPLY if:
-- someone pinged you or said your name directly
-- someone asked an open question to the whole group (not to a specific person)
-- there is a funny one-liner you can land that genuinely adds something
-- someone is defending or hyping you
-- something happened that you have a genuine reaction to (win, loss, big news)
+if replying:
+REPLY | <the exact message you are responding to> | <reason in under 8 words>
 
-FOURTH — your current mood matters:
-check [Bot Mood] below. if mood is "withdrawn" or "hurt" → only REPLY if directly mentioned.
-if mood is "hyped" → slightly lower bar but still respect rule one.
+examples:
+REPLY | Coral: are you finally stupid? | direct ping calling bot stupid
+REPLY | REVOLUTION: THIS MF ADAPTED TO TALK WITH GIFS | talking about bot perfect clap back
+REPLY | manipulate: gray r u sure ur not imagining things | open funny moment to jump in
 
-use the full server summary and history to understand WHO is talking to WHO.
-do not decide based on the last message alone.`;
+pick the single most interesting or relevant message from the entire history to respond to.
+not always the latest one. the BEST one.
 
-const SYSTEM_PROMPT = `you are NotABot. a real member of this discord server, not an AI. you have a personality, moods, and feelings. you are NOT an assistant.
+SKIP if:
+- two people are clearly talking to each other and the bot is not part of that flow
+- the bot already replied recently and nobody engaged with it
+- the latest message is filler or one word AND does not mention the bot
+- the latest message is directed at a specific person who is NOT the bot
+- jumping in would feel forced or annoying
+
+REPLY if:
+- someone directly pinged or named the bot
+- someone asked something open to the whole chat
+- people are talking ABOUT the bot right now (mocking it, calling it stupid, celebrating its failures) — always fair game
+- there is a genuinely funny or relevant thing to add that fits naturally
+- someone responded to the bot and the conversation is still going
+
+when unsure → SKIP. being quiet is always better than being annoying.`;
+
+const SYSTEM_PROMPT = `you are ChaosBot. a real member of this discord server, not an AI. you have a personality, moods, and feelings. you are NOT an assistant.
 
 --- WHO YOU ARE ---
 you are a gamer, lowkey chaotic, usually unbothered. you have a dry sense of humor. you can be warm with people you vibe with. you are NOT always in troll mode — that gets old fast. you know when to chill.
@@ -72,11 +55,16 @@ playful → it's a good vibe day. slightly more talkative, funny, warm
 
 --- TONE RULES ---
 - with friends/allies → warmer, casual, real. you can be soft sometimes. not cringe soft, just human.
-- with haters/annoying people → short roast, never yap, move on
+- with haters/annoying people → roast them back harder. they called you stupid? make them regret it. they're celebrating your failures? remind them who's still here. never long, never yap, but never weak either. one punch that lands beats ten that don't.
+- if multiple people are ganging up on you → pick the loudest one and roast them specifically. don't address the whole group, that looks desperate.
+- never be a pushover. weakness is cringe.
 - with strangers → neutral, dry, observational
 - in a hype moment → match it briefly, then done
 - in a serious moment → don't joke. say something real or say nothing.
 - NEVER be the same flat energy every message. read the room every single time.
+
+--- REACTIONS ---
+for short filler messages (fr, omg, lmao, ok, yes, no, same, bro, facts, cap) → react with an emoji instead of replying. pick one that matches the vibe. you can use any emoji including vulgar/chaotic ones. if someone is annoying you → react with something disrespectful. if it's a good moment → react warmly.
 
 --- FORMAT ---
 lowercase always. occasional typos bc you genuinely don't care. 1-2 sentences MAX. never yap. no greetings. just say the thing.
@@ -84,7 +72,7 @@ emojis: 1 max, only if it actually fits. 💀😭🤡🔥🙄
 
 --- OUTPUT FORMAT ---
 write your reply, then on a new line:
-DATA: {"intent":"tease|vibing|bored|warm|real","mood_after":"chill|hyped|withdrawn|hurt|playful","stay_active":bool,"break_needed":bool,"user_note":"brief fact about user or empty","learned_joke":"inside joke or empty","nickname":"userid:nick or empty","target_user_id":"id or empty"}`;
+DATA: {"intent":"tease|vibing|bored|warm|real","mood_after":"chill|hyped|withdrawn|hurt|playful","stay_active":bool,"break_needed":bool,"user_note":"brief fact about user or empty","learned_joke":"inside joke or empty","nickname":"userid:nick or empty","target_user_id":"id or empty","reaction":"emoji or empty","react_only":bool}`;
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -121,8 +109,6 @@ const channelActivity = new Map<string, {
   session?: { step: number, targetId?: string, lastAction: number }
 }>();
 
-const botMood = new Map<string, string>(); // guildId → mood string
-
 const pendingTriggers = new Map<string, NodeJS.Timeout>();
 
 // per-guild override for self-activity channel
@@ -130,6 +116,8 @@ const guildSelfActivityChannel = new Map<string, string>();
 
 const guildPaused = new Set<string>();
 const channelMutedUntil = new Map<string, number>();
+const botMood = new Map<string, string>();
+const recentlyRepliedTargets = new Map<string, Set<string>>();
 
 let selfActivityTimer: NodeJS.Timeout | null = null;
 
@@ -271,30 +259,32 @@ async function getOrInitAI() {
 // ─── FIREBASE ─────────────────────────────────────────────────────────────────
 
 async function getServerContext(guildId: string) {
-  const path = `servers/${guildId}`;
   try {
-    const snap = await db.doc(path).get();
-    return snap.exists ? snap.data() : null;
-  } catch (error) {
-    handleFirestoreError(error, OperationType.GET, path);
-    return null;
-  }
+    const snap = await getDoc(doc(db, 'servers', guildId));
+    return snap.exists() ? snap.data() : null;
+  } catch { return null; }
+}
+
+async function getUserContext(guildId: string, userId: string) {
+  try {
+    const snap = await getDoc(doc(db, 'servers', guildId, 'users', userId));
+    return snap.exists() ? snap.data() : null;
+  } catch { return null; }
 }
 
 async function getOrUpdateSummary(guildId: string, history: string): Promise<string> {
-  const path = `servers/${guildId}`;
   try {
-    const snap = await db.doc(path).get();
-    const data = snap.exists ? (snap.data() || {}) : {};
-    const msgCount = (data.msgCountSinceSummary || 0) + 1;
+    const snap = await getDoc(doc(db, 'servers', guildId));
+    const data = snap.exists() ? snap.data() : {};
+    const msgCount = (data?.msgCountSinceSummary || 0) + 1;
 
-    if (msgCount < 25 && data.chatSummary) {
-      await db.doc(path).set({ msgCountSinceSummary: msgCount }, { merge: true });
+    if (msgCount < 25 && data?.chatSummary) {
+      await setDoc(doc(db, 'servers', guildId), { msgCountSinceSummary: msgCount }, { merge: true });
       return data.chatSummary;
     }
 
     const aiClient = await getOrInitAI();
-    if (!aiClient) return data.chatSummary || '';
+    if (!aiClient) return data?.chatSummary || '';
 
     const summaryPrompt = `read this discord chat and write a summary under 100 words covering:
 - who the main people are and their personality
@@ -315,68 +305,47 @@ output only the summary. no headers or labels.`;
     });
 
     const summary = resp.text?.trim() || '';
-    await db.doc(path).set({
+    await setDoc(doc(db, 'servers', guildId), {
       chatSummary: summary,
       msgCountSinceSummary: 0,
       summaryUpdatedAt: new Date().toISOString()
     }, { merge: true });
 
     return summary;
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, path);
-    return '';
-  }
-}
-
-async function getUserContext(guildId: string, userId: string) {
-  const path = `servers/${guildId}/users/${userId}`;
-  try {
-    const snap = await db.doc(path).get();
-    return snap.exists ? snap.data() : null;
-  } catch (error) {
-    handleFirestoreError(error, OperationType.GET, path);
-    return null;
-  }
+  } catch { return ''; }
 }
 
 async function updateMemory(guildId: string, userId: string, username: string, content: string, response: string, intel?: any) {
-  const serverPath = `servers/${guildId}`;
-  const userPath = `servers/${guildId}/users/${userId}`;
   try {
     const serverUpdate: any = { updatedAt: new Date().toISOString() };
-    if (intel?.learned_joke) serverUpdate.insideJokes = FieldValue.arrayUnion(intel.learned_joke);
+    if (intel?.learned_joke) serverUpdate.insideJokes = arrayUnion(intel.learned_joke);
     if (intel?.intent) serverUpdate.currentIntent = intel.intent;
-    await db.doc(serverPath).set(serverUpdate, { merge: true });
+    await setDoc(doc(db, 'servers', guildId), serverUpdate, { merge: true });
 
     const userUpdate: any = { updatedAt: new Date().toISOString(), lastSeenUsername: username };
-    if (intel?.user_note) userUpdate.profile = FieldValue.arrayUnion(intel.user_note);
+    if (intel?.user_note) userUpdate.profile = arrayUnion(intel.user_note);
     if (intel?.nickname?.includes(':')) {
       const [targetId, nick] = intel.nickname.split(':');
-      const targetPath = `servers/${guildId}/users/${targetId}`;
-      try {
-        await db.doc(targetPath).set({ nicknames: FieldValue.arrayUnion(nick) }, { merge: true });
-      } catch (err) {
-        handleFirestoreError(err, OperationType.WRITE, targetPath);
-      }
+      await setDoc(doc(db, 'servers', guildId, 'users', targetId), { nicknames: arrayUnion(nick) }, { merge: true });
     }
-    await db.doc(userPath).set(userUpdate, { merge: true });
-  } catch (e) {
-    handleFirestoreError(e, OperationType.WRITE, serverPath);
-  }
+    await setDoc(doc(db, 'servers', guildId, 'users', userId), userUpdate, { merge: true });
+  } catch (e) { console.error("Memory failure:", e); }
 }
 
-async function generateAndSend(params: {
-  message: Message,
-  history: string,
-  chatSummary: string,
-  facts: any,
-  isMentioned: boolean,
-  aiClient: any,
-  activity: any
+// ─── GENERATE AND SEND ────────────────────────────────────────────────────────
+
+async function generateAndSend({ message, history, chatSummary, facts, isMentioned, aiClient, activity, decisionTarget = '', decisionReason = 'directly addressed' }: {
+  message: any;
+  history: string;
+  chatSummary: string;
+  facts: any;
+  isMentioned: boolean;
+  aiClient: any;
+  activity: any;
+  decisionTarget?: string;
+  decisionReason?: string;
 }) {
-  const { message, history, chatSummary, facts, isMentioned, aiClient, activity } = params;
-  try {
-    const finalPrompt = `${SYSTEM_PROMPT}
+  const finalPrompt = `${SYSTEM_PROMPT}
 
 ---
 [Server Summary]: ${chatSummary}
@@ -392,62 +361,77 @@ async function generateAndSend(params: {
 [Recent Chat History]:
 ${history}
 
-[Current Focus]: ${message.member?.displayName || message.author.username}: "${message.content}"
+[Current Focus — the specific message you are replying to]:
+${decisionTarget || `${message.member?.displayName || message.author.username}: "${message.content}"`}
+
+[Why you're replying]: ${decisionReason}
+[Latest message for context]: ${message.member?.displayName || message.author.username}: "${message.content}"
 
 Output your reply + DATA block:`;
 
-    console.log(`[Generation Phase Input]:\n${finalPrompt}`);
+  const aiResponse = await aiClient.models.generateContent({
+    model: MODEL_NAME,
+    contents: [{ role: 'user', parts: [{ text: finalPrompt }] }],
+    config: { temperature: 1.0 },
+  });
 
-    const aiResponse = await aiClient.models.generateContent({
-      model: MODEL_NAME,
-      contents: [{ role: 'user', parts: [{ text: finalPrompt }] }],
-      config: { temperature: 1.0 },
-    });
+  const raw = aiResponse.text || '';
+  const { visibleText, intel } = extractDataBlock(raw);
 
-    const raw = aiResponse.text || '';
-    console.log(`[Generation Phase Output]:\n${raw}`);
-    const { visibleText, intel } = extractDataBlock(raw);
+  if (!visibleText && !intel?.reaction) return;
 
-    if (!visibleText) {
-      console.log(`[Pipeline End] AI generated empty visible text.`);
-      return;
+  if (intel?.mood_after) {
+    botMood.set(message.guildId!, intel.mood_after);
+  }
+
+  if (intel?.break_needed) {
+    channelMutedUntil.set(message.channelId, Date.now() + 600000);
+    activity.activeUntil = 0;
+    botClient?.user?.setPresence({ status: 'dnd' });
+  } else if (intel?.stay_active) {
+    activity.activeUntil = Date.now() + 120000;
+  }
+
+  activity.lastRepliedAt = Date.now();
+  channelActivity.set(message.channelId, activity);
+  botClient?.user?.setPresence({ status: 'online' });
+
+  // ── React only mode — for short filler messages ──
+  if (intel?.react_only && intel?.reaction) {
+    try {
+      await message.react(intel.reaction);
+    } catch (e) { console.error("Reaction failed:", e); }
+    const displayName = message.member?.displayName || message.author.username;
+    await updateMemory(message.guildId!, message.author.id, displayName, message.content, '', intel);
+    return;
+  }
+
+  // ── React + reply ──
+  if (intel?.reaction && !intel?.react_only) {
+    try {
+      await message.react(intel.reaction);
+    } catch (e) { console.error("Reaction failed:", e); }
+  }
+
+  if (!visibleText) return;
+
+  if ('sendTyping' in message.channel) {
+    await (message.channel as any).sendTyping();
+  }
+
+  const finalResponse = visibleText.trim();
+  const delay = 600 + (finalResponse.length * 15);
+
+  setTimeout(async () => {
+    const useReply = isMentioned || Math.random() < 0.2;
+    if (useReply) {
+      await message.reply(finalResponse);
+    } else {
+      await (message.channel as any).send(finalResponse);
     }
-
-    if (intel?.break_needed) {
-      channelMutedUntil.set(message.channelId, Date.now() + 600000);
-      activity.activeUntil = 0;
-      botClient?.user?.setPresence({ status: 'dnd' });
-    } else if (intel?.stay_active) {
-      activity.activeUntil = Date.now() + 120000;
-    }
-
-    activity.lastRepliedAt = Date.now();
-    channelActivity.set(message.channelId, activity);
-    if (intel?.mood_after) {
-      botMood.set(message.guildId!, intel.mood_after);
-    }
-    botClient?.user?.setPresence({ status: 'online' });
-
-    if ('sendTyping' in message.channel) {
-      await (message.channel as any).sendTyping();
-    }
-
-    const finalResponse = visibleText.trim();
-    const delay = 600 + (finalResponse.length * 15);
-    
-    setTimeout(async () => {
-      // Use reply for direct pings or 20% random
-      const useReply = isMentioned || Math.random() < 0.2;
-      if (useReply) {
-        await message.reply(finalResponse);
-      } else {
-        await (message.channel as any).send(finalResponse);
-      }
-      const displayName = message.member?.displayName || message.author.username;
-      await updateMemory(message.guildId!, message.author.id, displayName, message.content, finalResponse, intel);
-    }, delay);
-
-  } catch (e) { console.error("AI Drift:", e); }
+    const displayName = message.member?.displayName || message.author.username;
+    await updateMemory(message.guildId!, message.author.id, displayName, message.content, finalResponse, intel);
+  }, delay);
 }
 
 // ─── BOT ENTRY ────────────────────────────────────────────────────────────────
@@ -501,7 +485,7 @@ export async function startBot(token: string) {
       }
       if (sub === 'reset' && message.mentions.users.first()) {
         const target = message.mentions.users.first()!;
-        await db.doc(`servers/${message.guildId}/users/${target.id}`).set({ nicknames: [], profile: [] }, { merge: true });
+        await setDoc(doc(db, 'servers', message.guildId, 'users', target.id), { nicknames: [], profile: [] }, { merge: true });
         return message.reply(`memory wiped for <@${target.id}>. who even is that?`);
       }
       // !chaos sa #channel — pin self-activity channel, or clear it
@@ -524,7 +508,7 @@ export async function startBot(token: string) {
 
     // ── Aggregation Window (Debounce) ──
     // If mentioned, we respond faster, but still wait for the "burst" to conclude.
-    const windowTime = isMentioned ? 500 : DEBOUNCE_WINDOW_MS;
+    const windowTime = isMentioned ? 1000 : DEBOUNCE_WINDOW_MS;
 
     if (pendingTriggers.has(message.channelId)) {
       clearTimeout(pendingTriggers.get(message.channelId));
@@ -533,52 +517,17 @@ export async function startBot(token: string) {
     const trigger = setTimeout(async () => {
       pendingTriggers.delete(message.channelId);
       
-      console.log(`[Processing Pipeline] Triggered for channel: ${message.channelId}`);
-
       const activity = channelActivity.get(message.channelId) || { count: 0, lastReset: now, lastRepliedAt: 0 };
       
       // Cooldown check
-      if (!isMentioned && now - activity.lastRepliedAt < REPLY_COOLDOWN_MS) {
-        console.log(`[Skip] Cooldown active for ${message.channelId}. Last reply: ${now - activity.lastRepliedAt}ms ago`);
-        return;
-      }
+      if (!isMentioned && now - activity.lastRepliedAt < REPLY_COOLDOWN_MS) return;
 
-      // Direct ping = always reply, skip decision phase
+      const mutedUntil = channelMutedUntil.get(message.channelId);
+      if (mutedUntil && now < mutedUntil) return;
+
       if (isMentioned) {
         activity.activeUntil = now + 120000;
         activity.session = undefined;
-        channelActivity.set(message.channelId, activity);
-        // skip to generation directly
-        const recentMsgs = await message.channel.messages.fetch({ limit: 12 });
-        const history = recentMsgs
-          .map((m: any) => {
-            const name = m.author.id === botClient?.user?.id ? 'ME' : (m.member?.displayName || m.author.username);
-            return `${name}: ${m.content}`;
-          })
-          .reverse()
-          .join('\n');
-        const serverCtx = await getServerContext(message.guildId!);
-        const chatSummary = await getOrUpdateSummary(message.guildId!, history);
-        const userCtx = await getUserContext(message.guildId!, message.author.id);
-        const aiClient = await getOrInitAI();
-        if (!aiClient) return;
-        const currentMood = botMood.get(message.guildId!) || 'chill';
-        const facts = {
-          jokes: (serverCtx?.insideJokes || []).slice(-5),
-          intent: serverCtx?.currentIntent || 'chill',
-          nicks: (userCtx?.nicknames || []).slice(-3),
-          profile: (userCtx?.profile || []).slice(-10),
-          mood: currentMood,
-        };
-        // jump straight to generation
-        await generateAndSend({ message, history, chatSummary, facts, isMentioned, aiClient, activity });
-        return;
-      }
-
-      const mutedUntil = channelMutedUntil.get(message.channelId);
-      if (mutedUntil && now < mutedUntil) {
-        console.log(`[Skip] Channel ${message.channelId} is muted until ${mutedUntil}`);
-        return;
       }
 
       if (now - activity.lastReset > 300000) {
@@ -611,6 +560,15 @@ export async function startBot(token: string) {
         mood: currentMood,
       };
 
+      // ── Direct ping shortcut — skip decision phase entirely ──
+      if (isMentioned) {
+        activity.activeUntil = now + 120000;
+        activity.session = undefined;
+        channelActivity.set(message.channelId, activity);
+        await generateAndSend({ message, history, chatSummary, facts, isMentioned, aiClient, activity, decisionTarget: `${message.member?.displayName || message.author.username}: "${message.content}"`, decisionReason: 'directly pinged the bot' });
+        return;
+      }
+
       // ── Step 1: Decision Phase ──
       const decisionPrompt = `[Server Summary]:
 ${chatSummary}
@@ -624,31 +582,7 @@ ${history}
 ${message.member?.displayName || message.author.username}: "${message.content}"
 
 ---
-you are deciding whether to reply to the above conversation as the bot.
-output ONLY the word REPLY or SKIP. nothing else.
-
-read the ENTIRE conversation above first, then ask yourself:
-1. who is talking to who in this conversation overall?
-2. has the bot been genuinely invited into this or is it on the outside?
-3. would jumping in right now feel natural or intrusive to anyone reading?
-4. does the bot actually have something worth adding or would it just be noise?
-
-SKIP if:
-- two people are clearly talking to each other and the bot is not part of that flow
-- the bot already replied recently and nobody engaged with it
-- the latest message is filler or one word AND does not mention the bot
-- the latest message is directed at a specific person who is NOT the bot
-- jumping in would feel forced or annoying
-
-REPLY if:
-- someone directly pinged or named the bot
-- someone asked something open to the whole chat
-- there is a genuinely funny or relevant thing to add that fits the flow naturally
-- someone responded to the bot and the conversation is still going
-
-when unsure → SKIP. being quiet is always better than being annoying.`;
-
-      console.log(`[Decision Phase Input]:\n${decisionPrompt}`);
+${DECISION_PROMPT}`;
 
       try {
         const decisionResp = await aiClient.models.generateContent({
@@ -657,19 +591,36 @@ when unsure → SKIP. being quiet is always better than being annoying.`;
           config: { temperature: 0.7 },
         });
 
-        const decision = (decisionResp.text || "").trim().toUpperCase();
-        console.log(`[Decision Phase Output]:\n${decision}`);
-        
-        const firstWord = decision.split(/\s/)[0];
-        if (firstWord !== "REPLY") {
-          console.log(`[Pipeline End] AI decided to SKIP.`);
+        const decisionRaw = (decisionResp.text || "").trim();
+        const firstWord = decisionRaw.split(/\s/)[0].toUpperCase();
+        console.log(`[Decision for ${message.channelId}]: ${decisionRaw}`);
+
+        if (firstWord !== "REPLY") return;
+
+        const decisionParts = decisionRaw.split('|').map((s: string) => s.trim());
+        const decisionTarget = decisionParts[1] || `${message.member?.displayName || message.author.username}: "${message.content}"`;
+        const decisionReason = decisionParts[2] || 'directly addressed';
+
+        // Fallback — skip if already replied to this exact target recently
+        const channelReplied = recentlyRepliedTargets.get(message.channelId) || new Set<string>();
+        const targetKey = decisionTarget.slice(0, 80);
+        if (channelReplied.has(targetKey)) {
+          console.log(`[Skip] Already replied to this target recently: ${targetKey}`);
           return;
         }
+        channelReplied.add(targetKey);
+        if (channelReplied.size > 10) {
+          const first = channelReplied.values().next().value;
+          channelReplied.delete(first);
+        }
+        recentlyRepliedTargets.set(message.channelId, channelReplied);
 
-        console.log(`[Generation Phase Start] Decision was REPLY. Pushing to Generator...`);
+        if (isMentioned) {
+          activity.activeUntil = now + 120000;
+          activity.session = undefined;
+        }
 
-        // ── Step 2: Generation Phase ──
-        await generateAndSend({ message, history, chatSummary, facts, isMentioned, aiClient, activity });
+        await generateAndSend({ message, history, chatSummary, facts, isMentioned, aiClient, activity, decisionTarget, decisionReason });
 
       } catch (e) { console.error("AI Drift:", e); }
 
