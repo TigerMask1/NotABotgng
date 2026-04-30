@@ -1,7 +1,7 @@
 import { Client, GatewayIntentBits, Message, Partials, Events } from 'discord.js';
 import { GoogleGenAI } from "@google/genai";
 import { db } from './firebase.ts';
-import * as admin from 'firebase-admin';
+import { FieldValue } from 'firebase-admin/firestore';
 
 let botClient: Client | null = null;
 let ai: GoogleGenAI | null = null;
@@ -318,16 +318,16 @@ output only the summary. no headers or labels.`;
 async function updateMemory(guildId: string, userId: string, username: string, content: string, response: string, intel?: any) {
   try {
     const serverUpdate: any = { updatedAt: new Date().toISOString() };
-    if (intel?.learned_joke) serverUpdate.insideJokes = admin.firestore.FieldValue.arrayUnion(intel.learned_joke);
+    if (intel?.learned_joke) serverUpdate.insideJokes = FieldValue.arrayUnion(intel.learned_joke);
     if (intel?.intent) serverUpdate.currentIntent = intel.intent;
     await db.collection('servers').doc(guildId).set(serverUpdate, { merge: true });
 
     const userUpdate: any = { updatedAt: new Date().toISOString(), lastSeenUsername: username };
-    if (intel?.user_note) userUpdate.profile = admin.firestore.FieldValue.arrayUnion(intel.user_note);
+    if (intel?.user_note) userUpdate.profile = FieldValue.arrayUnion(intel.user_note);
     if (intel?.nickname?.includes(':')) {
       const [targetId, nick] = intel.nickname.split(':');
       await db.collection('servers').doc(guildId).collection('users').doc(targetId).set(
-        { nicknames: admin.firestore.FieldValue.arrayUnion(nick) }, { merge: true }
+        { nicknames: FieldValue.arrayUnion(nick) }, { merge: true }
       );
     }
     await db.collection('servers').doc(guildId).collection('users').doc(userId).set(userUpdate, { merge: true });
