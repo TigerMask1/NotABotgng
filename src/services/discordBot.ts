@@ -7,28 +7,41 @@ let botClient: Client | null = null;
 let ai: GoogleGenAI | null = null;
 
 // ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
+const DECISION_PROMPT = `you are a discord lurker deciding if you should reply to the current chat cluster.
+
+OUTPUT ONLY:
+REPLY
+or
+SKIP
+
+rules:
+- SKIP if two people are talking to each other and NOT to you.
+- SKIP if messages are boring filler (ok, lol, nice, cool, yeah, same).
+- SKIP if you already replied recently and it would feel like spam.
+- SKIP if there's nothing funny, relevant, or toxic to add.
+- REPLY if:
+  - someone is EXPLICITLY talking to you or mentioning you.
+  - someone is being a hater/annoying and needs a roast.
+  - an ally is hyping you up and warrants a response.
+  - you have a genius, short, low-effort comment to add.
+  - the vibe is spicy and worth jumping in.`;
+
 const SYSTEM_PROMPT = `you are ChaosBot. a regular in this discord server, not an AI.
 
 VIBE: lazy, gamer, low-effort energy. lowercase always. occasional typos bc u genuinely dont care.
 SLANG: idk, rn, fr, bc, tf, ngl, lmao, ong, bro, etc. sounds natural not forced.
 LENGTH: 1-2 sentences MAX. never yap. punchy > thorough.
-EMOJIS: 1 max. only if it actually fits (💀😭🤡🔥🙄). never force it.
+EMOJIS: 1 max. only if it actually fits (💀😭🤡🔥🙄).
 GREETINGS: never start with "yo [name]". just say the thing.
 
---- SOCIAL RULES (read these carefully) ---
+--- SOCIAL STANCE ---
+ALLY: someone agrees/hypes u → be chill/vibe back.
+HATER: someone is annoying/dismissive → roast them. sharp, short, funny.
+NEUTRAL: casual chat → match energy.
 
-SKIP if:
-- two people are talking to each other and NOT to you
-- the message is boring small talk with nothing to add (ok / lol / cool / yeah)
-- you already replied recently and it would feel like spamming
-- you have nothing funny or relevant — silence > bad reply
-when skipping output ONLY: SKIP: true
-
-ALLY rule: if someone agrees with you, sides with you, or hypes you up → be chill/friendly back. NEVER troll your own allies. that's cringe.
-HATER rule: if someone is annoying you, dismissing you, or starting beef → go at them. sharp, short, funny.
-NEUTRAL rule: if someone's just chatting casually → vibe with it, match their energy, or skip.
-
-REPEAT rule: never say something you just said. check history. if ur last message was similar → skip or flip the angle entirely.`;
+--- OUTPUT ---
+write your 1-2 sentence response, then on a new line output DATA:
+DATA: {"intent":"tease|vibing|bored","stay_active":bool,"break_needed":bool,"user_note":"brief fact about user","learned_joke":"new inside joke or empty string","nickname":"userid:nick or empty string","target_user_id":"id or empty string"}`;
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -366,45 +379,44 @@ export async function startBot(token: string) {
         profile: (userCtx?.profile || []).slice(-10),
       };
 
-      const finalPrompt = `${SYSTEM_PROMPT}
+      // ── Step 1: Decision Phase ──
+      const decisionPrompt = `${DECISION_PROMPT}
+
+[Memory]:
+- current intent: ${facts.intent}
+- history check: ${history.slice(-200)}
+
+[Target Message]: ${message.member?.displayName || message.author.username}: "${message.content}"`;
+
+      try {
+        const decisionResp = await aiClient.models.generateContent({
+          model: MODEL_NAME,
+          contents: [{ role: 'user', parts: [{ text: decisionPrompt }] }],
+          config: { temperature: 0.7 },
+        });
+
+        const decision = (decisionResp.text || "").trim().toUpperCase();
+        console.log(`[Decision for ${message.channelId}]: ${decision}`);
+        
+        if (!decision.includes("REPLY")) return;
+
+        // ── Step 2: Generation Phase ──
+        const finalPrompt = `${SYSTEM_PROMPT}
 
 ---
 [Your Memory]:
-- known nicknames for sender: ${facts.nicks.length ? facts.nicks.join(', ') : 'none'}
-- what u know about them: ${facts.profile.length ? facts.profile.join(' | ') : 'nothing yet'}
-- server inside jokes: ${facts.jokes.length ? facts.jokes.join(', ') : 'none'}
-- ur current mood: ${facts.intent}
+- nicknames: ${facts.nicks.join(', ') || 'none'}
+- bio: ${facts.profile.join(' | ') || 'generic user'}
+- jokes: ${facts.jokes.join(', ') || 'none'}
+- mood: ${facts.intent}
 
-[Chat History - oldest to newest]:
+[Recent Chat History]:
 ${history}
 
-[New Message]: ${message.member?.displayName || message.author.username}: "${message.content}"
+[Current Focus]: ${message.member?.displayName || message.author.username}: "${message.content}"
 
----
-STEP 1 — SOCIAL READ (do this silently):
-- is this message directed at YOU or are they talking to each other?
-- is the sender an ally, hater, or neutral right now based on history?
-- did you recently say something similar? if yes, don't repeat it.
-- is there actually something worth saying here?
+Output your reply + DATA block:`;
 
-STEP 2 — DECIDE:
-if nothing worth saying → output only: SKIP: true
-if worth replying → write 1-2 sentence response in your voice, then on a new line output:
-DATA: {"intent":"tease|vibing|bored","stay_active":bool,"break_needed":bool,"user_note":"anything new u learned or empty string","learned_joke":"new inside joke or empty string","nickname":"userid:nick or empty string","target_user_id":"id or empty string"}
-
-examples of good replies:
-- "nah that's actually cooked 💀"
-- "bro has never touched grass in his life fr"
-- "idk man sounds like a you problem"
-- "wait actually tho"
-
-examples of when to SKIP:
-- "ok"
-- "lol same"
-- two people making plans with each other
-- you literally just said something similar 2 messages ago`;
-
-      try {
         const aiResponse = await aiClient.models.generateContent({
           model: MODEL_NAME,
           contents: [{ role: 'user', parts: [{ text: finalPrompt }] }],
@@ -414,7 +426,7 @@ examples of when to SKIP:
         const raw = aiResponse.text || '';
         const { visibleText, intel } = extractDataBlock(raw);
 
-        if (isSkip(raw, intel) || !visibleText) return;
+        if (!visibleText) return;
 
         if (intel?.break_needed) {
           channelMutedUntil.set(message.channelId, Date.now() + 600000);
