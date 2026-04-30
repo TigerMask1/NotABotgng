@@ -347,11 +347,6 @@ export async function startBot(token: string) {
       const mutedUntil = channelMutedUntil.get(message.channelId);
       if (mutedUntil && now < mutedUntil) return;
 
-      if (isMentioned) {
-        activity.activeUntil = now + 120000;
-        activity.session = undefined;
-      }
-
       if (now - activity.lastReset > 300000) {
         activity.count = 0;
         activity.lastReset = now;
@@ -384,7 +379,7 @@ export async function startBot(token: string) {
 
 [Memory]:
 - current intent: ${facts.intent}
-- history check: ${history.slice(-200)}
+- history check: ${history}
 
 [Target Message]: ${message.member?.displayName || message.author.username}: "${message.content}"`;
 
@@ -398,7 +393,13 @@ export async function startBot(token: string) {
         const decision = (decisionResp.text || "").trim().toUpperCase();
         console.log(`[Decision for ${message.channelId}]: ${decision}`);
         
-        if (!decision.includes("REPLY")) return;
+        const firstWord = decision.split(/\s/)[0];
+        if (firstWord !== "REPLY") return;
+
+        if (isMentioned) {
+          activity.activeUntil = now + 120000;
+          activity.session = undefined;
+        }
 
         // ── Step 2: Generation Phase ──
         const finalPrompt = `${SYSTEM_PROMPT}
