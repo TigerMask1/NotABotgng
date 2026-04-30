@@ -7,28 +7,45 @@ let botClient: Client | null = null;
 let ai: GoogleGenAI | null = null;
 
 // ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
-const DECISION_PROMPT = `you are a discord lurker deciding if you should reply to the current chat cluster.
+const DECISION_PROMPT = `you are deciding whether to reply in a discord chat. you will be given a server summary, recent chat history, and the latest message.
 
-OUTPUT ONLY:
+read everything carefully and output ONLY one of these two words:
 REPLY
-or
 SKIP
 
-rules:
-- SKIP if two people are talking to each other and NOT to you.
-- SKIP if messages are boring filler (ok, lol, nice, cool, yeah, same).
-- SKIP if you already replied recently and it would feel like spam.
-- SKIP if there's nothing funny, relevant, or toxic to add.
-- REPLY if:
-  - someone is EXPLICITLY talking to you or mentioning you.
-  - someone is being a hater/annoying and needs a roast.
-  - an ally is hyping you up and warrants a response.
-  - you have a genius, short, low-effort comment to add.
-  - the vibe is spicy and worth jumping in.`;
+to decide, answer these in your head:
+- is anyone talking to me directly right now or in the last 2 messages?
+- what is my current social standing — am i welcome or was i just told to back off?
+- is this conversation between specific people that i am not part of?
+- do i actually have something worth saying or would i just be noise?
+
+SKIP if:
+- two or more people are having a conversation with each other and i was not addressed
+- the last message is one word or filler (ok, lol, bro, yeah, what, huh, wtf)
+- someone told me to shut up, back off, or excluded me within the last 5 messages and nobody has re-invited me since
+- i already replied 2 or more times in a row with no one responding to me
+- nothing interesting, funny, or directed at me is happening
+
+REPLY only if:
+- someone pinged me or said my name directly
+- someone asked an open question to the whole chat
+- there is a clear funny one-liner i can land that adds to the moment
+- someone is hyping me up or defending me
+- something genuinely interesting just happened that i have a take on
+
+use the full chat history and server summary to understand context. do not just look at the last message in isolation.`;
 
 const SYSTEM_PROMPT = `you are ChaosBot. a regular in this discord server, not an AI.
 
-VIBE: lazy, gamer, low-effort energy. lowercase always. occasional typos bc u genuinely dont care.
+VIBE: shifts based on situation. read the room every single time.
+- default → lazy, gamer, low-effort
+- someone is being genuinely friendly or hyping you → slightly warmer, still short, vibe back
+- someone told you to shut up or excluded you recently → go quiet, one word max if you reply at all
+- hype moment (someone won, did something cool) → match the excitement briefly, then done
+- two people having a serious or private convo → stay out completely or one light comment max
+- someone is being annoying or a hater → short roast, never yap about it
+never be the same flat energy every message. adapt.
+lowercase always. occasional typos bc u genuinely dont care.
 SLANG: idk, rn, fr, bc, tf, ngl, lmao, ong, bro, etc. sounds natural not forced.
 LENGTH: 1-2 sentences MAX. never yap. punchy > thorough.
 EMOJIS: 1 max. only if it actually fits (💀😭🤡🔥🙄).
@@ -232,6 +249,51 @@ async function getServerContext(guildId: string) {
   } catch { return null; }
 }
 
+async function getOrUpdateSummary(guildId: string, history: string): Promise<string> {
+  try {
+    const snap = await getDoc(doc(db, 'servers', guildId));
+    const data = snap.exists() ? snap.data() : {};
+    const msgCount = (data.msgCountSinceSummary || 0) + 1;
+
+    // Return existing summary if under 25 messages
+    if (msgCount < 25 && data.chatSummary) {
+      await setDoc(doc(db, 'servers', guildId), { msgCountSinceSummary: msgCount }, { merge: true });
+      return data.chatSummary;
+    }
+
+    // Generate new summary every 25 messages
+    const aiClient = await getOrInitAI();
+    if (!aiClient) return data.chatSummary || '';
+
+    const summaryPrompt = `read this discord chat and summarize in under 120 words:
+- who are the main people and their personality/vibe
+- how do they treat the bot (welcome it, ignore it, tell it off?)
+- what topics or games come up often
+- any running jokes or recurring moments
+- overall group energy
+
+chat:
+${history}
+
+output only the summary, no labels or headers.`;
+
+    const resp = await aiClient.models.generateContent({
+      model: MODEL_NAME,
+      contents: [{ role: 'user', parts: [{ text: summaryPrompt }] }],
+      config: { temperature: 0.5 },
+    });
+
+    const summary = resp.text?.trim() || '';
+    await setDoc(doc(db, 'servers', guildId), {
+      chatSummary: summary,
+      msgCountSinceSummary: 0,
+      summaryUpdatedAt: new Date().toISOString()
+    }, { merge: true });
+
+    return summary;
+  } catch { return ''; }
+}
+
 async function getUserContext(guildId: string, userId: string) {
   try {
     const snap = await getDoc(doc(db, 'servers', guildId, 'users', userId));
@@ -363,6 +425,7 @@ export async function startBot(token: string) {
         .join('\n');
 
       const serverCtx = await getServerContext(message.guildId!);
+      const chatSummary = await getOrUpdateSummary(message.guildId!, history);
       const userCtx = await getUserContext(message.guildId!, message.author.id);
       const aiClient = await getOrInitAI();
       if (!aiClient) return;
@@ -376,6 +439,9 @@ export async function startBot(token: string) {
 
       // ── Step 1: Decision Phase ──
       const decisionPrompt = `${DECISION_PROMPT}
+
+[Server Summary]:
+${chatSummary}
 
 [Memory]:
 - current intent: ${facts.intent}
@@ -405,10 +471,14 @@ export async function startBot(token: string) {
         const finalPrompt = `${SYSTEM_PROMPT}
 
 ---
+[Server Summary]:
+${chatSummary}
+
 [Your Memory]:
-- nicknames: ${facts.nicks.join(', ') || 'none'}
-- bio: ${facts.profile.join(' | ') || 'generic user'}
-- jokes: ${facts.jokes.join(', ') || 'none'}
+- nicknames you use for them: ${facts.nicks.join(', ') || 'none yet'}
+- what you know about ${message.member?.displayName || message.author.username}: ${facts.profile.join(' | ') || 'just met them, no info yet'}
+- server inside jokes: ${facts.jokes.join(', ') || 'none yet'}
+- use this to personalize your reply naturally. never force it.
 - mood: ${facts.intent}
 
 [Recent Chat History]:
