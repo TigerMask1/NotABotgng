@@ -539,11 +539,27 @@ export async function startBot(token: string) {
       }
 
       // ── Fetch context ──
-      const recentMsgs = await message.channel.messages.fetch({ limit: 12 });
+      const recentMsgs = await message.channel.messages.fetch({ limit: 15 });
       const history = recentMsgs
         .map((m: any) => {
-          const name = m.author.id === botClient?.user?.id ? 'ME' : (m.member?.displayName || m.author.username);
-          return `${name}: ${m.content}`;
+          const isBot = m.author.id === botId;
+          const name = isBot ? 'ME' : (m.member?.displayName || m.author.username);
+
+          // Build rich ping metadata so the AI can track who is talking to whom
+          const mentionedNames: string[] = m.mentions.users.map((u: any) => {
+            if (u.id === botId) return 'ME(bot)';
+            const member = m.guild?.members.cache.get(u.id);
+            return member?.displayName || u.username;
+          });
+          const replyingTo = m.reference?.messageId
+            ? recentMsgs.get(m.reference.messageId)
+            : null;
+          const replyTag = replyingTo
+            ? ` [replying to ${replyingTo.author.id === botId ? 'ME(bot)' : (replyingTo.member?.displayName || replyingTo.author.username)}]`
+            : '';
+          const pingTag = mentionedNames.length > 0 ? ` [pinged: ${mentionedNames.join(', ')}]` : '';
+
+          return `${name}${replyTag}${pingTag}: ${m.content}`;
         })
         .reverse()
         .join('\n');
@@ -583,6 +599,33 @@ export async function startBot(token: string) {
         console.log(`[Withdrawn] Re-invited, clearing withdrawn mode`);
       }
 
+      // ── Fast-path: detect obvious "tell the bot to stop" messages without AI call ──
+      const botName = botClient!.user!.username.toLowerCase();
+      const contentLower = message.content.toLowerCase();
+      const stopPatterns = [
+        /\bstop\b/, /\bshut up\b/, /\bnot you\b/, /\bgo away\b/, /\bstfu\b/
+      ];
+      const nameTargetsBot = contentLower.includes(botName) || contentLower.includes('notabot') || contentLower.includes('chaos');
+      const isStopCommand = stopPatterns.some(p => p.test(contentLower)) && (nameTargetsBot || isMentioned);
+      if (isStopCommand && !isWithdrawn) {
+        console.log(`[Withdrawn] Fast-path stop detected: "${message.content}"`);
+        channelMutedUntil.set(`withdrawn:${message.channelId}`, now + 300000);
+        botMood.set(message.guildId!, 'withdrawn');
+        try {
+          const aiClient2 = await getOrInitAI();
+          if (aiClient2) {
+            const resp = await aiClient2.models.generateContent({
+              model: MODEL_NAME,
+              contents: [{ role: 'user', parts: [{ text: `${SYSTEM_PROMPT}\n\nsomeone just told you to stop or shut up. say something real — maybe unbothered, maybe slightly salty. 1 sentence max. lowercase. no DATA block.\n\n[Who said it]: ${senderName}: "${message.content}"` }] }],
+              config: { temperature: 1.1 },
+            });
+            const text = (resp.text || 'aight').replace(/DATA:[\s\S]*$/i, '').trim();
+            await (message.channel as any).send(text);
+          }
+        } catch { await (message.channel as any).send('aight'); }
+        return;
+      }
+
       // ── Single Decision Call — handles everything ──
       const withdrawnContext = isWithdrawn
         ? `[Mode]: WITHDRAWN — someone told bot to back off recently. higher skip chance. only engage if clearly invited back.`
@@ -592,50 +635,71 @@ export async function startBot(token: string) {
 
 ${withdrawnContext}
 [Bot Mood]: ${facts.mood}
+[Bot Username in history]: "ME" (marked as ME in history, also tagged as "ME(bot)" in ping lists)
 [Server Summary]: ${chatSummary || 'none yet'}
 [User Knowledge - ${senderName}]: ${facts.profile.join(' | ') || 'none yet'}
 
-[Recent Conversation]:
+[Recent Conversation — with ping and reply metadata]:
 ${history}
 
 [Triggering Message]:
 ${senderName}: "${message.content}"
-[Was bot directly pinged?]: ${isMentioned ? 'YES' : 'NO'}
+[Was bot directly @mentioned in this message?]: ${isMentioned ? 'YES' : 'NO'}
 
 ---
-first, figure out what's actually going on:
-- who is talking to who in this conversation? look at pings, flow, who's been responding to who
-- if someone pinged another user earlier and that user is offline, messages after might still be for that person not the bot
-- is this message actually for the bot, or is it for someone else?
-- if pinged: is this person genuinely talking to the bot, or just reacting (fr, ok, lol, yeah) to something the bot said?
-- is the bot being excluded or told to back off?
+## STEP 1 — TARGETING ANALYSIS (do this first, silently)
 
-then output ONLY this JSON:
+Read the history carefully. Each line may include:
+- [replying to X] — that message is a direct reply to person X
+- [pinged: X] — that message explicitly pinged/mentioned person X
+
+Use this to map who is talking to whom. Ask:
+1. Who sent the triggering message?
+2. Does it [ping] or [reply to] anyone? If so, who — is it ME(bot), or another user?
+3. If no explicit ping/reply: look at the conversational flow — who was that person most recently talking to?
+4. Is there an ongoing 2-person thread that doesn't include the bot? If yes, bot should SKIP.
+
+## STEP 2 — DECIDE
+
+Output ONLY this JSON (no explanation, no markdown):
 {
   "action": "REPLY" | "SKIP" | "WITHDRAW",
-  "target_msg": "the exact message from history you're replying to, or empty",
+  "target_msg": "the exact message line from history you would reply to, or empty",
   "reason": "one line explanation",
-  "predicted_audience": "bot" | "user:NAME" | "group" | "unknown"
+  "predicted_audience": "bot" | "user:NAME" | "group" | "unknown",
+  "targeting_analysis": "1-2 sentences: who is talking to who, and why you concluded that"
 }
 
-action meanings:
-- REPLY = engage. pick the best message to respond to from history.
-- SKIP = stay quiet. not your convo, just a reaction, or nothing worth adding.
-- WITHDRAW = someone excluded the bot or called it out. bot will say something then go quiet for a bit.
+## DECISION RULES
 
-REPLY rules:
-- pinged with real content → almost always REPLY
-- pinged but just reacting (fr/ok/yeah/lol/💀) to bot's last msg → SKIP
-- someone greeting or saying hi → REPLY warmly
-- two people clearly in their own chat → SKIP
-- people talking ABOUT the bot (mocking, hyping, testing) → REPLY
-- something funny the bot can land on → REPLY
-- message clearly for someone else → SKIP
-- already replied a lot and nobody engaging → SKIP
+REPLY when:
+- bot is directly @mentioned with real content (not just a filler reaction like "lol", "fr", "ok", "yeah", "💀")
+- someone replied to a bot message with actual engagement
+- a question was asked open to the whole chat and bot has something good to add
+- people are talking ABOUT the bot (mocking it, testing it, talking about something it said)
+- a message has clear comedic or conversational opening that fits the bot's personality
 
-WITHDRAW rules:
-- "not you", "i'm talking to X", "shut up", "i didn't ask you/the bot" → WITHDRAW
-- only if it's clearly directed at the bot, not just general frustration`;
+SKIP when:
+- [replying to X] or [pinged: X] where X is NOT the bot — it's for someone else, stay out
+- two people are clearly in their own exchange with no room for bot
+- triggering message is a short filler reaction (fr, lol, ok, yeah, same, bro, facts, cap, 💀, gng, "going to sleep", "gn") — UNLESS it directly mentions the bot
+- bot already replied recently and nobody is actively engaging back
+- jumping in would feel forced, desperate, or annoying
+
+WITHDRAW when:
+- someone says "stop", "shut up", "not you", "i'm not talking to you", "i didn't ask you/the bot", directed at the bot
+- only WITHDRAW if it is clearly aimed at the bot, not just general frustration between users
+
+## KEY EXAMPLE (from real logs)
+History showed:
+  manipulate: gng [going to sleep, no ping]
+  ME: [bot replied with a quip]
+  manipulate: time to sleep [still no ping, talking to herself/group]
+  ME: [bot replied AGAIN — this was wrong, nobody was talking to the bot]
+  REVOLUTION: notabot stop [told the bot to stop]
+
+Correct behavior: After "gng" with no bot ping, SKIP. Don't keep replying into a void.`;
+
 
       try {
         const decisionResp = await aiClient.models.generateContent({
@@ -654,6 +718,23 @@ WITHDRAW rules:
 
         const action = (parsed.action || 'SKIP').toUpperCase();
         console.log(`[Decision]: action=${action} | target="${parsed.target_msg?.slice(0, 60) || ''}" | audience=${parsed.predicted_audience || '?'} | reason=${parsed.reason || ''}`);
+        if (parsed.targeting_analysis) {
+          console.log(`[Targeting]: ${parsed.targeting_analysis}`);
+        }
+
+        // ── Guard: don't reply if the last message in history was already from the bot
+        // and the triggering message has no bot ping — prevents bot talking into a void
+        const lastHistoryLine = history.split('\n').filter(Boolean).pop() || '';
+        const lastSpeakerWasBot = lastHistoryLine.startsWith('ME:') || lastHistoryLine.startsWith('ME ');
+        if (action === 'REPLY' && lastSpeakerWasBot && !isMentioned) {
+          // Check if the triggering message is a short filler with no ping
+          const cleanContent = message.content.replace(/<@!?\d+>/g, '').trim();
+          const isShortFiller = cleanContent.length < 20 && !/[?.!]/.test(cleanContent);
+          if (isShortFiller) {
+            console.log(`[Skip] Bot spoke last and triggering msg is filler with no ping — staying quiet`);
+            return;
+          }
+        }
 
         // ── WITHDRAW — bot says what it feels like then goes quiet ──
         if (action === 'WITHDRAW') {
