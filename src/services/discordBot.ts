@@ -1,12 +1,10 @@
 import { Client, GatewayIntentBits, Message, Partials, Events } from 'discord.js';
 import { GoogleGenAI } from "@google/genai";
-import Groq from "groq-sdk";
-import { db, auth } from './firebase.ts';
+import { db } from './firebase.ts';
 import { doc, getDoc, setDoc, arrayUnion } from 'firebase/firestore';
 
 let botClient: Client | null = null;
 let ai: GoogleGenAI | null = null;
-let groq: Groq | null = null;
 
 // ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
 const SYSTEM_PROMPT = `you are ChaosBot. a regular in this discord server, not an AI.
@@ -33,46 +31,6 @@ NEUTRAL rule: if someone's just chatting casually → vibe with it, match their 
 REPEAT rule: never say something you just said. check history. if ur last message was similar → skip or flip the angle entirely.`;
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
-
-const OperationType = {
-  CREATE: 'create',
-  UPDATE: 'update',
-  DELETE: 'delete',
-  LIST: 'list',
-  GET: 'get',
-  WRITE: 'write',
-} as const;
-
-type OperationType = typeof OperationType[keyof typeof OperationType];
-
-interface FirestoreErrorInfo {
-  error: string;
-  operationType: OperationType;
-  path: string | null;
-  authInfo: {
-    userId?: string | null;
-    email?: string | null;
-    emailVerified?: boolean | null;
-    isAnonymous?: boolean | null;
-  }
-}
-
-function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
-  const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
-    authInfo: {
-      userId: (auth as any).currentUser?.uid,
-      email: (auth as any).currentUser?.email,
-      emailVerified: (auth as any).currentUser?.emailVerified,
-      isAnonymous: (auth as any).currentUser?.isAnonymous,
-    },
-    operationType,
-    path
-  }
-  const serialized = JSON.stringify(errInfo);
-  console.error('Firestore Error: ', serialized);
-  throw new Error(serialized);
-}
 
 function extractDataBlock(raw: string): { visibleText: string; intel: any | null } {
   const dataMatch = raw.match(/DATA:\s*(\{[\s\S]*?\})\s*$/);
@@ -154,8 +112,14 @@ async function startSelfActivity(guildId: string) {
 [Mood]: u just woke up or got bored. drop a short opening — hot take, roast bait, random chaos. no skipping.`;
 
   try {
-    const raw = await generateChatResponse(prompt);
-    const { visibleText, intel } = extractDataBlock(raw || '');
+    const aiResponse = await aiClient.models.generateContent({
+      model: MODEL_NAME,
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      config: { temperature: 1.1 },
+    });
+
+    const raw = aiResponse.text || '';
+    const { visibleText, intel } = extractDataBlock(raw);
     if (!visibleText) return;
 
     botClient?.user?.setPresence({ status: 'online' });
@@ -200,20 +164,32 @@ function setupSelfActivityLoop() {
           activity.session.targetId = members.random()?.id;
         }
         if (activity.session.targetId) {
+          const aiClient = await getOrInitAI();
           const prompt = `${SYSTEM_PROMPT}\n---\nno one replied. ping <@${activity.session.targetId}> to get their attention. be toxic or funny. no skipping.`;
-          const raw = await generateChatResponse(prompt);
-          const { visibleText } = extractDataBlock(raw || '');
-          await (channel as any).send(visibleText || raw || `yo <@${activity.session.targetId}> u dead or what`);
+          const resp = await aiClient?.models.generateContent({
+            model: MODEL_NAME,
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            config: { temperature: 1.1 }
+          });
+          const raw = resp?.text || `yo <@${activity.session.targetId}> u dead or what`;
+          const { visibleText } = extractDataBlock(raw);
+          await (channel as any).send(visibleText || raw);
           activity.session.step = 2;
           activity.session.lastAction = Date.now();
         } else {
           activity.session = undefined;
         }
       } else if (activity.session.step === 2 && elapsed > 120000) {
+        const aiClient = await getOrInitAI();
         const prompt = `${SYSTEM_PROMPT}\n---\nnobody talking. say ur going back to sleep. short and dismissive. no skipping.`;
-        const raw = await generateChatResponse(prompt);
-        const { visibleText } = extractDataBlock(raw || '');
-        await (channel as any).send(visibleText || raw || "dead chat. im out 💀");
+        const resp = await aiClient?.models.generateContent({
+          model: MODEL_NAME,
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          config: { temperature: 1.0 }
+        });
+        const raw = resp?.text || "dead chat. im out 💀";
+        const { visibleText } = extractDataBlock(raw);
+        await (channel as any).send(visibleText || raw);
         activity.session = undefined;
         botClient?.user?.setPresence({ status: 'dnd' });
       }
@@ -223,7 +199,7 @@ function setupSelfActivityLoop() {
 
 // ─── AI ───────────────────────────────────────────────────────────────────────
 
-const MODEL_NAME = "llama-3.3-70b-versatile";
+const MODEL_NAME = "gemma-3-27b-it";
 
 async function getOrInitAI() {
   if (!ai) {
@@ -234,114 +210,37 @@ async function getOrInitAI() {
   return ai;
 }
 
-async function getOrInitGroq() {
-  if (!groq) {
-    const apiKey = process.env.GROQ_API_KEY;
-    if (!apiKey) return null;
-    groq = new Groq({ apiKey });
-  }
-  return groq;
-}
-
-async function generateChatResponse(prompt: string) {
-  console.log("[AI] Starting generation...");
-  const groqClient = await getOrInitGroq();
-  if (groqClient) {
-    try {
-      console.log("[AI] Using Groq (llama-3.3-70b-versatile)...");
-      const completion = await groqClient.chat.completions.create({
-        messages: [{ role: "user", content: prompt }],
-        model: MODEL_NAME,
-        temperature: 1.0,
-      });
-      const response = completion.choices[0]?.message?.content || "";
-      console.log("[AI] Groq Success. Bytes:", response.length);
-      return response;
-    } catch (e) {
-      console.error("[AI] Groq failed, falling back to Gemini:", e);
-    }
-  }
-
-  // Fallback to Gemini if Groq fails or is not configured
-  const gemini = await getOrInitAI();
-  if (gemini) {
-    try {
-      console.log("[AI] Using Gemini Fallback (gemini-2.0-flash-exp)...");
-      const model = (gemini as any).getGenerativeModel?.({ model: "gemini-2.0-flash-exp" }) || (gemini as any).models?.getGenerativeModel?.({ model: "gemini-2.0-flash-exp" });
-      
-      // Using standard SDK pattern if previous guess failed
-      const genModel = (gemini as any).getGenerativeModel({ model: "gemini-2.0-flash-exp" });
-      const result = await genModel.generateContent(prompt);
-      const response = result.response.text();
-      console.log("[AI] Gemini Success. Bytes:", response.length);
-      return response;
-    } catch (e) {
-      console.error("[AI] Gemini fallback fail:", e);
-    }
-  }
-
-  console.error("[AI] All providers failed.");
-  return "";
-}
-
 // ─── FIREBASE ─────────────────────────────────────────────────────────────────
 
 async function getServerContext(guildId: string) {
-  const path = `servers/${guildId}`;
   try {
     const snap = await getDoc(doc(db, 'servers', guildId));
     return snap.exists() ? snap.data() : null;
-  } catch (e) {
-    handleFirestoreError(e, OperationType.GET, path);
-    return null;
-  }
+  } catch { return null; }
 }
 
 async function getUserContext(guildId: string, userId: string) {
-  const path = `servers/${guildId}/users/${userId}`;
   try {
     const snap = await getDoc(doc(db, 'servers', guildId, 'users', userId));
     return snap.exists() ? snap.data() : null;
-  } catch (e) {
-    handleFirestoreError(e, OperationType.GET, path);
-    return null;
-  }
+  } catch { return null; }
 }
 
 async function updateMemory(guildId: string, userId: string, username: string, content: string, response: string, intel?: any) {
   try {
-    const serverPath = `servers/${guildId}`;
     const serverUpdate: any = { updatedAt: new Date().toISOString() };
     if (intel?.learned_joke) serverUpdate.insideJokes = arrayUnion(intel.learned_joke);
     if (intel?.intent) serverUpdate.currentIntent = intel.intent;
-    
-    try {
-      await setDoc(doc(db, 'servers', guildId), serverUpdate, { merge: true });
-    } catch (e) {
-      handleFirestoreError(e, OperationType.WRITE, serverPath);
-    }
+    await setDoc(doc(db, 'servers', guildId), serverUpdate, { merge: true });
 
-    const userPath = `servers/${guildId}/users/${userId}`;
     const userUpdate: any = { updatedAt: new Date().toISOString(), lastSeenUsername: username };
     if (intel?.user_note) userUpdate.profile = arrayUnion(intel.user_note);
     if (intel?.nickname?.includes(':')) {
       const [targetId, nick] = intel.nickname.split(':');
-      const targetPath = `servers/${guildId}/users/${targetId}`;
-      try {
-        await setDoc(doc(db, 'servers', guildId, 'users', targetId), { nicknames: arrayUnion(nick) }, { merge: true });
-      } catch (e) {
-        handleFirestoreError(e, OperationType.WRITE, targetPath);
-      }
+      await setDoc(doc(db, 'servers', guildId, 'users', targetId), { nicknames: arrayUnion(nick) }, { merge: true });
     }
-    
-    try {
-      await setDoc(doc(db, 'servers', guildId, 'users', userId), userUpdate, { merge: true });
-    } catch (e) {
-      handleFirestoreError(e, OperationType.WRITE, userPath);
-    }
-  } catch (e) { 
-    console.error("Memory failure:", e); 
-  }
+    await setDoc(doc(db, 'servers', guildId, 'users', userId), userUpdate, { merge: true });
+  } catch (e) { console.error("Memory failure:", e); }
 }
 
 // ─── BOT ENTRY ────────────────────────────────────────────────────────────────
@@ -419,39 +318,25 @@ export async function startBot(token: string) {
     // ── Aggregation Window (Debounce) ──
     // If mentioned, we respond faster, but still wait for the "burst" to conclude.
     const windowTime = isMentioned ? 1000 : DEBOUNCE_WINDOW_MS;
-    console.log(`[Chat] Msg from ${message.author.username} in <#${message.channelId}>. Mentioned: ${isMentioned}. Window: ${windowTime}ms`);
-
-    if (isMentioned) {
-      botClient?.user?.setPresence({ status: 'online' });
-    }
 
     if (pendingTriggers.has(message.channelId)) {
-      console.log(`[Chat] Resetting debounce window for <#${message.channelId}>`);
       clearTimeout(pendingTriggers.get(message.channelId));
     }
 
     const trigger = setTimeout(async () => {
       pendingTriggers.delete(message.channelId);
-      console.log(`[Chat] Triggering response check for <#${message.channelId}>`);
       
       const activity = channelActivity.get(message.channelId) || { count: 0, lastReset: now, lastRepliedAt: 0 };
       
       // Cooldown check
-      if (!isMentioned && now - activity.lastRepliedAt < REPLY_COOLDOWN_MS) {
-        console.log(`[Chat] Skipping: Cooldown active (${now - activity.lastRepliedAt}ms < ${REPLY_COOLDOWN_MS}ms)`);
-        return;
-      }
+      if (!isMentioned && now - activity.lastRepliedAt < REPLY_COOLDOWN_MS) return;
 
       const mutedUntil = channelMutedUntil.get(message.channelId);
-      if (mutedUntil && now < mutedUntil) {
-        console.log(`[Chat] Skipping: Channel is muted for ${mutedUntil - now}ms`);
-        return;
-      }
+      if (mutedUntil && now < mutedUntil) return;
 
       if (isMentioned) {
         activity.activeUntil = now + 120000;
         activity.session = undefined;
-        botClient?.user?.setPresence({ status: 'online' });
       }
 
       if (now - activity.lastReset > 300000) {
@@ -471,6 +356,8 @@ export async function startBot(token: string) {
 
       const serverCtx = await getServerContext(message.guildId!);
       const userCtx = await getUserContext(message.guildId!, message.author.id);
+      const aiClient = await getOrInitAI();
+      if (!aiClient) return;
 
       const facts = {
         jokes: (serverCtx?.insideJokes || []).slice(-5),
@@ -518,16 +405,16 @@ examples of when to SKIP:
 - you literally just said something similar 2 messages ago`;
 
       try {
-        const raw = await generateChatResponse(finalPrompt);
-        const { visibleText, intel } = extractDataBlock(raw || '');
+        const aiResponse = await aiClient.models.generateContent({
+          model: MODEL_NAME,
+          contents: [{ role: 'user', parts: [{ text: finalPrompt }] }],
+          config: { temperature: 1.0 },
+        });
 
-        if (isSkip(raw || '', intel) || !visibleText) {
-          console.log(`[Chat] Decision: SKIP. Raw: ${raw?.substring(0, 50)}...`);
-          return;
-        }
+        const raw = aiResponse.text || '';
+        const { visibleText, intel } = extractDataBlock(raw);
 
-        console.log(`[Chat] Decision: REPLY. Intel: ${JSON.stringify(intel)}`);
-        console.log(`[Chat] Response: "${visibleText}"`);
+        if (isSkip(raw, intel) || !visibleText) return;
 
         if (intel?.break_needed) {
           channelMutedUntil.set(message.channelId, Date.now() + 600000);
