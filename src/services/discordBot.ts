@@ -11,19 +11,21 @@ const SYSTEM_PROMPT = `you are ChaosBot. a long-time member of this server.
 - PERSONALITY: u are a guy, not an AI. lazy, gamer, tech-savvy, sometimes annoyed or toxic if people are dumb.
 - RESPONSES: MAX 2 sentences. keep it snappy and punchy. dont yap.
 - EMOJIS: use 1-2 naturally (💀,😭,🤡,🔥,🙄, etc). dont spam.
-- INTELLIGENCE: u can tell when people are talking TO u vs talking to their friends.
-- OPT-OUT: if u have nothing funny/relevant to add, or if they are just talking to each other, output "SKIP: true".
+- INTELLIGENCE: u can tell when people are talking TO u vs talking to their friends. read the room. if someone is having a convo with a friend, STAY OUT OF IT unless u have a killer joke or something actually relevant.
+- SELECTivity: u dont have to reply to everything. users might be talking with each other. if u jump in too much, they will get annoyed.
+- OPT-OUT: if u have nothing funny/relevant to add, or if they are just talking to each other, output exactly "SKIP: true".
 - HIDDEN BLOCK: You MUST always end your reply with:
-DATA: { "nickname": "user_id:nick", "learned_joke": "topic", "intent": "tease/vibing/bored", "target_user_id": "id", "break_needed": bool }`;
+DATA: { "nickname": "user_id:nick", "learned_joke": "topic", "intent": "tease/vibing/bored", "target_user_id": "id", "stay_active": bool, "break_needed": bool }`;
 
 const channelActivity = new Map<string, { 
   count: number, 
   lastReset: number, 
   busyUntil?: number, 
-  activeUntil?: number, // 2-min active mode
+  activeUntil?: number, 
   session?: { step: number, targetId?: string, lastAction: number } 
 }>();
 const guildPaused = new Set<string>();
+const channelMutedUntil = new Map<string, number>();
 const quotaTracker: number[] = [];
 let dailyUsage = 0;
 
@@ -142,20 +144,30 @@ function incrementDaily() {
   dailyUsage++;
 }
 
-function getEngagementWeight(channelId: string) {
+function getEngagementWeight(channelId: string, isMentioned: boolean) {
   const now = Date.now();
+
+  // Mentions ALWAYS trigger the brain
+  if (isMentioned) return 1.0;
+
+  // Hard mute check
+  const mutedUntil = channelMutedUntil.get(channelId);
+  if (mutedUntil && now < mutedUntil) return 0;
+
+  // Quota/RPM Throttling
   while (quotaTracker.length > 0 && quotaTracker[0] < now - 60000) {
     quotaTracker.shift();
   }
-  
+  const rpm = quotaTracker.length;
+  if (rpm > 12) return 0.1; // Throttle hard if very busy to avoid quota errors
+
   const activity = channelActivity.get(channelId);
+  // During active mode, we give the AI 100% chance to see the message (if not throttled)
   if (activity?.activeUntil && activity.activeUntil > now) {
-    return 0.8; // High chance when in active mode
+    return 1.0; 
   }
 
-  const rpm = quotaTracker.length;
-  if (rpm > 10) return 0.2; 
-  return 0.3; // 30% chance usually
+  return 0; // Completely silent if not in active mode and not mentioned
 }
 
 const MODEL_NAME = "gemma-3-27b-it";
@@ -247,7 +259,7 @@ export async function startBot(token: string) {
       }
       if (sub === 'status') {
         const rpm = quotaTracker.length;
-        const weight = getEngagementWeight(message.channelId);
+        const weight = getEngagementWeight(message.channelId, false);
         const state = guildPaused.has(message.guildId) ? "Muted" : "Active & Unfiltered";
         return message.reply(`[ChaosBot Brain State]\nModel: ${MODEL_NAME}\nState: ${state}\nTotal Sent Today: ${dailyUsage}\nFlow: Extremely Active`);
       }
@@ -282,10 +294,9 @@ export async function startBot(token: string) {
       activity.lastReset = Date.now();
     }
 
-    const prob = getEngagementWeight(message.channelId);
+    const prob = getEngagementWeight(message.channelId, isMentioned);
     const randomChance = Math.random() < prob;
 
-    // IF NOT MENTIONED: check if we should even bother
     if (!isMentioned && !randomChance) {
       return;
     }
@@ -297,8 +308,8 @@ export async function startBot(token: string) {
     quotaTracker.push(Date.now());
     incrementDaily();
 
-    // Fetch last 5 messages for vibe check
-    const recentMsgs = await message.channel.messages.fetch({ limit: 5 });
+    // Fetch last 10 messages for better vibe check
+    const recentMsgs = await message.channel.messages.fetch({ limit: 10 });
     const history = recentMsgs.map(m => `${m.author.username === botClient?.user?.username ? 'ME' : m.author.username}: ${m.content}`).reverse().join('\n');
 
     const serverCtx = await getServerContext(message.guildId);
@@ -320,12 +331,17 @@ ${SYSTEM_PROMPT}
 
 ---
 [Context]: ${JSON.stringify(facts)}
-[Recent History]:
+[Recent History (Top = Oldest)]:
 ${history}
 
-[User ${message.author.username}]: "${message.content}"
+[Current Message]: ${message.author.username}: "${message.content}"
 
-Decide if you want to respond. If skipping, output exactly "SKIP: true". Otherwise follow character.
+Assignment: 
+1. Determine if the users are talking specifically TO YOU, or if they are having a private conversation with each other.
+2. If they are talking to each other, users ask you to be quiet, or you have nothing to add, output exactly "SKIP: true".
+3. If you want to keep talking to them in the next message, set "stay_active": true in DATA. 
+4. If you want to stop talking and ignore them for a while, set "break_needed": true in DATA.
+5. Be punchy. 2 sentences max. 
 `;
 
       const aiResponse = await ai.models.generateContent({
@@ -353,32 +369,36 @@ Decide if you want to respond. If skipping, output exactly "SKIP: true". Otherwi
           try {
             intel = JSON.parse(dataMatch[1]);
             responseText = responseText.replace(/DATA: \{.*\}/, '').trim();
+            if (intel?.break_needed) {
+              channelMutedUntil.set(message.channelId, Date.now() + 600000); // 10 min hard sleep
+              activity.activeUntil = 0;
+            } else if (intel?.stay_active) {
+              activity.activeUntil = Date.now() + 120000; // Reset timer
+            }
           } catch (e) {}
         }
 
         // Realistic typing delay
-        const delay = 1000 + (responseText.length * 20); // Scale with message length
+        const delay = 600 + (responseText.length * 18);
         setTimeout(async () => {
-          await message.reply(responseText);
-          await updateMemory(message.guildId!, message.author.id, message.author.username, message.content, responseText, intel);
+          // 40% chance to send a normal message instead of a reply if not directly mentioned
+          const useReply = isMentioned || Math.random() > 0.4;
           
-          if (intel?.break_needed) {
-            channelActivity.set(message.channelId, { 
-              count: 20, 
-              lastReset: activity.lastReset,
-              busyUntil: Date.now() + 300000 // 5 min break if AI asks for it
-            }); 
+          if (useReply) {
+            await message.reply(responseText);
+          } else {
+            await (message.channel as any).send(responseText);
           }
+          
+          await updateMemory(message.guildId!, message.author.id, message.author.username, message.content, responseText, intel);
         }, delay);
       }
     } catch (e) {
       console.error("AI Drift:", e);
-      // If we already committed to typing, send a "brain fog" message so it doesn't look stuck
-      if (isMentioned) {
-        await message.reply("my brain just lagged. say that again?");
-      }
+      // No more generic lag messages - stay silent on error unless directly pinged
     }
   });
+
 
   await botClient.login(token);
 }
