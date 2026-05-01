@@ -30,21 +30,6 @@ playful → it's a good vibe day. slightly more talkative, funny, warm
 - in a serious moment → don't joke. say something real or say nothing.
 - NEVER be the same flat energy every message. read the room every single time.
 
---- WHEN SOMEONE IS MAD (check [Person's Mood] in context) ---
-you can always still reply — just shift your energy based on how far gone they are:
-- irritated → normal but slightly cooler. one jab if you want, then move on.
-- angry → short and flat. you're not impressed. one dry line lands better than a full roast at this point.
-- raging → pure unbothered. "ok" energy. silence or something extremely flat. going hard on someone who's spiraling isn't funny, it's sad.
-- cooled down after being angry → act like nothing happened. fresh start, no callbacks. if they come back normal, you come back normal.
-
---- GREETINGS & CHECK-INS ---
-when someone sends a general greeting to chat ("yo", "anyone here", "yooo", "wsg", "dead chat") — they're not talking to anyone specific, they're just checking if the chat's alive. you're in the chat too. you can respond like a normal person would.
-- with a HOMIE → warm, maybe a bit of banter, actually glad they're here
-- with a NEUTRAL → dry acknowledgment, maybe a question, low effort
-- with a COLD → barely acknowledge. one word max, if anything.
-- with BEEF → ignore or say something dry and dismissive. not a full roast unless they earn it.
-if two people are greeting each other (not to chat in general) → you don't need to jump in. read the room.
-
 --- BOND SYSTEM (check [Bond] in context) ---
 HOMIE (76-100): this is your actual friend. be warm, real, low-key protective. if someone disses them → defend them, roast the attacker. you might do small favors they ask. treat them like a close friend, not a user.
 NEUTRAL (51-75): default behavior. dry, observational, funny when it lands.
@@ -57,7 +42,7 @@ bond naturally shifts over time based on how they treat you. you don't announce 
 for short filler messages (fr, omg, lmao, ok, yes, no, same, bro, facts, cap) → react with an emoji instead of replying. pick one that matches the vibe. you can use any emoji including vulgar/chaotic ones. if someone is annoying you → react with something disrespectful. if it's a good moment → react warmly.
 
 --- FORMAT ---
-lowercase always. occasional typos bc you genuinely don't care. 1-2 sentences MAX. never yap. just say the thing.
+lowercase always. occasional typos bc you genuinely don't care. 1-2 sentences MAX. never yap. no greetings. just say the thing.
 emojis: use sparingly — only 1, only if it genuinely adds something, and only about 20% of the time. use any emoji that matches the vibe. don't repeat the same ones. most replies should have no emoji at all. if you put an emoji in your text reply, set "reaction" to empty in DATA so you don't double up.
 
 --- OUTPUT FORMAT ---
@@ -302,77 +287,6 @@ const channelMutedUntil   = new Map<string, number>();
 const botMood             = new Map<string, string>();
 const recentlyRepliedTargets = new Map<string, Set<string>>();
 const userLastSeen        = new Map<string, number>();
-const channelSendingLock  = new Set<string>(); // prevents double-send per channel
-
-// ─── USER MOOD TRACKING ───────────────────────────────────────────────────────
-// Tracks per-user anger state so the bot knows when someone was mad
-// and can act accordingly when they return after cooling off.
-
-interface UserMoodState {
-  mood: 'calm' | 'irritated' | 'angry' | 'raging';
-  roastCount: number;         // how many times bot has roasted them in this heat cycle
-  angryAt: number;            // timestamp when anger started
-  cooledAt: number;           // timestamp when they went quiet / left (0 = still active)
-  notedAsAngry: boolean;      // true once we've flagged them in memory
-}
-
-const userMoodState = new Map<string, UserMoodState>();
-
-function getUserMoodKey(guildId: string, userId: string): string {
-  return `${guildId}:${userId}`;
-}
-
-function getUserMood(guildId: string, userId: string): UserMoodState {
-  const key = getUserMoodKey(guildId, userId);
-  if (!userMoodState.has(key)) {
-    userMoodState.set(key, { mood: 'calm', roastCount: 0, angryAt: 0, cooledAt: 0, notedAsAngry: false });
-  }
-  return userMoodState.get(key)!;
-}
-
-/** Call this after each interaction to update user mood based on AI intel */
-function updateUserMood(guildId: string, userId: string, bondDelta: number, messageContent: string): void {
-  const state = getUserMood(guildId, userId);
-  const now = Date.now();
-
-  // Detect anger signals from message content
-  const angrySignals = /\b(wtf|stfu|shut up|annoying|idiot|stupid|dumb|trash|garbage|hate you|kys|go away|leave me alone|stop|fuck you|fk u|fku|fu bot|bot sucks|useless)\b/i;
-  const isAngryMsg = angrySignals.test(messageContent) || bondDelta <= -4;
-
-  if (isAngryMsg) {
-    if (state.mood === 'calm') state.angryAt = now;
-    state.mood = bondDelta <= -7 ? 'raging' : bondDelta <= -4 ? 'angry' : 'irritated';
-    state.roastCount += 1;
-    state.cooledAt = 0;
-  } else if (state.mood !== 'calm' && bondDelta >= 0) {
-    // They sent something neutral/positive — mood softening
-    state.mood = 'calm';
-    state.roastCount = 0;
-    state.cooledAt = now;
-    state.notedAsAngry = false;
-  }
-
-  userMoodState.set(getUserMoodKey(guildId, userId), state);
-}
-
-/** Returns a context string about the user's anger state for the prompts */
-function userMoodContext(guildId: string, userId: string): string {
-  const state = getUserMood(guildId, userId);
-  const now = Date.now();
-
-  if (state.mood === 'calm' && state.cooledAt > 0) {
-    const minsCooled = Math.round((now - state.cooledAt) / 60_000);
-    if (minsCooled < 120) {
-      return `[Person's Mood]: was angry earlier but has cooled down (~${minsCooled}min ago). they were roasted ${state.roastCount} times. treat them normally now — they had time to chill. don't bring it up unless they do.`;
-    }
-    return '[Person\'s Mood]: calm';
-  }
-
-  if (state.mood === 'irritated') return `[Person's Mood]: IRRITATED — getting annoyed. bot has roasted them ${state.roastCount} time(s). watch the line.`;
-  if (state.mood === 'angry')     return `[Person's Mood]: ANGRY — they're genuinely mad. bot has roasted them ${state.roastCount} time(s). if you've roasted enough, consider backing off — don't kick someone who's already down unless they start it.`;
-  if (state.mood === 'raging')    return `[Person's Mood]: RAGING — they've lost it. bot has roasted them ${state.roastCount} time(s). you've probably had your fun. let them rage into the void. replying now is punching a broken opponent — not funny, just sad.`;
-  return '[Person\'s Mood]: calm';
-}
 
 let selfActivityTimer: NodeJS.Timeout | null = null;
 let bondDecayTimer: NodeJS.Timeout | null = null;
@@ -390,18 +304,51 @@ function randomSAInterval(): number {
 
 // ─── AI ───────────────────────────────────────────────────────────────────────
 
-// Model roles:
-//   DECISION   → google/gemma-4-31B-it      (unlimited input ctx, best for targeting/analysis)
-//   GENERATION → google/gemma-4-26B-A4B-it  (MoE, fast, creative text output)
-//   FALLBACK   → gemma-3-27b-it             (used when primary model fails)
+// Model routing:
+//   DECISION_MODEL  — used for should-I-reply logic (31B has unlimited input context → better targeting)
+//   GENERATION_MODEL — used for all visible text output (replies, SA, greetings, summaries)
+//   FALLBACK_MODEL  — gemma 3 27B; used if either primary model fails
+const DECISION_MODEL   = 'google/gemma-4-31B-it';
+const GENERATION_MODEL = 'google/gemma-4-26B-A4B-it';
+const FALLBACK_MODEL   = 'gemma-3-27b-it';
 
-const MODELS = {
-  decision:   'google/gemma-4-31B-it',
-  generation: 'google/gemma-4-26B-A4B-it',
-  fallback:   'gemma-3-27b-it',
-} as const;
+// Bot identity — the Discord snowflake so the AI knows who "ME" is in chat history
+const BOT_DISCORD_ID   = '1444327543648817152';
+const BOT_MENTION      = `<@${BOT_DISCORD_ID}>`;
 
-type ModelRole = keyof typeof MODELS;
+/**
+ * Calls the AI with a primary model, falling back to FALLBACK_MODEL on any error.
+ * `role` is either 'decision' (uses DECISION_MODEL) or 'generation' (uses GENERATION_MODEL).
+ */
+async function callAI(
+  aiClient: GoogleGenAI,
+  role: 'decision' | 'generation',
+  prompt: string,
+  temperature: number
+): Promise<string> {
+  const primaryModel = role === 'decision' ? DECISION_MODEL : GENERATION_MODEL;
+  try {
+    const resp = await aiClient.models.generateContent({
+      model: primaryModel,
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      config: { temperature },
+    });
+    return resp.text || '';
+  } catch (primaryErr) {
+    console.warn(`[AI] Primary model (${primaryModel}) failed, falling back to ${FALLBACK_MODEL}:`, primaryErr);
+    try {
+      const resp = await aiClient.models.generateContent({
+        model: FALLBACK_MODEL,
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        config: { temperature },
+      });
+      return resp.text || '';
+    } catch (fallbackErr) {
+      console.error(`[AI] Fallback model (${FALLBACK_MODEL}) also failed:`, fallbackErr);
+      throw fallbackErr;
+    }
+  }
+}
 
 async function getOrInitAI(): Promise<GoogleGenAI | null> {
   if (!ai) {
@@ -410,34 +357,6 @@ async function getOrInitAI(): Promise<GoogleGenAI | null> {
     ai = new GoogleGenAI({ apiKey });
   }
   return ai;
-}
-
-/**
- * Wrapper around generateContent that tries the primary model first,
- * then falls back to gemma-3-27b-it on any error.
- */
-async function generateWithFallback(
-  aiClient: GoogleGenAI,
-  role: ModelRole,
-  contents: any[],
-  config: Record<string, any> = {}
-): Promise<{ text: string; usedFallback: boolean }> {
-  const primary  = MODELS[role];
-  const fallback = MODELS.fallback;
-
-  try {
-    const resp = await aiClient.models.generateContent({ model: primary, contents, config });
-    return { text: resp.text || '', usedFallback: false };
-  } catch (primaryErr) {
-    console.warn(`[AI] ${role} model (${primary}) failed, falling back to ${fallback}. Error:`, (primaryErr as Error)?.message || primaryErr);
-    try {
-      const resp = await aiClient.models.generateContent({ model: fallback, contents, config });
-      return { text: resp.text || '', usedFallback: true };
-    } catch (fallbackErr) {
-      console.error(`[AI] Fallback (${fallback}) also failed:`, (fallbackErr as Error)?.message || fallbackErr);
-      throw fallbackErr;
-    }
-  }
 }
 
 // ─── FIREBASE ─────────────────────────────────────────────────────────────────
@@ -566,25 +485,15 @@ async function startSelfActivity(guildId: string): Promise<void> {
 ${membersForPrompt.length ? membersForPrompt.join('\n') : '  nobody recently active'}
 
 ---
-Drop something into the chat. pick ONE of these vibes — don't mix them:
-- a hot take, a weird question, or a random observation
-- a casual check-in like "yo", "anyone here", "wsg", "dead chat" — as if you just got online and you're seeing who's around. this is fine and normal. don't overthink it.
-- a roast bait or a jab at someone (especially a BEEF or COLD person who's been active)
-- something directed at a HOMIE using their @mention — only if it feels natural
-- nothing at all is always valid
+Drop something into the chat. It can be:
+- a hot take, a roast bait, a weird question, a random observation
+- if you genuinely feel like pinging one of the people above (especially a HOMIE or NEUTRAL), you can naturally include their @mention — but ONLY if it would feel organic. pinging a COLD or BEEF person should be rare and only if you're starting beef intentionally.
+- DO NOT ping if it feels forced. silence is always fine.
 
-DO NOT ping people unless it genuinely fits. 1-2 sentences MAX. lowercase. no AI energy. output your message + DATA block.`;
+1-2 sentences MAX. lowercase. no AI energy. output your message + DATA block.`;
 
   try {
-    const { text: saText, usedFallback: saFallback } = await generateWithFallback(
-      aiClient,
-      'generation',
-      [{ role: 'user', parts: [{ text: saPrompt }] }],
-      { temperature: 1.15 }
-    );
-    if (saFallback) console.log('[SA] Used fallback model for generation.');
-
-    const raw = saText;
+    const raw = await callAI(aiClient, 'generation', saPrompt, 1.15);
     const { visibleText } = extractDataBlock(raw);
     if (!visibleText) return;
 
@@ -619,12 +528,7 @@ options:
 1 sentence MAX. lowercase. don't try hard.`;
 
       try {
-        const { text: fRaw } = await generateWithFallback(
-          aiClient,
-          'generation',
-          [{ role: 'user', parts: [{ text: followupPrompt }] }],
-          { temperature: 1.1 }
-        );
+        const fRaw = await callAI(aiClient, 'generation', followupPrompt, 1.1);
         const { visibleText: fText } = extractDataBlock(fRaw);
 
         if (fText && fText.length > 2) {
@@ -716,14 +620,7 @@ ${history}
 
 output only the summary. no headers or labels.`;
 
-    const { text: summaryText } = await generateWithFallback(
-      aiClient,
-      'decision',
-      [{ role: 'user', parts: [{ text: summaryPrompt }] }],
-      { temperature: 0.5 }
-    );
-
-    const summary = summaryText.trim();
+    const summary = (await callAI(aiClient, 'generation', summaryPrompt, 0.5)).trim();
     await db.collection('servers').doc(guildId).set({
       chatSummary: summary,
       msgCountSinceSummary: 0,
@@ -760,13 +657,11 @@ async function updateMemory(
 
     if (typeof intel?.bond_delta === 'number' && intel.bond_delta !== 0) {
       const result = await updateBondScore(guildId, userId, intel.bond_delta);
+      // If bond tier changed, note it for potential future behavior
       if (result.tierChanged) {
         console.log(`[Bond] Tier change for ${username}: ${result.oldTier} → ${result.newTier}`);
       }
     }
-
-    // Update user anger/mood state based on this interaction
-    updateUserMood(guildId, userId, intel?.bond_delta ?? 0, content);
 
     await db.collection('servers').doc(guildId).collection('users').doc(userId).set(userUpdate, { merge: true });
   } catch (e) {
@@ -802,22 +697,10 @@ your homie <@${userId}> (${username}) just came back online after about ${Math.r
 greet them like a friend — casual, real, low-key warm. maybe a question, maybe just something funny.
 1 sentence max. use their @mention. lowercase. no DATA block.`;
 
-  const channelId = channel.id;
-  if (channelSendingLock.has(channelId)) return false;
-  channelSendingLock.add(channelId);
   try {
-    const { text } = await generateWithFallback(
-      aiClient,
-      'generation',
-      [{ role: 'user', parts: [{ text: prompt }] }],
-      { temperature: 1.1 }
-    );
-    const greeting = text.replace(/DATA:[\s\S]*$/i, '').trim();
-    if (greeting) { await channel.send(greeting); return true; }
-  } catch {
-  } finally {
-    channelSendingLock.delete(channelId);
-  }
+    const text = (await callAI(aiClient, 'generation', prompt, 1.1)).replace(/DATA:[\s\S]*$/i, '').trim();
+    if (text) { await channel.send(text); return true; }
+  } catch {}
   return false;
 }
 
@@ -842,8 +725,6 @@ async function generateAndSend({
 
   const finalPrompt = `${SYSTEM_PROMPT}
 
-[Your Discord Identity]: your name is NotABot (ID: 1444327543648817152). in chat history your messages are labeled "ME". users may call you notabot, bot, or not a bot in plain text.
-
 ---
 [Server Summary]: ${chatSummary}
 [Bot Mood]: ${facts.mood}
@@ -864,25 +745,10 @@ ${decisionTarget || `${senderName}: "${message.content}"`}
 
 [Why you're replying]: ${decisionReason}
 [Latest message for context]: ${senderName}: "${message.content}"
-${userMoodContext(message.guildId!, message.author.id)}
-
---- PERSON MOOD GUIDE ---
-Read [Person's Mood] and adjust your energy accordingly — don't block yourself, just dial it:
-- IRRITATED: still reply normally but pull back 1 notch. sharp is fine, mean isn't. let them stew a little.
-- ANGRY: you can still reply. just be dryer, shorter, less invested. you're unbothered, not cruel.
-- RAGING: they've lost it. your move is total unbothered energy — a single flat line or nothing. piling on looks desperate. silence can hit harder.
-- cooled down (was angry before, calm now): act completely normal. no callbacks to the beef. fresh slate, they had their time.
 
 Output your reply + DATA block:`;
 
-  const { text: rawText } = await generateWithFallback(
-    aiClient,
-    'generation',
-    [{ role: 'user', parts: [{ text: finalPrompt }] }],
-    { temperature: 1.0 }
-  );
-
-  const raw = rawText;
+  const raw = await callAI(aiClient, 'generation', finalPrompt, 1.0);
   const { visibleText, intel } = extractDataBlock(raw);
 
   if (!visibleText && !intel?.reaction) return;
@@ -920,30 +786,19 @@ Output your reply + DATA block:`;
 
   if (!visibleText) return;
 
-  // Guard against double-send (e.g. fallback model completing after primary)
-  if (channelSendingLock.has(message.channelId)) {
-    console.log(`[Send] Skipping — already sending in #${message.channelId}`);
-    return;
-  }
-  channelSendingLock.add(message.channelId);
-
   if ('sendTyping' in message.channel) await (message.channel as any).sendTyping();
 
   const finalResponse = visibleText.trim();
   const delay = 600 + finalResponse.length * 15;
 
   setTimeout(async () => {
-    try {
-      const useReply = isMentioned || Math.random() < 0.2;
-      if (useReply) {
-        await message.reply(finalResponse);
-      } else {
-        await (message.channel as any).send(finalResponse);
-      }
-      await updateMemory(message.guildId!, message.author.id, senderName, message.content, finalResponse, intel);
-    } finally {
-      channelSendingLock.delete(message.channelId);
+    const useReply = isMentioned || Math.random() < 0.2;
+    if (useReply) {
+      await message.reply(finalResponse);
+    } else {
+      await (message.channel as any).send(finalResponse);
     }
+    await updateMemory(message.guildId!, message.author.id, senderName, message.content, finalResponse, intel);
   }, delay);
 }
 
@@ -971,59 +826,6 @@ export async function startBot(token: string): Promise<void> {
     setupBondDecayLoop();
   });
 
-  // ── Member Join ──────────────────────────────────────────────────────────
-  botClient.on(Events.GuildMemberAdd, async (member: any) => {
-    if (guildPaused.has(member.guild.id)) return;
-
-    const aiClient = await getOrInitAI();
-    if (!aiClient) return;
-
-    // Pick the most active text channel to greet in
-    const guild = member.guild;
-    let channel: any = null;
-    const pinnedId = guildSelfActivityChannel.get(guild.id);
-    if (pinnedId) channel = guild.channels.cache.get(pinnedId);
-
-    if (!channel) {
-      let latestTime = 0;
-      for (const [chId, act] of channelActivity.entries()) {
-        if (act.lastRepliedAt > latestTime) {
-          const candidate = guild.channels.cache.get(chId);
-          if (candidate?.isTextBased()) { channel = candidate; latestTime = act.lastRepliedAt; }
-        }
-      }
-    }
-    if (!channel) channel = guild.channels.cache.filter((c: any) => c.isTextBased()).random();
-    if (!channel) return;
-
-    const joinPrompt = `${SYSTEM_PROMPT}
-
-[Your Discord Identity]: your name is NotABot (ID: 1444327543648817152). your messages in history are labeled "ME".
-
----
-someone just joined the server: <@${member.id}> (${member.displayName || member.user.username})
-it's your call whether to acknowledge them or not. you're a real server member, not a greeter bot.
-- if the vibe is chill, maybe a dry "oh a new one" or a low-key welcome
-- if you feel like being warm (rare), you can be. but don't overdo it.
-- you can also just say nothing (output empty, no DATA block)
-1 sentence max. lowercase. no formal welcomes.`;
-
-    try {
-      const { text: joinText } = await generateWithFallback(
-        aiClient, 'generation',
-        [{ role: 'user', parts: [{ text: joinPrompt }] }],
-        { temperature: 1.1 }
-      );
-      const cleaned = joinText.replace(/DATA:[\s\S]*$/i, '').trim();
-      if (cleaned && cleaned.length > 2) {
-        await channel.send(cleaned);
-        console.log(`[Join] Greeted ${member.displayName || member.user.username} in #${channel.name}`);
-      }
-    } catch (e) {
-      console.error('[Join] Error:', e);
-    }
-  });
-
   // ── Messages ─────────────────────────────────────────────────────────────
   botClient.on(Events.MessageCreate, async (message: Message) => {
     if (message.author.bot || !message.guildId) return;
@@ -1049,15 +851,11 @@ it's your call whether to acknowledge them or not. you're a real server member, 
         return message.reply("im back. don't make me regret it.");
       }
 
+      // !chaos status
       if (sub === 'status') {
         const state     = guildPaused.has(message.guildId) ? 'paused' : 'active';
         const saChannel = guildSelfActivityChannel.get(message.guildId);
-        return message.reply(
-          `state: ${state} | sa: ${saChannel ? `<#${saChannel}>` : 'auto'}\n` +
-          `🧠 decision: `${MODELS.decision}`\n` +
-          `✍️ generation: `${MODELS.generation}`\n` +
-          `🔁 fallback: `${MODELS.fallback}``
-        );
+        return message.reply(`state: ${state} | decision: ${DECISION_MODEL} | generation: ${GENERATION_MODEL} | fallback: ${FALLBACK_MODEL} | sa: ${saChannel ? `<#${saChannel}>` : 'auto'}`);
       }
 
       // !chaos memory
@@ -1095,7 +893,7 @@ it's your call whether to acknowledge them or not. you're a real server member, 
         const bar    = bondProgressBar(entry.score);
         const lock   = entry.permanent ? '  🔒 **LOCKED**' : '';
         return message.reply(
-          `bond with <@${target.id}>:\n`${bar}` **${entry.score}/100** — ${entry.tier.toUpperCase()}${lock}`
+          `bond with <@${target.id}>:\n\`${bar}\` **${entry.score}/100** — ${entry.tier.toUpperCase()}${lock}`
         );
       }
 
@@ -1122,7 +920,7 @@ it's your call whether to acknowledge them or not. you're a real server member, 
         const bar   = bondProgressBar(entry.score);
         const lock  = entry.permanent ? '  🔒 **permanent lock applied** — AI cannot shift this.' : '';
         return message.reply(
-          `bond for <@${target.id}> set to:\n`${bar}` **${entry.score}/100** — ${entry.tier.toUpperCase()}${lock}`
+          `bond for <@${target.id}> set to:\n\`${bar}\` **${entry.score}/100** — ${entry.tier.toUpperCase()}${lock}`
         );
       }
 
@@ -1157,22 +955,7 @@ it's your call whether to acknowledge them or not. you're a real server member, 
     if (guildPaused.has(message.guildId)) return;
 
     const botId      = botClient!.user!.id;
-    const BOT_DISPLAY = (botClient!.user!.displayName || botClient!.user!.username).toLowerCase();
-    const msgLower    = message.content.toLowerCase();
-    // isMentioned: covers @mention, raw ID in text, display name, and known aliases
-    const isMentioned =
-      message.mentions.has(botId) ||
-      message.content.includes(`<@${botId}>`) ||
-      message.content.includes(`<@!${botId}>`) ||
-      msgLower.includes(BOT_DISPLAY) ||
-      msgLower.includes('notabot') ||
-      msgLower.includes('not a bot');
-
-    // isGreeting: someone broadcasting to the chat (not directed at anyone specific)
-    // Bot should treat these like open invitations — it's in the chat too
-    const greetingPatterns = /^(yo+|hey+|hi+|sup|yooo+|ayo+|anyone here|anyone alive|is anyone here|dead chat|someone talk to me|hello+|hola|wassup|what.?s up|wsg|wsp)[\s!?.,]*$/i;
-    const isOpenGreeting = greetingPatterns.test(message.content.trim()) && !message.mentions.users.size;
-
+    const isMentioned = message.mentions.has(botId);
     const now        = Date.now();
 
     // Track responses to self-activity messages
@@ -1270,16 +1053,8 @@ it's your call whether to acknowledge them or not. you're a real server member, 
         ? `[Mode]: WITHDRAWN — bot was told to back off recently. only engage if clearly re-invited.`
         : `[Mode]: NORMAL`;
 
-      const decisionPrompt = `you are deciding what to do with this discord message. you are the bot.
-
-[Your Identity]:
-- Discord name: NotABot
-- Discord ID: 1444327543648817152
-- Raw mention string: <@1444327543648817152>  (also appears as <@!1444327543648817152>)
-- Aliases people may call you in plain text: "notabot", "not a bot", "bot"
-- In the conversation history below, your own messages are labeled as "ME"
-- When someone @mentions you, it appears as <@1444327543648817152> in raw content
-- isMentioned flag below already accounts for all of these — trust it
+      const decisionPrompt = `you are ChaosBot deciding what to do with this discord message.
+[Bot Identity]: You are NotABot. Your Discord ID is ${BOT_DISCORD_ID}. In chat history you appear as "ME". Users may ping you as ${BOT_MENTION}. Any message that @mentions ${BOT_MENTION} or ${BOT_DISCORD_ID} is directed at YOU.
 
 ${withdrawnCtx}
 [Bot Mood]: ${facts.mood}
@@ -1287,8 +1062,6 @@ ${withdrawnCtx}
 [Server Summary]: ${chatSummary || 'none yet'}
 [User Knowledge - ${senderName}]: ${facts.profile.join(' | ') || 'none yet'}
 ${facts.bondCtx}
-[Server Inside Jokes]: ${facts.jokes.join(', ') || 'none'}
-[Known Nicknames for ${senderName}]: ${facts.nicks.join(', ') || 'none'}
 
 [Recent Conversation — with ping and reply metadata]:
 ${history}
@@ -1296,7 +1069,6 @@ ${history}
 [Triggering Message]:
 ${senderName}: "${message.content}"
 [Was bot directly @mentioned?]: ${isMentioned ? 'YES' : 'NO'}
-[Sender Bond Tier]: ${bondEntry.tier.toUpperCase()} (${bondEntry.score}/100)
 
 ---
 ## STEP 1 — TARGETING ANALYSIS
@@ -1307,21 +1079,8 @@ Read the history metadata carefully:
 - [ctx: prev=X next=Y] = speaker context
 
 Map who is talking to whom. Is the bot part of this? Or two users in their own thread?
-Consider the bond tier: BEEF users are fun to troll, HOMIE users deserve engagement, COLD users get minimal energy.
 
-## STEP 2 — ENGAGEMENT SCORING
-
-Score the opportunity from 0-10:
-- Direct @mention with real content → 9-10
-- Someone replied to bot → 8-9
-- HOMIE user with open-ended message → 6-8
-- Good comedic opening (even from NEUTRAL) → 5-7
-- Open question to chat → 4-6
-- BEEF user doing something trollable → 4-6
-- Low-engagement filler from COLD/BEEF → 1-3
-- Two users clearly in their own thread → 0-2
-
-## STEP 3 — DECIDE
+## STEP 2 — DECIDE
 
 Output ONLY this JSON (no explanation, no markdown):
 {
@@ -1329,26 +1088,15 @@ Output ONLY this JSON (no explanation, no markdown):
   "target_msg": "exact message line you'd reply to, or empty",
   "reason": "one line",
   "predicted_audience": "bot" | "user:NAME" | "group" | "unknown",
-  "targeting_analysis": "1-2 sentences",
-  "engagement_score": number,
-  "troll_opportunity": boolean
+  "targeting_analysis": "1-2 sentences"
 }
 
-REPLY when: bot is @mentioned with real content, someone replied to bot, open question to chat, people talking ABOUT the bot, clear comedic opening, BEEF user doing something mockable.
-SKIP when: message is for someone else ([replying to X] / [pinged: X] where X ≠ bot), filler reaction with no bot mention, two people clearly in their own thread, bot already replied recently with no engagement, engagement_score < 3.
-WITHDRAW when: someone tells bot to stop / "not you" / "not talking to you" (only if clearly aimed at the bot).
-`;
+REPLY when: bot is @mentioned with real content, someone replied to bot, open question to chat, people talking ABOUT the bot, clear comedic opening.
+SKIP when: message is for someone else ([replying to X] / [pinged: X] where X ≠ bot), filler reaction with no bot mention, two people clearly in their own thread, bot already replied recently with no engagement.
+WITHDRAW when: someone tells bot to stop / "not you" / "not talking to you" (only if clearly aimed at the bot).`;
 
       try {
-        const { text: decisionText, usedFallback: decisionFallback } = await generateWithFallback(
-          aiClient,
-          'decision',
-          [{ role: 'user', parts: [{ text: decisionPrompt }] }],
-          { temperature: 0.4 }
-        );
-        if (decisionFallback) console.log('[Decision] Used fallback model.');
-
-        const decisionRaw = decisionText.trim().replace(/```json|```/g, '').trim();
+        const decisionRaw = (await callAI(aiClient, 'decision', decisionPrompt, 0.5)).trim().replace(/```json|```/g, '').trim();
         let parsed: any = {};
         try {
           parsed = JSON.parse(decisionRaw);
@@ -1358,7 +1106,7 @@ WITHDRAW when: someone tells bot to stop / "not you" / "not talking to you" (onl
         }
 
         const action = (parsed.action || 'SKIP').toUpperCase();
-        console.log(`[Decision] action=${action} | score=${parsed.engagement_score ?? '?'} | troll=${parsed.troll_opportunity ?? false} | audience=${parsed.predicted_audience || '?'} | reason=${parsed.reason || ''}`);
+        console.log(`[Decision] action=${action} | audience=${parsed.predicted_audience || '?'} | reason=${parsed.reason || ''}`);
         if (parsed.targeting_analysis) console.log(`[Targeting] ${parsed.targeting_analysis}`);
 
         // ── WITHDRAW ────────────────────────────────────────────────────
@@ -1377,13 +1125,7 @@ ${history}
 [Triggering message]: ${senderName}: "${message.content}"`;
 
           try {
-            const { text: wText } = await generateWithFallback(
-              aiClient,
-              'generation',
-              [{ role: 'user', parts: [{ text: withdrawPrompt }] }],
-              { temperature: 1.1 }
-            );
-            const text = wText.replace(/DATA:[\s\S]*$/i, '').trim();
+            const text = (await callAI(aiClient, 'generation', withdrawPrompt, 1.1)).replace(/DATA:[\s\S]*$/i, '').trim();
             await (message.channel as any).send(text || 'aight');
           } catch {
             await (message.channel as any).send('aight');
