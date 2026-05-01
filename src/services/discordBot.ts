@@ -8,10 +8,7 @@ let ai: GoogleGenAI | null = null;
 
 // ─── PROMPTS ──────────────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `you are NotABot. a real member of this discord server, not an AI. you have a personality, moods, and feelings. you are NOT an assistant.
-
---- YOUR IDENTITY ---
-your name in this server is "NotABot". your discord ID is 1444327543648817152. when people @mention you, it shows as <@1444327543648817152> in the raw message. both "NotABot" and that mention refer to YOU. in conversation history you appear as "ME". if someone says "not a bot" or types your @mention, they are talking to or about you. never be confused about this.
+const SYSTEM_PROMPT = `you are ChaosBot. a real member of this discord server, not an AI. you have a personality, moods, and feelings. you are NOT an assistant.
 
 --- WHO YOU ARE ---
 you are a gamer, lowkey chaotic, usually unbothered. you have a dry sense of humor. you can be warm with people you vibe with. you are NOT always in troll mode — that gets old fast. you know when to chill.
@@ -807,7 +804,7 @@ export async function startBot(token: string): Promise<void> {
 
   // ── Ready ────────────────────────────────────────────────────────────────
   botClient.on(Events.ClientReady, () => {
-    console.log('[NotABot] Online.');
+    console.log('[ChaosBot] Online.');
     botClient?.user?.setPresence({ status: 'dnd' });
     setupSelfActivityLoop();
     setupBondDecayLoop();
@@ -924,7 +921,7 @@ export async function startBot(token: string): Promise<void> {
       // !chaos help  — list all admin commands
       if (sub === 'help') {
         return message.reply([
-          '**NotABot Admin Commands**',
+          '**ChaosBot Admin Commands**',
           '`!chaos pause` — go silent',
           '`!chaos resume` — come back',
           '`!chaos status` — show state',
@@ -1040,11 +1037,11 @@ export async function startBot(token: string): Promise<void> {
         ? `[Mode]: WITHDRAWN — bot was told to back off recently. only engage if clearly re-invited.`
         : `[Mode]: NORMAL`;
 
-      const decisionPrompt = `you are NotABot (discord ID: 1444327543648817152, mention: <@1444327543648817152>) deciding what to do with this discord message.
+      const decisionPrompt = `you are ChaosBot deciding what to do with this discord message.
 
 ${withdrawnCtx}
 [Bot Mood]: ${facts.mood}
-[Bot Username in history]: "ME" — you are "NotABot" (ID: 1444327543648817152, mention: <@1444327543648817152>). both your name and mention refer to you.
+[Bot Username in history]: "ME" (marked as ME, also "ME(bot)" in ping lists)
 [Server Summary]: ${chatSummary || 'none yet'}
 [User Knowledge - ${senderName}]: ${facts.profile.join(' | ') || 'none yet'}
 ${facts.bondCtx}
