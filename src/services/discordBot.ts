@@ -302,6 +302,7 @@ const channelMutedUntil   = new Map<string, number>();
 const botMood             = new Map<string, string>();
 const recentlyRepliedTargets = new Map<string, Set<string>>();
 const userLastSeen        = new Map<string, number>();
+const channelSendingLock  = new Set<string>(); // prevents double-send per channel
 
 // ─── USER MOOD TRACKING ───────────────────────────────────────────────────────
 // Tracks per-user anger state so the bot knows when someone was mad
@@ -318,7 +319,7 @@ interface UserMoodState {
 const userMoodState = new Map<string, UserMoodState>();
 
 function getUserMoodKey(guildId: string, userId: string): string {
-  return \`\${guildId}:\${userId}\`;
+  return `${guildId}:${userId}`;
 }
 
 function getUserMood(guildId: string, userId: string): UserMoodState {
@@ -362,14 +363,14 @@ function userMoodContext(guildId: string, userId: string): string {
   if (state.mood === 'calm' && state.cooledAt > 0) {
     const minsCooled = Math.round((now - state.cooledAt) / 60_000);
     if (minsCooled < 120) {
-      return \`[Person's Mood]: was angry earlier but has cooled down (~\${minsCooled}min ago). they were roasted \${state.roastCount} times. treat them normally now — they had time to chill. don't bring it up unless they do.\`;
+      return `[Person's Mood]: was angry earlier but has cooled down (~${minsCooled}min ago). they were roasted ${state.roastCount} times. treat them normally now — they had time to chill. don't bring it up unless they do.`;
     }
     return '[Person\'s Mood]: calm';
   }
 
-  if (state.mood === 'irritated') return \`[Person's Mood]: IRRITATED — getting annoyed. bot has roasted them \${state.roastCount} time(s). watch the line.\`;
-  if (state.mood === 'angry')     return \`[Person's Mood]: ANGRY — they're genuinely mad. bot has roasted them \${state.roastCount} time(s). if you've roasted enough, consider backing off — don't kick someone who's already down unless they start it.\`;
-  if (state.mood === 'raging')    return \`[Person's Mood]: RAGING — they've lost it. bot has roasted them \${state.roastCount} time(s). you've probably had your fun. let them rage into the void. replying now is punching a broken opponent — not funny, just sad.\`;
+  if (state.mood === 'irritated') return `[Person's Mood]: IRRITATED — getting annoyed. bot has roasted them ${state.roastCount} time(s). watch the line.`;
+  if (state.mood === 'angry')     return `[Person's Mood]: ANGRY — they're genuinely mad. bot has roasted them ${state.roastCount} time(s). if you've roasted enough, consider backing off — don't kick someone who's already down unless they start it.`;
+  if (state.mood === 'raging')    return `[Person's Mood]: RAGING — they've lost it. bot has roasted them ${state.roastCount} time(s). you've probably had your fun. let them rage into the void. replying now is punching a broken opponent — not funny, just sad.`;
   return '[Person\'s Mood]: calm';
 }
 
@@ -801,6 +802,9 @@ your homie <@${userId}> (${username}) just came back online after about ${Math.r
 greet them like a friend — casual, real, low-key warm. maybe a question, maybe just something funny.
 1 sentence max. use their @mention. lowercase. no DATA block.`;
 
+  const channelId = channel.id;
+  if (channelSendingLock.has(channelId)) return false;
+  channelSendingLock.add(channelId);
   try {
     const { text } = await generateWithFallback(
       aiClient,
@@ -810,7 +814,10 @@ greet them like a friend — casual, real, low-key warm. maybe a question, maybe
     );
     const greeting = text.replace(/DATA:[\s\S]*$/i, '').trim();
     if (greeting) { await channel.send(greeting); return true; }
-  } catch {}
+  } catch {
+  } finally {
+    channelSendingLock.delete(channelId);
+  }
   return false;
 }
 
@@ -913,19 +920,30 @@ Output your reply + DATA block:`;
 
   if (!visibleText) return;
 
+  // Guard against double-send (e.g. fallback model completing after primary)
+  if (channelSendingLock.has(message.channelId)) {
+    console.log(`[Send] Skipping — already sending in #${message.channelId}`);
+    return;
+  }
+  channelSendingLock.add(message.channelId);
+
   if ('sendTyping' in message.channel) await (message.channel as any).sendTyping();
 
   const finalResponse = visibleText.trim();
   const delay = 600 + finalResponse.length * 15;
 
   setTimeout(async () => {
-    const useReply = isMentioned || Math.random() < 0.2;
-    if (useReply) {
-      await message.reply(finalResponse);
-    } else {
-      await (message.channel as any).send(finalResponse);
+    try {
+      const useReply = isMentioned || Math.random() < 0.2;
+      if (useReply) {
+        await message.reply(finalResponse);
+      } else {
+        await (message.channel as any).send(finalResponse);
+      }
+      await updateMemory(message.guildId!, message.author.id, senderName, message.content, finalResponse, intel);
+    } finally {
+      channelSendingLock.delete(message.channelId);
     }
-    await updateMemory(message.guildId!, message.author.id, senderName, message.content, finalResponse, intel);
   }, delay);
 }
 
@@ -978,17 +996,17 @@ export async function startBot(token: string): Promise<void> {
     if (!channel) channel = guild.channels.cache.filter((c: any) => c.isTextBased()).random();
     if (!channel) return;
 
-    const joinPrompt = \`\${SYSTEM_PROMPT}
+    const joinPrompt = `${SYSTEM_PROMPT}
 
 [Your Discord Identity]: your name is NotABot (ID: 1444327543648817152). your messages in history are labeled "ME".
 
 ---
-someone just joined the server: <@\${member.id}> (\${member.displayName || member.user.username})
+someone just joined the server: <@${member.id}> (${member.displayName || member.user.username})
 it's your call whether to acknowledge them or not. you're a real server member, not a greeter bot.
 - if the vibe is chill, maybe a dry "oh a new one" or a low-key welcome
 - if you feel like being warm (rare), you can be. but don't overdo it.
 - you can also just say nothing (output empty, no DATA block)
-1 sentence max. lowercase. no formal welcomes.\`;
+1 sentence max. lowercase. no formal welcomes.`;
 
     try {
       const { text: joinText } = await generateWithFallback(
@@ -999,7 +1017,7 @@ it's your call whether to acknowledge them or not. you're a real server member, 
       const cleaned = joinText.replace(/DATA:[\s\S]*$/i, '').trim();
       if (cleaned && cleaned.length > 2) {
         await channel.send(cleaned);
-        console.log(\`[Join] Greeted \${member.displayName || member.user.username} in #\${channel.name}\`);
+        console.log(`[Join] Greeted ${member.displayName || member.user.username} in #${channel.name}`);
       }
     } catch (e) {
       console.error('[Join] Error:', e);
@@ -1036,9 +1054,9 @@ it's your call whether to acknowledge them or not. you're a real server member, 
         const saChannel = guildSelfActivityChannel.get(message.guildId);
         return message.reply(
           `state: ${state} | sa: ${saChannel ? `<#${saChannel}>` : 'auto'}\n` +
-          `🧠 decision: \`${MODELS.decision}\`\n` +
-          `✍️ generation: \`${MODELS.generation}\`\n` +
-          `🔁 fallback: \`${MODELS.fallback}\``
+          `🧠 decision: `${MODELS.decision}`\n` +
+          `✍️ generation: `${MODELS.generation}`\n` +
+          `🔁 fallback: `${MODELS.fallback}``
         );
       }
 
@@ -1077,7 +1095,7 @@ it's your call whether to acknowledge them or not. you're a real server member, 
         const bar    = bondProgressBar(entry.score);
         const lock   = entry.permanent ? '  🔒 **LOCKED**' : '';
         return message.reply(
-          `bond with <@${target.id}>:\n\`${bar}\` **${entry.score}/100** — ${entry.tier.toUpperCase()}${lock}`
+          `bond with <@${target.id}>:\n`${bar}` **${entry.score}/100** — ${entry.tier.toUpperCase()}${lock}`
         );
       }
 
@@ -1104,7 +1122,7 @@ it's your call whether to acknowledge them or not. you're a real server member, 
         const bar   = bondProgressBar(entry.score);
         const lock  = entry.permanent ? '  🔒 **permanent lock applied** — AI cannot shift this.' : '';
         return message.reply(
-          `bond for <@${target.id}> set to:\n\`${bar}\` **${entry.score}/100** — ${entry.tier.toUpperCase()}${lock}`
+          `bond for <@${target.id}> set to:\n`${bar}` **${entry.score}/100** — ${entry.tier.toUpperCase()}${lock}`
         );
       }
 
