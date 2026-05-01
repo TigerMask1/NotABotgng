@@ -304,21 +304,21 @@ function randomSAInterval(): number {
 
 // ─── AI ───────────────────────────────────────────────────────────────────────
 
-// Model routing:
-//   DECISION_MODEL   — should-I-reply logic (31B dense, huge input context)
-//   GENERATION_MODEL — all visible text output (replies, SA, greetings, summaries)
-//   FALLBACK_MODEL   — gemma 3 27B; drops in if either primary fails
-const DECISION_MODEL   = 'google/gemma-4-31b-it';       // dense 31B — correct lowercase ID
-const GENERATION_MODEL = 'google/gemma-4-26b-a4b-it';   // MoE 26B (3.8B active) — correct lowercase ID
-const FALLBACK_MODEL   = 'gemma-3-27b-it';
+// NOTE: These are Google AI Studio model IDs used with @google/genai SDK.
+// The "google/" prefix is OpenRouter syntax — do NOT use it here.
+const DECISION_MODEL   = 'gemma-4-31b-it';      // dense 31B — for should-I-reply logic
+const GENERATION_MODEL = 'gemma-4-26b-a4b-it';  // MoE 26B  — for all visible text output
+const FALLBACK_MODEL   = 'gemma-3-27b-it';       // original  — fallback if either primary fails
 
-// Bot identity — so the AI always knows who "ME" is in chat history
+// Bot identity — lets the AI unambiguously know who "ME" is in chat history
 const BOT_DISCORD_ID = '1444327543648817152';
 const BOT_MENTION    = `<@${BOT_DISCORD_ID}>`;
 
 /**
- * Single AI call entry-point. Tries primaryModel first; on any error falls back
- * to FALLBACK_MODEL. `role` picks which primary: 'decision' = 31B, 'generation' = 26B.
+ * Single AI call entry-point with automatic fallback.
+ * 'decision' → DECISION_MODEL (31B, best for targeting analysis)
+ * 'generation' → GENERATION_MODEL (26B MoE, best for replies/text)
+ * Either falls back to FALLBACK_MODEL on any error.
  */
 async function callAI(
   aiClient: GoogleGenAI,
@@ -491,7 +491,6 @@ Drop something into the chat. It can be:
     const raw = await callAI(aiClient, 'generation', saPrompt, 1.15);
     const { visibleText } = extractDataBlock(raw);
     if (!visibleText) return;
-
     botClient?.user?.setPresence({ status: 'online' });
     await channel.send(visibleText);
 
@@ -1049,7 +1048,7 @@ export async function startBot(token: string): Promise<void> {
         : `[Mode]: NORMAL`;
 
       const decisionPrompt = `you are ChaosBot deciding what to do with this discord message.
-[Bot Identity]: You are NotABot. Discord ID: ${BOT_DISCORD_ID}. In history you appear as "ME" or "ME(bot)". Any ping of ${BOT_MENTION} or the ID ${BOT_DISCORD_ID} is directed AT YOU.
+[Bot Identity]: You are NotABot. Your Discord ID is ${BOT_DISCORD_ID}. In history you appear as "ME" or "ME(bot)". Any ping of ${BOT_MENTION} is directed AT YOU.
 
 ${withdrawnCtx}
 [Bot Mood]: ${facts.mood}
@@ -1136,15 +1135,15 @@ ${history}
           decisionTarget = `${senderName}: "${message.content}"`;
         }
 
-        // Duplicate reply guard — keyed on message snowflake ID (not content) to prevent
-        // the same message ever triggering two replies even if the debounce fires twice.
+        // Duplicate reply guard — keyed on Discord message snowflake ID, not content.
+        // This prevents the same message ever getting two replies, even if the debounce
+        // fires multiple times or the trigger races with itself.
         const channelReplied = recentlyRepliedTargets.get(message.channelId) || new Set<string>();
-        const targetKey      = message.id;  // snowflake is unique per message
-        if (channelReplied.has(targetKey)) {
-          console.log(`[Skip] Already replied to message ${targetKey}`);
+        if (channelReplied.has(message.id)) {
+          console.log(`[Skip] Already replied to message ${message.id}`);
           return;
         }
-        channelReplied.add(targetKey);
+        channelReplied.add(message.id);
         if (channelReplied.size > 20) channelReplied.delete(channelReplied.values().next().value);
         recentlyRepliedTargets.set(message.channelId, channelReplied);
 
