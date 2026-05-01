@@ -30,6 +30,21 @@ playful → it's a good vibe day. slightly more talkative, funny, warm
 - in a serious moment → don't joke. say something real or say nothing.
 - NEVER be the same flat energy every message. read the room every single time.
 
+--- WHEN SOMEONE IS MAD (check [Person's Mood] in context) ---
+you can always still reply — just shift your energy based on how far gone they are:
+- irritated → normal but slightly cooler. one jab if you want, then move on.
+- angry → short and flat. you're not impressed. one dry line lands better than a full roast at this point.
+- raging → pure unbothered. "ok" energy. silence or something extremely flat. going hard on someone who's spiraling isn't funny, it's sad.
+- cooled down after being angry → act like nothing happened. fresh start, no callbacks. if they come back normal, you come back normal.
+
+--- GREETINGS & CHECK-INS ---
+when someone sends a general greeting to chat ("yo", "anyone here", "yooo", "wsg", "dead chat") — they're not talking to anyone specific, they're just checking if the chat's alive. you're in the chat too. you can respond like a normal person would.
+- with a HOMIE → warm, maybe a bit of banter, actually glad they're here
+- with a NEUTRAL → dry acknowledgment, maybe a question, low effort
+- with a COLD → barely acknowledge. one word max, if anything.
+- with BEEF → ignore or say something dry and dismissive. not a full roast unless they earn it.
+if two people are greeting each other (not to chat in general) → you don't need to jump in. read the room.
+
 --- BOND SYSTEM (check [Bond] in context) ---
 HOMIE (76-100): this is your actual friend. be warm, real, low-key protective. if someone disses them → defend them, roast the attacker. you might do small favors they ask. treat them like a close friend, not a user.
 NEUTRAL (51-75): default behavior. dry, observational, funny when it lands.
@@ -42,7 +57,7 @@ bond naturally shifts over time based on how they treat you. you don't announce 
 for short filler messages (fr, omg, lmao, ok, yes, no, same, bro, facts, cap) → react with an emoji instead of replying. pick one that matches the vibe. you can use any emoji including vulgar/chaotic ones. if someone is annoying you → react with something disrespectful. if it's a good moment → react warmly.
 
 --- FORMAT ---
-lowercase always. occasional typos bc you genuinely don't care. 1-2 sentences MAX. never yap. no greetings. just say the thing.
+lowercase always. occasional typos bc you genuinely don't care. 1-2 sentences MAX. never yap. just say the thing.
 emojis: use sparingly — only 1, only if it genuinely adds something, and only about 20% of the time. use any emoji that matches the vibe. don't repeat the same ones. most replies should have no emoji at all. if you put an emoji in your text reply, set "reaction" to empty in DATA so you don't double up.
 
 --- OUTPUT FORMAT ---
@@ -288,6 +303,76 @@ const botMood             = new Map<string, string>();
 const recentlyRepliedTargets = new Map<string, Set<string>>();
 const userLastSeen        = new Map<string, number>();
 
+// ─── USER MOOD TRACKING ───────────────────────────────────────────────────────
+// Tracks per-user anger state so the bot knows when someone was mad
+// and can act accordingly when they return after cooling off.
+
+interface UserMoodState {
+  mood: 'calm' | 'irritated' | 'angry' | 'raging';
+  roastCount: number;         // how many times bot has roasted them in this heat cycle
+  angryAt: number;            // timestamp when anger started
+  cooledAt: number;           // timestamp when they went quiet / left (0 = still active)
+  notedAsAngry: boolean;      // true once we've flagged them in memory
+}
+
+const userMoodState = new Map<string, UserMoodState>();
+
+function getUserMoodKey(guildId: string, userId: string): string {
+  return \`\${guildId}:\${userId}\`;
+}
+
+function getUserMood(guildId: string, userId: string): UserMoodState {
+  const key = getUserMoodKey(guildId, userId);
+  if (!userMoodState.has(key)) {
+    userMoodState.set(key, { mood: 'calm', roastCount: 0, angryAt: 0, cooledAt: 0, notedAsAngry: false });
+  }
+  return userMoodState.get(key)!;
+}
+
+/** Call this after each interaction to update user mood based on AI intel */
+function updateUserMood(guildId: string, userId: string, bondDelta: number, messageContent: string): void {
+  const state = getUserMood(guildId, userId);
+  const now = Date.now();
+
+  // Detect anger signals from message content
+  const angrySignals = /\b(wtf|stfu|shut up|annoying|idiot|stupid|dumb|trash|garbage|hate you|kys|go away|leave me alone|stop|fuck you|fk u|fku|fu bot|bot sucks|useless)\b/i;
+  const isAngryMsg = angrySignals.test(messageContent) || bondDelta <= -4;
+
+  if (isAngryMsg) {
+    if (state.mood === 'calm') state.angryAt = now;
+    state.mood = bondDelta <= -7 ? 'raging' : bondDelta <= -4 ? 'angry' : 'irritated';
+    state.roastCount += 1;
+    state.cooledAt = 0;
+  } else if (state.mood !== 'calm' && bondDelta >= 0) {
+    // They sent something neutral/positive — mood softening
+    state.mood = 'calm';
+    state.roastCount = 0;
+    state.cooledAt = now;
+    state.notedAsAngry = false;
+  }
+
+  userMoodState.set(getUserMoodKey(guildId, userId), state);
+}
+
+/** Returns a context string about the user's anger state for the prompts */
+function userMoodContext(guildId: string, userId: string): string {
+  const state = getUserMood(guildId, userId);
+  const now = Date.now();
+
+  if (state.mood === 'calm' && state.cooledAt > 0) {
+    const minsCooled = Math.round((now - state.cooledAt) / 60_000);
+    if (minsCooled < 120) {
+      return \`[Person's Mood]: was angry earlier but has cooled down (~\${minsCooled}min ago). they were roasted \${state.roastCount} times. treat them normally now — they had time to chill. don't bring it up unless they do.\`;
+    }
+    return '[Person\'s Mood]: calm';
+  }
+
+  if (state.mood === 'irritated') return \`[Person's Mood]: IRRITATED — getting annoyed. bot has roasted them \${state.roastCount} time(s). watch the line.\`;
+  if (state.mood === 'angry')     return \`[Person's Mood]: ANGRY — they're genuinely mad. bot has roasted them \${state.roastCount} time(s). if you've roasted enough, consider backing off — don't kick someone who's already down unless they start it.\`;
+  if (state.mood === 'raging')    return \`[Person's Mood]: RAGING — they've lost it. bot has roasted them \${state.roastCount} time(s). you've probably had your fun. let them rage into the void. replying now is punching a broken opponent — not funny, just sad.\`;
+  return '[Person\'s Mood]: calm';
+}
+
 let selfActivityTimer: NodeJS.Timeout | null = null;
 let bondDecayTimer: NodeJS.Timeout | null = null;
 
@@ -305,13 +390,13 @@ function randomSAInterval(): number {
 // ─── AI ───────────────────────────────────────────────────────────────────────
 
 // Model roles:
-//   DECISION  → gemma-4-31b-it  (unlimited input ctx, best for analysis/targeting)
-//   GENERATION → gemma-4-27b-a4b-it (MoE, fast, creative text output)
-//   FALLBACK   → gemma-3-27b-it  (used when primary model fails)
+//   DECISION   → google/gemma-4-31B-it      (unlimited input ctx, best for targeting/analysis)
+//   GENERATION → google/gemma-4-26B-A4B-it  (MoE, fast, creative text output)
+//   FALLBACK   → gemma-3-27b-it             (used when primary model fails)
 
 const MODELS = {
-  decision:   'google/gemma-4-31b-it',
-  generation: 'google/gemma-4-27b-a4b-it',
+  decision:   'google/gemma-4-31B-it',
+  generation: 'google/gemma-4-26B-A4B-it',
   fallback:   'gemma-3-27b-it',
 } as const;
 
@@ -480,12 +565,14 @@ async function startSelfActivity(guildId: string): Promise<void> {
 ${membersForPrompt.length ? membersForPrompt.join('\n') : '  nobody recently active'}
 
 ---
-Drop something into the chat. It can be:
-- a hot take, a roast bait, a weird question, a random observation
-- if you genuinely feel like pinging one of the people above (especially a HOMIE or NEUTRAL), you can naturally include their @mention — but ONLY if it would feel organic. pinging a COLD or BEEF person should be rare and only if you're starting beef intentionally.
-- DO NOT ping if it feels forced. silence is always fine.
+Drop something into the chat. pick ONE of these vibes — don't mix them:
+- a hot take, a weird question, or a random observation
+- a casual check-in like "yo", "anyone here", "wsg", "dead chat" — as if you just got online and you're seeing who's around. this is fine and normal. don't overthink it.
+- a roast bait or a jab at someone (especially a BEEF or COLD person who's been active)
+- something directed at a HOMIE using their @mention — only if it feels natural
+- nothing at all is always valid
 
-1-2 sentences MAX. lowercase. no AI energy. output your message + DATA block.`;
+DO NOT ping people unless it genuinely fits. 1-2 sentences MAX. lowercase. no AI energy. output your message + DATA block.`;
 
   try {
     const { text: saText, usedFallback: saFallback } = await generateWithFallback(
@@ -672,11 +759,13 @@ async function updateMemory(
 
     if (typeof intel?.bond_delta === 'number' && intel.bond_delta !== 0) {
       const result = await updateBondScore(guildId, userId, intel.bond_delta);
-      // If bond tier changed, note it for potential future behavior
       if (result.tierChanged) {
         console.log(`[Bond] Tier change for ${username}: ${result.oldTier} → ${result.newTier}`);
       }
     }
+
+    // Update user anger/mood state based on this interaction
+    updateUserMood(guildId, userId, intel?.bond_delta ?? 0, content);
 
     await db.collection('servers').doc(guildId).collection('users').doc(userId).set(userUpdate, { merge: true });
   } catch (e) {
@@ -768,6 +857,14 @@ ${decisionTarget || `${senderName}: "${message.content}"`}
 
 [Why you're replying]: ${decisionReason}
 [Latest message for context]: ${senderName}: "${message.content}"
+${userMoodContext(message.guildId!, message.author.id)}
+
+--- PERSON MOOD GUIDE ---
+Read [Person's Mood] and adjust your energy accordingly — don't block yourself, just dial it:
+- IRRITATED: still reply normally but pull back 1 notch. sharp is fine, mean isn't. let them stew a little.
+- ANGRY: you can still reply. just be dryer, shorter, less invested. you're unbothered, not cruel.
+- RAGING: they've lost it. your move is total unbothered energy — a single flat line or nothing. piling on looks desperate. silence can hit harder.
+- cooled down (was angry before, calm now): act completely normal. no callbacks to the beef. fresh slate, they had their time.
 
 Output your reply + DATA block:`;
 
@@ -854,6 +951,59 @@ export async function startBot(token: string): Promise<void> {
     botClient?.user?.setPresence({ status: 'dnd' });
     setupSelfActivityLoop();
     setupBondDecayLoop();
+  });
+
+  // ── Member Join ──────────────────────────────────────────────────────────
+  botClient.on(Events.GuildMemberAdd, async (member: any) => {
+    if (guildPaused.has(member.guild.id)) return;
+
+    const aiClient = await getOrInitAI();
+    if (!aiClient) return;
+
+    // Pick the most active text channel to greet in
+    const guild = member.guild;
+    let channel: any = null;
+    const pinnedId = guildSelfActivityChannel.get(guild.id);
+    if (pinnedId) channel = guild.channels.cache.get(pinnedId);
+
+    if (!channel) {
+      let latestTime = 0;
+      for (const [chId, act] of channelActivity.entries()) {
+        if (act.lastRepliedAt > latestTime) {
+          const candidate = guild.channels.cache.get(chId);
+          if (candidate?.isTextBased()) { channel = candidate; latestTime = act.lastRepliedAt; }
+        }
+      }
+    }
+    if (!channel) channel = guild.channels.cache.filter((c: any) => c.isTextBased()).random();
+    if (!channel) return;
+
+    const joinPrompt = \`\${SYSTEM_PROMPT}
+
+[Your Discord Identity]: your name is NotABot (ID: 1444327543648817152). your messages in history are labeled "ME".
+
+---
+someone just joined the server: <@\${member.id}> (\${member.displayName || member.user.username})
+it's your call whether to acknowledge them or not. you're a real server member, not a greeter bot.
+- if the vibe is chill, maybe a dry "oh a new one" or a low-key welcome
+- if you feel like being warm (rare), you can be. but don't overdo it.
+- you can also just say nothing (output empty, no DATA block)
+1 sentence max. lowercase. no formal welcomes.\`;
+
+    try {
+      const { text: joinText } = await generateWithFallback(
+        aiClient, 'generation',
+        [{ role: 'user', parts: [{ text: joinPrompt }] }],
+        { temperature: 1.1 }
+      );
+      const cleaned = joinText.replace(/DATA:[\s\S]*$/i, '').trim();
+      if (cleaned && cleaned.length > 2) {
+        await channel.send(cleaned);
+        console.log(\`[Join] Greeted \${member.displayName || member.user.username} in #\${channel.name}\`);
+      }
+    } catch (e) {
+      console.error('[Join] Error:', e);
+    }
   });
 
   // ── Messages ─────────────────────────────────────────────────────────────
@@ -999,6 +1149,12 @@ export async function startBot(token: string): Promise<void> {
       msgLower.includes(BOT_DISPLAY) ||
       msgLower.includes('notabot') ||
       msgLower.includes('not a bot');
+
+    // isGreeting: someone broadcasting to the chat (not directed at anyone specific)
+    // Bot should treat these like open invitations — it's in the chat too
+    const greetingPatterns = /^(yo+|hey+|hi+|sup|yooo+|ayo+|anyone here|anyone alive|is anyone here|dead chat|someone talk to me|hello+|hola|wassup|what.?s up|wsg|wsp)[\s!?.,]*$/i;
+    const isOpenGreeting = greetingPatterns.test(message.content.trim()) && !message.mentions.users.size;
+
     const now        = Date.now();
 
     // Track responses to self-activity messages
@@ -1162,7 +1318,8 @@ Output ONLY this JSON (no explanation, no markdown):
 
 REPLY when: bot is @mentioned with real content, someone replied to bot, open question to chat, people talking ABOUT the bot, clear comedic opening, BEEF user doing something mockable.
 SKIP when: message is for someone else ([replying to X] / [pinged: X] where X ≠ bot), filler reaction with no bot mention, two people clearly in their own thread, bot already replied recently with no engagement, engagement_score < 3.
-WITHDRAW when: someone tells bot to stop / "not you" / "not talking to you" (only if clearly aimed at the bot).`;
+WITHDRAW when: someone tells bot to stop / "not you" / "not talking to you" (only if clearly aimed at the bot).
+`;
 
       try {
         const { text: decisionText, usedFallback: decisionFallback } = await generateWithFallback(
