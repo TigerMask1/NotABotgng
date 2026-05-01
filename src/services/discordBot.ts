@@ -126,6 +126,7 @@ const channelActivity = new Map<string, {
 }>();
 
 const pendingTriggers = new Map<string, NodeJS.Timeout>();
+const processingChannels = new Set<string>(); // prevents concurrent decision runs per channel
 
 // per-guild override for self-activity channel
 const guildSelfActivityChannel = new Map<string, string>();
@@ -677,14 +678,22 @@ export async function startBot(token: string) {
 
     const trigger = setTimeout(async () => {
       pendingTriggers.delete(message.channelId);
-      
+
+      // Prevent concurrent decision runs for the same channel
+      if (processingChannels.has(message.channelId)) {
+        console.log(`[Skip] Already processing a decision for channel ${message.channelId}`);
+        return;
+      }
+      processingChannels.add(message.channelId);
+
+      try {
       const activity = channelActivity.get(message.channelId) || { count: 0, lastReset: now, lastRepliedAt: 0 };
       
       // Cooldown check
-      if (!isMentioned && now - activity.lastRepliedAt < REPLY_COOLDOWN_MS) return;
+      if (!isMentioned && now - activity.lastRepliedAt < REPLY_COOLDOWN_MS) { processingChannels.delete(message.channelId); return; }
 
       const mutedUntil = channelMutedUntil.get(message.channelId);
-      if (mutedUntil && now < mutedUntil) return;
+      if (mutedUntil && now < mutedUntil) { processingChannels.delete(message.channelId); return; }
 
       if (now - activity.lastReset > 300000) {
         activity.count = 0;
@@ -836,6 +845,8 @@ SKIP when:
 - [replying to X] or [pinged: X] where X is NOT the bot — it's for someone else, stay out
 - two people are clearly in their own exchange with no room for bot
 - triggering message is a short filler reaction (fr, lol, ok, yeah, same, bro, facts, cap, 💀, gng, "going to sleep", "gn") — UNLESS it directly mentions the bot
+- triggering message is a short ambiguous phrase ("who?", "what?", "huh?", "lol", "wdym", "nah", "ong", "fr fr", "same") with no bot ping — these are never directed at the bot unless they explicitly mention it
+- message is clearly a reaction to another human's message (they replied to someone else or their message only makes sense as a response to the person before them)
 - bot already replied recently and nobody is actively engaging back
 - jumping in would feel forced, desperate, or annoying
 
@@ -932,6 +943,9 @@ ${senderName}: "${message.content}"`;
         await generateAndSend({ message, history, chatSummary, facts, isMentioned, aiClient, activity, decisionTarget, decisionReason: parsed.reason || 'engaged' });
 
       } catch (e) { console.error("Decision fail:", e); }
+      } finally {
+        processingChannels.delete(message.channelId);
+      }
 
     }, windowTime);
 
