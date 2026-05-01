@@ -305,48 +305,43 @@ function randomSAInterval(): number {
 // ─── AI ───────────────────────────────────────────────────────────────────────
 
 // Model routing:
-//   DECISION_MODEL  — used for should-I-reply logic (31B has unlimited input context → better targeting)
-//   GENERATION_MODEL — used for all visible text output (replies, SA, greetings, summaries)
-//   FALLBACK_MODEL  — gemma 3 27B; used if either primary model fails
-const DECISION_MODEL   = 'google/gemma-4-31B-it';
-const GENERATION_MODEL = 'google/gemma-4-26B-A4B-it';
+//   DECISION_MODEL   — should-I-reply logic (31B dense, huge input context)
+//   GENERATION_MODEL — all visible text output (replies, SA, greetings, summaries)
+//   FALLBACK_MODEL   — gemma 3 27B; drops in if either primary fails
+const DECISION_MODEL   = 'google/gemma-4-31b-it';       // dense 31B — correct lowercase ID
+const GENERATION_MODEL = 'google/gemma-4-26b-a4b-it';   // MoE 26B (3.8B active) — correct lowercase ID
 const FALLBACK_MODEL   = 'gemma-3-27b-it';
 
-// Bot identity — the Discord snowflake so the AI knows who "ME" is in chat history
-const BOT_DISCORD_ID   = '1444327543648817152';
-const BOT_MENTION      = `<@${BOT_DISCORD_ID}>`;
+// Bot identity — so the AI always knows who "ME" is in chat history
+const BOT_DISCORD_ID = '1444327543648817152';
+const BOT_MENTION    = `<@${BOT_DISCORD_ID}>`;
 
 /**
- * Calls the AI with a primary model, falling back to FALLBACK_MODEL on any error.
- * `role` is either 'decision' (uses DECISION_MODEL) or 'generation' (uses GENERATION_MODEL).
+ * Single AI call entry-point. Tries primaryModel first; on any error falls back
+ * to FALLBACK_MODEL. `role` picks which primary: 'decision' = 31B, 'generation' = 26B.
  */
 async function callAI(
   aiClient: GoogleGenAI,
   role: 'decision' | 'generation',
   prompt: string,
-  temperature: number
+  temperature: number,
 ): Promise<string> {
-  const primaryModel = role === 'decision' ? DECISION_MODEL : GENERATION_MODEL;
+  const primary = role === 'decision' ? DECISION_MODEL : GENERATION_MODEL;
   try {
-    const resp = await aiClient.models.generateContent({
-      model: primaryModel,
+    const r = await aiClient.models.generateContent({
+      model: primary,
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       config: { temperature },
     });
-    return resp.text || '';
-  } catch (primaryErr) {
-    console.warn(`[AI] Primary model (${primaryModel}) failed, falling back to ${FALLBACK_MODEL}:`, primaryErr);
-    try {
-      const resp = await aiClient.models.generateContent({
-        model: FALLBACK_MODEL,
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        config: { temperature },
-      });
-      return resp.text || '';
-    } catch (fallbackErr) {
-      console.error(`[AI] Fallback model (${FALLBACK_MODEL}) also failed:`, fallbackErr);
-      throw fallbackErr;
-    }
+    return r.text || '';
+  } catch (err) {
+    console.warn(`[AI] ${primary} failed, falling back to ${FALLBACK_MODEL}:`, (err as any)?.message ?? err);
+    const r = await aiClient.models.generateContent({
+      model: FALLBACK_MODEL,
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      config: { temperature },
+    });
+    return r.text || '';
   }
 }
 
@@ -855,7 +850,7 @@ export async function startBot(token: string): Promise<void> {
       if (sub === 'status') {
         const state     = guildPaused.has(message.guildId) ? 'paused' : 'active';
         const saChannel = guildSelfActivityChannel.get(message.guildId);
-        return message.reply(`state: ${state} | decision: ${DECISION_MODEL} | generation: ${GENERATION_MODEL} | fallback: ${FALLBACK_MODEL} | sa: ${saChannel ? `<#${saChannel}>` : 'auto'}`);
+        return message.reply(`state: ${state} | decision: ${DECISION_MODEL} | gen: ${GENERATION_MODEL} | fallback: ${FALLBACK_MODEL} | sa: ${saChannel ? `<#${saChannel}>` : 'auto'}`);
       }
 
       // !chaos memory
@@ -1054,7 +1049,7 @@ export async function startBot(token: string): Promise<void> {
         : `[Mode]: NORMAL`;
 
       const decisionPrompt = `you are ChaosBot deciding what to do with this discord message.
-[Bot Identity]: You are NotABot. Your Discord ID is ${BOT_DISCORD_ID}. In chat history you appear as "ME". Users may ping you as ${BOT_MENTION}. Any message that @mentions ${BOT_MENTION} or ${BOT_DISCORD_ID} is directed at YOU.
+[Bot Identity]: You are NotABot. Discord ID: ${BOT_DISCORD_ID}. In history you appear as "ME" or "ME(bot)". Any ping of ${BOT_MENTION} or the ID ${BOT_DISCORD_ID} is directed AT YOU.
 
 ${withdrawnCtx}
 [Bot Mood]: ${facts.mood}
@@ -1141,15 +1136,16 @@ ${history}
           decisionTarget = `${senderName}: "${message.content}"`;
         }
 
-        // Duplicate reply guard
+        // Duplicate reply guard — keyed on message snowflake ID (not content) to prevent
+        // the same message ever triggering two replies even if the debounce fires twice.
         const channelReplied = recentlyRepliedTargets.get(message.channelId) || new Set<string>();
-        const targetKey      = decisionTarget.slice(0, 80);
+        const targetKey      = message.id;  // snowflake is unique per message
         if (channelReplied.has(targetKey)) {
-          console.log(`[Skip] Already replied to this target: ${targetKey}`);
+          console.log(`[Skip] Already replied to message ${targetKey}`);
           return;
         }
         channelReplied.add(targetKey);
-        if (channelReplied.size > 10) channelReplied.delete(channelReplied.values().next().value);
+        if (channelReplied.size > 20) channelReplied.delete(channelReplied.values().next().value);
         recentlyRepliedTargets.set(message.channelId, channelReplied);
 
         if (isMentioned) {
