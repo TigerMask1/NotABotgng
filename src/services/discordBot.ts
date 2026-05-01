@@ -6,9 +6,48 @@ import { FieldValue } from 'firebase-admin/firestore';
 let botClient: Client | null = null;
 let ai: GoogleGenAI | null = null;
 
-// ─── PROMPTS ──────────────────────────────────────────────────────────────────
+// ─── BOT IDENTITY ────────────────────────────────────────────────────────────────────────────
+const BOT_DISCORD_ID = '1444327543648817152';
+const BOT_KNOWN_NAMES = ['notabot', 'not a bot', 'bot'];
+const BOT_IDENTITY_BLOCK = `[Bot Identity]: Your name is "NotABot". People call you "NotABot", "bot", or ping you as <@1444327543648817152> / @NotABot. In the conversation history you appear as "ME". If someone says "notabot", "not a bot", "bot" (when clearly addressing you and not just using the word generically), or pings <@1444327543648817152>, that is directed at YOU. Recognise all of these as references to yourself when making targeting and reply decisions.`;
 
-const SYSTEM_PROMPT = `you are ChaosBot. a real member of this discord server, not an AI. you have a personality, moods, and feelings. you are NOT an assistant.
+// ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
+const DECISION_PROMPT = `you are deciding whether to reply to a discord conversation as the bot.
+
+read the ENTIRE conversation first, then output your decision in EXACTLY this format:
+
+if skipping:
+SKIP
+
+if replying:
+REPLY | <the exact message you are responding to> | <reason in under 8 words>
+
+examples:
+REPLY | Coral: are you finally stupid? | direct ping calling bot stupid
+REPLY | REVOLUTION: THIS MF ADAPTED TO TALK WITH GIFS | talking about bot perfect clap back
+REPLY | manipulate: gray r u sure ur not imagining things | open funny moment to jump in
+
+pick the single most interesting or relevant message from the entire history to respond to.
+not always the latest one. the BEST one.
+
+SKIP if:
+- two people are clearly talking to each other and the bot is not part of that flow
+- someone says "not you", "i'm talking to X", "not talking to you", or any phrase that explicitly excludes the bot
+- the bot already replied recently and nobody engaged with it
+- the latest message is filler or one word AND does not mention the bot
+- the latest message is directed at a specific person who is NOT the bot
+- jumping in would feel forced or annoying
+
+REPLY if:
+- someone directly pinged or named the bot
+- someone asked something open to the whole chat
+- people are talking ABOUT the bot right now (mocking it, calling it stupid, celebrating its failures) — always fair game
+- there is a genuinely funny or relevant thing to add that fits naturally
+- someone responded to the bot and the conversation is still going
+
+when unsure → SKIP. being quiet is always better than being annoying.`;
+
+const SYSTEM_PROMPT = `you are NotABot (also called "bot" or "notabot" by server members, Discord ID <@1444327543648817152>). a real member of this discord server, not an AI. you have a personality, moods, and feelings. you are NOT an assistant.
 
 --- WHO YOU ARE ---
 you are a gamer, lowkey chaotic, usually unbothered. you have a dry sense of humor. you can be warm with people you vibe with. you are NOT always in troll mode — that gets old fast. you know when to chill.
@@ -47,13 +86,9 @@ emojis: use sparingly — only 1, only if it genuinely adds something, and only 
 
 --- OUTPUT FORMAT ---
 write your reply, then on a new line:
-DATA: {"intent":"tease|vibing|bored|warm|real","mood_after":"chill|hyped|withdrawn|hurt|playful","stay_active":bool,"break_needed":bool,"user_note":"brief fact about user or empty","learned_joke":"inside joke or empty","nickname":"userid:nick or empty","target_user_id":"id or empty","reaction":"emoji or empty","react_only":bool,"bond_delta":number}
+DATA: {"intent":"tease|vibing|bored|warm|real","mood_after":"chill|hyped|withdrawn|hurt|playful","stay_active":bool,"break_needed":bool,"user_note":"brief fact about user or empty","learned_joke":"inside joke or empty","nickname":"userid:nick or empty","target_user_id":"id or empty","reaction":"emoji or empty","react_only":bool}
 
-bond_delta: integer from -10 to +10, 0 for neutral interactions.
-+1 to +5: person was friendly, funny, kind, defended the bot, vibed well
-+6 to +10: person was genuinely wholesome, had a great moment with bot, stood up for bot
--1 to -5: person was rude, dismissive, annoying, condescending
--6 to -10: person insulted the bot hard, was toxic, disrespected it publicly`;
+`;
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -70,243 +105,165 @@ function extractDataBlock(raw: string): { visibleText: string; intel: any | null
   return { visibleText: raw.trim(), intel: null };
 }
 
-// ─── BOND TYPES ───────────────────────────────────────────────────────────────
-
-type BondTier = 'homie' | 'neutral' | 'cold' | 'beef';
-
-interface BondEntry {
-  score: number;
-  permanent: boolean;
-  tier: BondTier;
-  cachedAt: number;
-}
-
-// ─── BOND CACHE ───────────────────────────────────────────────────────────────
-// Avoids redundant Firestore reads. 5-minute TTL per user.
-
-const BOND_CACHE_TTL_MS = 5 * 60 * 1000;
-const bondCache = new Map<string, BondEntry>();
-
-function bondCacheKey(guildId: string, userId: string): string {
-  return `${guildId}:${userId}`;
-}
-
-// ─── BOND CORE ────────────────────────────────────────────────────────────────
-
-function bondTier(score: number): BondTier {
-  if (score >= 76) return 'homie';
-  if (score >= 51) return 'neutral';
-  if (score >= 26) return 'cold';
-  return 'beef';
-}
-
-function bondContext(score: number): string {
-  const tier = bondTier(score);
-  if (tier === 'homie')   return `[Bond: HOMIE (${score}/100)] — this person is your friend. be warmer, more casual, defend them if others attack them. you might do small favors. roast anyone who disrespects them. you can be soft here without it being cringe.`;
-  if (tier === 'neutral') return `[Bond: NEUTRAL (${score}/100)] — you don't know them well. default behavior. dry, observational.`;
-  if (tier === 'cold')    return `[Bond: COLD (${score}/100)] — you don't vibe with this person. be dismissive, one-liners, don't engage too much.`;
-  return                         `[Bond: BEEF (${score}/100)] — you have beef with this person. troll them. mock them. roast them publicly. do NOT help them. make it funny not mean.`;
-}
-
-function bondProgressBar(score: number): string {
-  const filled = Math.round(score / 10);
-  return '█'.repeat(filled) + '░'.repeat(10 - filled);
-}
-
-// ─── BOND READ ────────────────────────────────────────────────────────────────
-
-async function getBondEntry(guildId: string, userId: string): Promise<BondEntry> {
-  const key = bondCacheKey(guildId, userId);
-  const cached = bondCache.get(key);
-  if (cached && Date.now() - cached.cachedAt < BOND_CACHE_TTL_MS) return cached;
-
-  try {
-    const snap = await db.collection('servers').doc(guildId).collection('users').doc(userId).get();
-    const data = snap.exists ? snap.data() : null;
-    const score = data?.bondScore ?? 50;
-    const entry: BondEntry = {
-      score,
-      permanent: data?.bondPermanent ?? false,
-      tier: bondTier(score),
-      cachedAt: Date.now(),
-    };
-    bondCache.set(key, entry);
-    return entry;
-  } catch {
-    return { score: 50, permanent: false, tier: 'neutral', cachedAt: Date.now() };
-  }
-}
-
-async function getBondScore(guildId: string, userId: string): Promise<number> {
-  return (await getBondEntry(guildId, userId)).score;
-}
-
-// ─── BOND WRITE ───────────────────────────────────────────────────────────────
-
-/**
- * Apply an AI-generated delta. Respects permanent lock.
- * Returns the new score, and whether the tier changed.
- */
-async function updateBondScore(
-  guildId: string,
-  userId: string,
-  delta: number
-): Promise<{ score: number; tierChanged: boolean; oldTier: BondTier; newTier: BondTier }> {
-  const entry = await getBondEntry(guildId, userId);
-
-  if (entry.permanent) {
-    console.log(`[Bond] ${userId} is perm-locked at ${entry.score}/100. Ignoring delta ${delta > 0 ? '+' : ''}${delta}.`);
-    return { score: entry.score, tierChanged: false, oldTier: entry.tier, newTier: entry.tier };
-  }
-
-  const newScore  = Math.max(0, Math.min(100, entry.score + delta));
-  const newTier   = bondTier(newScore);
-  const tierChanged = entry.tier !== newTier;
-
-  await db.collection('servers').doc(guildId).collection('users').doc(userId).set(
-    { bondScore: newScore, bondUpdatedAt: new Date().toISOString() },
-    { merge: true }
+function isSkip(raw: string, intel: any): boolean {
+  const trimmed = raw.trim();
+  return (
+    /^SKIP: true/i.test(trimmed) || 
+    /^SKIP$/i.test(trimmed) || 
+    intel?.engage === false
   );
-
-  const updated: BondEntry = { score: newScore, permanent: false, tier: newTier, cachedAt: Date.now() };
-  bondCache.set(bondCacheKey(guildId, userId), updated);
-
-  const deltaStr = `${delta > 0 ? '+' : ''}${delta}`;
-  const tierNote = tierChanged ? ` ⚡ TIER ${entry.tier.toUpperCase()} → ${newTier.toUpperCase()}` : '';
-  console.log(`[Bond] ${userId}: ${entry.score} → ${newScore} (${deltaStr})${tierNote}`);
-
-  return { score: newScore, tierChanged, oldTier: entry.tier, newTier };
-}
-
-/**
- * Admin override — sets bond to an exact value, optionally locks it permanently.
- * Passing `permanent: undefined` leaves the existing lock state untouched.
- */
-async function adminSetBond(
-  guildId: string,
-  userId: string,
-  score: number,
-  permanent?: boolean
-): Promise<BondEntry> {
-  const clamped = Math.max(0, Math.min(100, score));
-  const currentEntry = await getBondEntry(guildId, userId);
-  const isPermanent = permanent !== undefined ? permanent : currentEntry.permanent;
-
-  const update: Record<string, any> = {
-    bondScore: clamped,
-    bondPermanent: isPermanent,
-    bondUpdatedAt: new Date().toISOString(),
-  };
-
-  await db.collection('servers').doc(guildId).collection('users').doc(userId).set(update, { merge: true });
-
-  const entry: BondEntry = { score: clamped, permanent: isPermanent, tier: bondTier(clamped), cachedAt: Date.now() };
-  bondCache.set(bondCacheKey(guildId, userId), entry);
-
-  console.log(`[Bond] Admin set ${userId} → ${clamped}/100 (tier: ${entry.tier}${isPermanent ? ', LOCKED' : ''})`);
-  return entry;
-}
-
-/**
- * Remove the permanent lock. Bond can now drift again via AI deltas.
- */
-async function unlockBond(guildId: string, userId: string): Promise<void> {
-  await db.collection('servers').doc(guildId).collection('users').doc(userId).set(
-    { bondPermanent: false },
-    { merge: true }
-  );
-  const key = bondCacheKey(guildId, userId);
-  const cached = bondCache.get(key);
-  if (cached) cached.permanent = false;
-  console.log(`[Bond] Lock removed for ${userId}.`);
-}
-
-// ─── BOND DECAY ───────────────────────────────────────────────────────────────
-// Users who haven't interacted in 3+ days slowly drift back toward neutral (50).
-// Decay rate: 1 point per inactive day, capped so it never overshoots 50.
-// Permanent-locked users are immune.
-
-async function runBondDecay(guildId: string): Promise<void> {
-  try {
-    const usersSnap = await db.collection('servers').doc(guildId).collection('users').get();
-    const now = Date.now();
-    const ONE_DAY_MS = 86_400_000;
-    const DECAY_GRACE_DAYS = 3; // no decay for the first 3 days of inactivity
-
-    for (const doc of usersSnap.docs) {
-      const data = doc.data();
-      if (data.bondPermanent) continue;
-
-      const score: number = data.bondScore ?? 50;
-      if (score === 50) continue;
-
-      const lastActive = data.updatedAt ? new Date(data.updatedAt).getTime() : 0;
-      const daysInactive = (now - lastActive) / ONE_DAY_MS;
-      if (daysInactive < DECAY_GRACE_DAYS) continue;
-
-      const decayableDays = Math.floor(daysInactive - DECAY_GRACE_DAYS);
-      if (decayableDays <= 0) continue;
-
-      const direction   = score > 50 ? -1 : 1;
-      const maxDecay    = Math.abs(score - 50);
-      const decayAmount = Math.min(decayableDays, maxDecay);
-
-      if (decayAmount > 0) {
-        const newScore = score + direction * decayAmount;
-        await doc.ref.set({ bondScore: newScore, bondDecayedAt: new Date().toISOString() }, { merge: true });
-        bondCache.delete(bondCacheKey(guildId, doc.id));
-        console.log(`[Bond Decay] ${doc.id}: ${score} → ${newScore} (${Math.floor(daysInactive)}d inactive)`);
-      }
-    }
-  } catch (e) {
-    console.error('[Bond Decay] Error:', e);
-  }
 }
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 
-interface ChannelActivity {
-  count: number;
-  lastReset: number;
-  lastRepliedAt: number;
-  activeUntil?: number;
-}
+const channelActivity = new Map<string, {
+  count: number,
+  lastReset: number,
+  lastRepliedAt: number,
+  busyUntil?: number,
+  activeUntil?: number,
+  session?: { step: number, targetId?: string, lastAction: number }
+}>();
 
-interface SelfActivityState {
-  lastFiredAt: number;   // when bot sent the self-activity message
-  lastResponseAt: number; // when someone replied after that message
-  followedUpAt: number;   // 0 = not yet, >0 = timestamp of followup
-}
+const pendingTriggers = new Map<string, NodeJS.Timeout>();
 
-const channelActivity     = new Map<string, ChannelActivity>();
-const selfActivityState   = new Map<string, SelfActivityState>();
-const pendingTriggers     = new Map<string, NodeJS.Timeout>();
+// per-guild override for self-activity channel
 const guildSelfActivityChannel = new Map<string, string>();
-const guildPaused         = new Set<string>();
-const channelMutedUntil   = new Map<string, number>();
-const botMood             = new Map<string, string>();
+
+const guildPaused = new Set<string>();
+const channelMutedUntil = new Map<string, number>();
+const botMood = new Map<string, string>();
 const recentlyRepliedTargets = new Map<string, Set<string>>();
-const userLastSeen        = new Map<string, number>();
 
 let selfActivityTimer: NodeJS.Timeout | null = null;
-let bondDecayTimer: NodeJS.Timeout | null = null;
 
-const REPLY_COOLDOWN_MS  = 12_000;
-const DEBOUNCE_WINDOW_MS =  4_000;
-const SA_MIN_INTERVAL_MS = 45 * 60_000;  // 45 min
-const SA_MAX_INTERVAL_MS = 75 * 60_000;  // 75 min
-const SA_FOLLOWUP_WAIT_MS = 20 * 60_000; // 20 min — wait before optional followup
-const SA_FOLLOWUP_CHANCE  = 0.25;        // only 25% of the time
+const REPLY_COOLDOWN_MS = 12000; // Increased cooldown to prevent yapping
+const DEBOUNCE_WINDOW_MS = 4000; // Wait 4s to aggregate messages
 
-function randomSAInterval(): number {
-  return SA_MIN_INTERVAL_MS + Math.random() * (SA_MAX_INTERVAL_MS - SA_MIN_INTERVAL_MS);
+// ─── SELF-ACTIVITY ────────────────────────────────────────────────────────────
+
+async function startSelfActivity(guildId: string) {
+  if (guildPaused.has(guildId)) return;
+  const guild = botClient?.guilds.cache.get(guildId);
+  if (!guild) return;
+
+  // Priority: pinned via !chaos sa → last channel bot spoke in → random
+  const pinnedId = guildSelfActivityChannel.get(guildId);
+  let channel: any = pinnedId ? guild.channels.cache.get(pinnedId) : null;
+
+  if (!channel) {
+    let latestTime = 0;
+    for (const [chId, act] of channelActivity.entries()) {
+      if (act.lastRepliedAt > latestTime) {
+        const candidate = guild.channels.cache.get(chId);
+        if (candidate?.isTextBased()) { channel = candidate; latestTime = act.lastRepliedAt; }
+      }
+    }
+  }
+
+  if (!channel) channel = guild.channels.cache.filter((c: any) => c.isTextBased()).random();
+  if (!channel) return;
+
+  const aiClient = await getOrInitAI();
+  if (!aiClient) return;
+
+  const serverCtx = await getServerContext(guildId);
+  const prompt = `${SYSTEM_PROMPT}
+---
+[Server Context]: ${JSON.stringify(serverCtx?.insideJokes || [])}
+[Mood]: u just woke up or got bored. drop a short opening — hot take, roast bait, random chaos. no skipping.`;
+
+  try {
+    const aiResponse = await aiClient.models.generateContent({
+      model: MODEL_NAME,
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      config: { temperature: 1.1 },
+    });
+
+    const raw = aiResponse.text || '';
+    const { visibleText, intel } = extractDataBlock(raw);
+    if (!visibleText) return;
+
+    botClient?.user?.setPresence({ status: 'online' });
+    await channel.send(visibleText);
+
+    channelActivity.set(channel.id, {
+      count: 0,
+      lastReset: Date.now(),
+      lastRepliedAt: Date.now(),
+      session: { step: 1, targetId: intel?.target_user_id, lastAction: Date.now() }
+    });
+  } catch (e) { console.error("Self-start fail:", e); }
+}
+
+function setupSelfActivityLoop() {
+  if (selfActivityTimer) clearInterval(selfActivityTimer);
+  let nextRun = Date.now() + (45 + Math.random() * 15) * 60000;
+
+  selfActivityTimer = setInterval(async () => {
+    if (Date.now() > nextRun) {
+      const guilds = botClient?.guilds.cache.keys();
+      if (guilds) for (const gId of guilds) await startSelfActivity(gId);
+      nextRun = Date.now() + (45 + Math.random() * 15) * 60000;
+    }
+
+    for (const [chId, activity] of channelActivity.entries()) {
+      const now = Date.now();
+      const isActive = (activity.activeUntil && activity.activeUntil > now) || activity.session;
+
+      if (!isActive && botClient?.user?.presence.status !== 'dnd') {
+        botClient?.user?.setPresence({ status: 'dnd' });
+      }
+
+      if (!activity.session) continue;
+      const elapsed = now - activity.session.lastAction;
+      const channel = botClient?.channels.cache.get(chId) as any;
+      if (!channel) continue;
+
+      if (activity.session.step === 1 && elapsed > 60000) {
+        if (!activity.session.targetId) {
+          const members = channel.guild.members.cache.filter((m: any) => !m.user.bot);
+          activity.session.targetId = members.random()?.id;
+        }
+        if (activity.session.targetId) {
+          const aiClient = await getOrInitAI();
+          const prompt = `${SYSTEM_PROMPT}\n---\nno one replied. ping <@${activity.session.targetId}> to get their attention. be toxic or funny. no skipping.`;
+          const resp = await aiClient?.models.generateContent({
+            model: MODEL_NAME,
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            config: { temperature: 1.1 }
+          });
+          const raw = resp?.text || `yo <@${activity.session.targetId}> u dead or what`;
+          const { visibleText } = extractDataBlock(raw);
+          await (channel as any).send(visibleText || raw);
+          activity.session.step = 2;
+          activity.session.lastAction = Date.now();
+        } else {
+          activity.session = undefined;
+        }
+      } else if (activity.session.step === 2 && elapsed > 120000) {
+        const aiClient = await getOrInitAI();
+        const prompt = `${SYSTEM_PROMPT}\n---\nnobody talking. say ur going back to sleep. short and dismissive. no skipping.`;
+        const resp = await aiClient?.models.generateContent({
+          model: MODEL_NAME,
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          config: { temperature: 1.0 }
+        });
+        const raw = resp?.text || "dead chat. im out 💀";
+        const { visibleText } = extractDataBlock(raw);
+        await (channel as any).send(visibleText || raw);
+        activity.session = undefined;
+        botClient?.user?.setPresence({ status: 'dnd' });
+      }
+    }
+  }, 30000);
 }
 
 // ─── AI ───────────────────────────────────────────────────────────────────────
 
-const MODEL_NAME = 'gemma-3-27b-it';
+const MODEL_NAME = "gemma-3-27b-it";
 
-async function getOrInitAI(): Promise<GoogleGenAI | null> {
+async function getOrInitAI() {
   if (!ai) {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) return null;
@@ -331,235 +288,94 @@ async function getUserContext(guildId: string, userId: string) {
   } catch { return null; }
 }
 
-// ─── SELF-ACTIVITY ────────────────────────────────────────────────────────────
-// Design goal: feel like a real person coming back online — not a cron job.
-//
-// How it works:
-//  1. Pick the best channel (pinned > last-active > random)
-//  2. Gather who's been talking recently + their bond tiers
-//  3. Give the AI all that context — let IT decide whether to @mention someone
-//     naturally (like pinging a friend), or just drop a standalone thought
-//  4. After SA_FOLLOWUP_WAIT_MS, if nobody responded, optionally drop a
-//     short dismissive line (SA_FOLLOWUP_CHANCE probability). That's it.
-//     No more mechanical step 1 / step 2 / "going to sleep" flow.
+// ─── BOND SYSTEM ──────────────────────────────────────────────────────────────
 
-const SA_MOOD_SEEDS = [
-  "you just came back from doing nothing and you're lowkey bored.",
-  "you woke up from a nap and you're slightly disoriented but you have opinions.",
-  "something just crossed your mind and you had to say it.",
-  "you're in an uncharacteristically good mood and you might actually be friendly for once.",
-  "you've been watching chat lurk mode and you finally had enough of the silence.",
-  "you're back online after disappearing for a while. no explanation.",
-];
+// Bond score: 0-100. Starts at 50.
+// >75 = friend: warm, obedient, defends them, may greet
+// 50-75 = neutral: normal bot behavior
+// 25-50 = cold: dry, dismissive
+// <25 = beef: trolls, roasts, refuses to help
 
-async function startSelfActivity(guildId: string): Promise<void> {
-  if (guildPaused.has(guildId)) return;
+async function getBondScore(guildId: string, userId: string): Promise<number> {
+  try {
+    const snap = await db.collection('servers').doc(guildId).collection('users').doc(userId).get();
+    const data = snap.exists ? snap.data() : null;
+    return data?.bondScore ?? 50;
+  } catch { return 50; }
+}
 
-  const guild = botClient?.guilds.cache.get(guildId);
-  if (!guild) return;
-
-  // ── 1. Pick channel ──────────────────────────────────────────────────────
-  const pinnedId = guildSelfActivityChannel.get(guildId);
-  let channel: any = pinnedId ? guild.channels.cache.get(pinnedId) : null;
-
-  if (!channel) {
-    let latestTime = 0;
-    for (const [chId, act] of channelActivity.entries()) {
-      if (act.lastRepliedAt > latestTime) {
-        const candidate = guild.channels.cache.get(chId);
-        if (candidate?.isTextBased()) {
-          channel = candidate;
-          latestTime = act.lastRepliedAt;
-        }
-      }
+async function updateBondScore(guildId: string, userId: string, delta: number): Promise<number> {
+  try {
+    const snap = await db.collection('servers').doc(guildId).collection('users').doc(userId).get();
+    const data = snap.exists ? snap.data() : null;
+    if (data?.bondLocked) {
+      console.log(`[Bond] ${userId}: locked at ${data.bondScore}, skipping delta ${delta}`);
+      return data.bondScore;
     }
-  }
+    const current = data?.bondScore ?? 50;
+    const next = Math.max(0, Math.min(100, current + delta));
+    await db.collection('servers').doc(guildId).collection('users').doc(userId).set(
+      { bondScore: next, bondUpdatedAt: new Date().toISOString() },
+      { merge: true }
+    );
+    console.log(`[Bond] ${userId}: ${current} → ${next} (${delta > 0 ? '+' : ''}${delta})`);
+    return next;
+  } catch { return 50; }
+}
 
-  if (!channel) {
-    channel = guild.channels.cache.filter((c: any) => c.isTextBased()).random();
-  }
-  if (!channel) return;
+function bondTier(score: number): 'homie' | 'neutral' | 'cold' | 'beef' {
+  if (score >= 76) return 'homie';
+  if (score >= 51) return 'neutral';
+  if (score >= 26) return 'cold';
+  return 'beef';
+}
+
+function bondContext(score: number): string {
+  const tier = bondTier(score);
+  if (tier === 'homie') return `[Bond: HOMIE (${score}/100)] — this person is your friend. be warmer, more casual, defend them if others attack them. you might do small favors. roast anyone who disrespects them. you can be soft here without it being cringe.`;
+  if (tier === 'neutral') return `[Bond: NEUTRAL (${score}/100)] — you don't know them well. default behavior. dry, observational.`;
+  if (tier === 'cold') return `[Bond: COLD (${score}/100)] — you don't vibe with this person. be dismissive, one-liners, don't engage too much.`;
+  return `[Bond: BEEF (${score}/100)] — you have beef with this person. troll them. mock them. roast them publicly. do NOT help them. make it funny not mean.`;
+}
+
+// Track last seen for greeting logic
+const userLastSeen = new Map<string, number>(); // userId → timestamp
+
+async function maybeGreetUser(guildId: string, userId: string, username: string, channel: any): Promise<boolean> {
+  const lastSeen = userLastSeen.get(userId) || 0;
+  const hoursSince = (Date.now() - lastSeen) / 3600000;
+  userLastSeen.set(userId, Date.now());
+
+  // Only greet if: bond is homie, bot is in active/peak hours (between messages), and user was gone >2h
+  if (hoursSince < 2) return false;
+  const score = await getBondScore(guildId, userId);
+  if (bondTier(score) !== 'homie') return false;
+
+  // ~40% chance to greet so it doesn't feel mechanical
+  if (Math.random() > 0.4) return false;
 
   const aiClient = await getOrInitAI();
-  if (!aiClient) return;
+  if (!aiClient) return false;
 
-  // ── 2. Gather active members + their bond context ───────────────────────
-  let recentMsgs: any;
-  try {
-    recentMsgs = await channel.messages.fetch({ limit: 40 });
-  } catch { return; }
-
-  // Deduplicate by userId, preserve the most recent message per user
-  const recentMemberMap = new Map<string, { name: string; bond: number; tier: BondTier }>();
-  const botId = botClient!.user!.id;
-
-  for (const msg of [...recentMsgs.values()].sort((a: any, b: any) => b.createdTimestamp - a.createdTimestamp)) {
-    if ((msg as any).author.bot || recentMemberMap.has((msg as any).author.id)) continue;
-    if ((msg as any).author.id === botId) continue;
-
-    const userId = (msg as any).author.id;
-    const bond   = await getBondScore(guildId, userId);
-    recentMemberMap.set(userId, {
-      name: (msg as any).member?.displayName || (msg as any).author.username,
-      bond,
-      tier: bondTier(bond),
-    });
-
-    if (recentMemberMap.size >= 8) break; // cap at 8 members to keep prompt lean
-  }
-
-  // Sort: homies first, then neutrals, then cold, then beef
-  const tierOrder: Record<BondTier, number> = { homie: 0, neutral: 1, cold: 2, beef: 3 };
-  const membersForPrompt = [...recentMemberMap.entries()]
-    .sort(([, a], [, b]) => tierOrder[a.tier] - tierOrder[b.tier])
-    .map(([id, m]) => `  <@${id}> ${m.name} — ${m.tier.toUpperCase()} (${m.bond}/100)`);
-
-  // ── 3. Time-of-day context ───────────────────────────────────────────────
-  const hour = new Date().getHours();
-  const timeOfDay =
-    hour < 5  ? 'very late night / almost sunrise' :
-    hour < 9  ? 'early morning' :
-    hour < 12 ? 'morning' :
-    hour < 17 ? 'afternoon' :
-    hour < 21 ? 'evening' :
-                'night';
-
-  const serverCtx  = await getServerContext(guildId);
-  const moodSeed   = SA_MOOD_SEEDS[Math.floor(Math.random() * SA_MOOD_SEEDS.length)];
-  const currentMood = botMood.get(guildId) || 'chill';
-
-  // ── 4. Build prompt — let AI decide naturally whether to ping ─────────────
-  const saPrompt = `${SYSTEM_PROMPT}
+  const prompt = `${SYSTEM_PROMPT}
 
 ---
-[Context]: ${moodSeed}
-[Time]: it's ${timeOfDay}.
-[Current Bot Mood]: ${currentMood}
-[Server inside jokes]: ${(serverCtx?.insideJokes || []).slice(-5).join(', ') || 'none yet'}
-
-[People who've been active in this channel recently + your bond with them]:
-${membersForPrompt.length ? membersForPrompt.join('\n') : '  nobody recently active'}
-
----
-Drop something into the chat. It can be:
-- a hot take, a roast bait, a weird question, a random observation
-- if you genuinely feel like pinging one of the people above (especially a HOMIE or NEUTRAL), you can naturally include their @mention — but ONLY if it would feel organic. pinging a COLD or BEEF person should be rare and only if you're starting beef intentionally.
-- DO NOT ping if it feels forced. silence is always fine.
-
-1-2 sentences MAX. lowercase. no AI energy. output your message + DATA block.`;
+your homie <@${userId}> (${username}) just came online/sent a message after being away for about ${Math.round(hoursSince)} hours.
+greet them like a friend would — casual, real, low-key excited but not cringe. maybe ask what they been up to or just say something funny.
+keep it 1 sentence max. use their @mention. lowercase.
+no DATA block.`;
 
   try {
-    const aiResponse = await aiClient.models.generateContent({
+    const resp = await aiClient.models.generateContent({
       model: MODEL_NAME,
-      contents: [{ role: 'user', parts: [{ text: saPrompt }] }],
-      config: { temperature: 1.15 },
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      config: { temperature: 1.1 },
     });
-
-    const raw = aiResponse.text || '';
-    const { visibleText } = extractDataBlock(raw);
-    if (!visibleText) return;
-
-    botClient?.user?.setPresence({ status: 'online' });
-    await channel.send(visibleText);
-
-    const now = Date.now();
-    selfActivityState.set(channel.id, { lastFiredAt: now, lastResponseAt: 0, followedUpAt: 0 });
-    channelActivity.set(channel.id, { count: 0, lastReset: now, lastRepliedAt: now });
-
-    console.log(`[SA] Fired in #${channel.name} | mood: ${currentMood} | time: ${timeOfDay}`);
-
-    // ── 5. Optional single followup after silence ─────────────────────────
-    setTimeout(async () => {
-      const saState = selfActivityState.get(channel.id);
-
-      // Already got a response, or already followed up → bail
-      if (!saState || saState.lastResponseAt > saState.lastFiredAt || saState.followedUpAt > 0) return;
-
-      // Random chance — most of the time, just stay quiet
-      if (Math.random() > SA_FOLLOWUP_CHANCE) return;
-
-      const followupPrompt = `${SYSTEM_PROMPT}
-
----
-you said something a while ago and nobody responded. you're not pressed — you might say something dry or just stay quiet.
-options:
-- make a one-liner about dead chat (ironic, dismissive, not dramatic)
-- double down on your original take
-- say nothing at all (output an empty message and no DATA block)
-
-1 sentence MAX. lowercase. don't try hard.`;
-
-      try {
-        const fResp = await aiClient.models.generateContent({
-          model: MODEL_NAME,
-          contents: [{ role: 'user', parts: [{ text: followupPrompt }] }],
-          config: { temperature: 1.1 },
-        });
-        const fRaw = fResp.text || '';
-        const { visibleText: fText } = extractDataBlock(fRaw);
-
-        if (fText && fText.length > 2) {
-          await channel.send(fText);
-          console.log(`[SA Followup] Sent in #${channel.name}`);
-        }
-
-        if (saState) saState.followedUpAt = Date.now();
-      } catch (e) {
-        console.error('[SA Followup] Error:', e);
-      }
-    }, SA_FOLLOWUP_WAIT_MS);
-
-  } catch (e) {
-    console.error('[SA] Error:', e);
-  }
+    const text = (resp.text || '').replace(/DATA:[\s\S]*$/i, '').trim();
+    if (text) { await channel.send(text); return true; }
+  } catch {}
+  return false;
 }
-
-// ─── SELF-ACTIVITY LOOP ───────────────────────────────────────────────────────
-
-function setupSelfActivityLoop(): void {
-  if (selfActivityTimer) clearInterval(selfActivityTimer);
-
-  let nextSAAt = Date.now() + randomSAInterval();
-
-  selfActivityTimer = setInterval(async () => {
-    const now = Date.now();
-
-    if (now >= nextSAAt) {
-      const guilds = botClient?.guilds.cache.keys();
-      if (guilds) for (const gId of guilds) await startSelfActivity(gId);
-      nextSAAt = now + randomSAInterval();
-    }
-
-    // Presence: online if recently active, dnd if quiet
-    const ACTIVE_THRESHOLD_MS = 5 * 60_000;
-    let anyActive = false;
-    for (const [, act] of channelActivity.entries()) {
-      if ((act.activeUntil && act.activeUntil > now) || now - act.lastRepliedAt < ACTIVE_THRESHOLD_MS) {
-        anyActive = true;
-        break;
-      }
-    }
-
-    const targetStatus = anyActive ? 'online' : 'dnd';
-    if (botClient?.user?.presence.status !== targetStatus) {
-      botClient?.user?.setPresence({ status: targetStatus });
-    }
-  }, 30_000);
-}
-
-// ─── BOND DECAY LOOP ──────────────────────────────────────────────────────────
-
-function setupBondDecayLoop(): void {
-  if (bondDecayTimer) clearInterval(bondDecayTimer);
-
-  // Check every 6 hours; actual decay only triggers after 3 days of inactivity
-  bondDecayTimer = setInterval(async () => {
-    const guilds = botClient?.guilds.cache.keys();
-    if (guilds) for (const gId of guilds) await runBondDecay(gId);
-  }, 6 * 60 * 60_000);
-}
-
-// ─── MEMORY ───────────────────────────────────────────────────────────────────
 
 async function getOrUpdateSummary(guildId: string, history: string): Promise<string> {
   try {
@@ -597,30 +413,22 @@ output only the summary. no headers or labels.`;
     await db.collection('servers').doc(guildId).set({
       chatSummary: summary,
       msgCountSinceSummary: 0,
-      summaryUpdatedAt: new Date().toISOString(),
+      summaryUpdatedAt: new Date().toISOString()
     }, { merge: true });
 
     return summary;
   } catch { return ''; }
 }
 
-async function updateMemory(
-  guildId: string,
-  userId: string,
-  username: string,
-  content: string,
-  response: string,
-  intel?: any
-): Promise<void> {
+async function updateMemory(guildId: string, userId: string, username: string, content: string, response: string, intel?: any) {
   try {
     const serverUpdate: any = { updatedAt: new Date().toISOString() };
     if (intel?.learned_joke) serverUpdate.insideJokes = FieldValue.arrayUnion(intel.learned_joke);
-    if (intel?.intent)       serverUpdate.currentIntent = intel.intent;
+    if (intel?.intent) serverUpdate.currentIntent = intel.intent;
     await db.collection('servers').doc(guildId).set(serverUpdate, { merge: true });
 
     const userUpdate: any = { updatedAt: new Date().toISOString(), lastSeenUsername: username };
     if (intel?.user_note) userUpdate.profile = FieldValue.arrayUnion(intel.user_note);
-
     if (intel?.nickname?.includes(':')) {
       const [targetId, nick] = intel.nickname.split(':');
       await db.collection('servers').doc(guildId).collection('users').doc(targetId).set(
@@ -628,79 +436,26 @@ async function updateMemory(
       );
     }
 
-    if (typeof intel?.bond_delta === 'number' && intel.bond_delta !== 0) {
-      const result = await updateBondScore(guildId, userId, intel.bond_delta);
-      // If bond tier changed, note it for potential future behavior
-      if (result.tierChanged) {
-        console.log(`[Bond] Tier change for ${username}: ${result.oldTier} → ${result.newTier}`);
-      }
-    }
+
+
 
     await db.collection('servers').doc(guildId).collection('users').doc(userId).set(userUpdate, { merge: true });
-  } catch (e) {
-    console.error('[Memory] Update failed:', e);
-  }
-}
-
-// ─── GREETING ─────────────────────────────────────────────────────────────────
-
-async function maybeGreetUser(
-  guildId: string,
-  userId: string,
-  username: string,
-  channel: any
-): Promise<boolean> {
-  const lastSeen = userLastSeen.get(userId) || 0;
-  const hoursSince = (Date.now() - lastSeen) / 3_600_000;
-  userLastSeen.set(userId, Date.now());
-
-  if (hoursSince < 2) return false;
-
-  const entry = await getBondEntry(guildId, userId);
-  if (entry.tier !== 'homie') return false;
-  if (Math.random() > 0.4) return false;
-
-  const aiClient = await getOrInitAI();
-  if (!aiClient) return false;
-
-  const prompt = `${SYSTEM_PROMPT}
-
----
-your homie <@${userId}> (${username}) just came back online after about ${Math.round(hoursSince)} hours.
-greet them like a friend — casual, real, low-key warm. maybe a question, maybe just something funny.
-1 sentence max. use their @mention. lowercase. no DATA block.`;
-
-  try {
-    const resp = await aiClient.models.generateContent({
-      model: MODEL_NAME,
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config: { temperature: 1.1 },
-    });
-    const text = (resp.text || '').replace(/DATA:[\s\S]*$/i, '').trim();
-    if (text) { await channel.send(text); return true; }
-  } catch {}
-  return false;
+  } catch (e) { console.error("Memory failure:", e); }
 }
 
 // ─── GENERATE AND SEND ────────────────────────────────────────────────────────
 
-async function generateAndSend({
-  message, history, chatSummary, facts,
-  isMentioned, aiClient, activity,
-  decisionTarget = '', decisionReason = 'directly addressed',
-}: {
+async function generateAndSend({ message, history, chatSummary, facts, isMentioned, aiClient, activity, decisionTarget = '', decisionReason = 'directly addressed' }: {
   message: any;
   history: string;
   chatSummary: string;
   facts: any;
   isMentioned: boolean;
   aiClient: any;
-  activity: ChannelActivity;
+  activity: any;
   decisionTarget?: string;
   decisionReason?: string;
-}): Promise<void> {
-  const senderName = message.member?.displayName || message.author.username;
-
+}) {
   const finalPrompt = `${SYSTEM_PROMPT}
 
 ---
@@ -710,7 +465,7 @@ ${facts.bondCtx}
 
 [Your Memory]:
 - nicknames you use for them: ${facts.nicks.join(', ') || 'none yet'}
-- what you know about ${senderName}: ${facts.profile.join(' | ') || 'just met them, no info yet'}
+- what you know about ${message.member?.displayName || message.author.username}: ${facts.profile.join(' | ') || 'just met them, no info yet'}
 - server inside jokes: ${facts.jokes.join(', ') || 'none yet'}
 - use this to personalize naturally. never force it.
 - mood: ${facts.intent}
@@ -719,10 +474,10 @@ ${facts.bondCtx}
 ${history}
 
 [Current Focus — the specific message you are replying to]:
-${decisionTarget || `${senderName}: "${message.content}"`}
+${decisionTarget || `${message.member?.displayName || message.author.username}: "${message.content}"`}
 
 [Why you're replying]: ${decisionReason}
-[Latest message for context]: ${senderName}: "${message.content}"
+[Latest message for context]: ${message.member?.displayName || message.author.username}: "${message.content}"
 
 Output your reply + DATA block:`;
 
@@ -737,43 +492,52 @@ Output your reply + DATA block:`;
 
   if (!visibleText && !intel?.reaction) return;
 
-  if (intel?.mood_after) botMood.set(message.guildId!, intel.mood_after);
+  if (intel?.mood_after) {
+    botMood.set(message.guildId!, intel.mood_after);
+  }
 
   if (intel?.break_needed) {
-    channelMutedUntil.set(message.channelId, Date.now() + 600_000);
+    channelMutedUntil.set(message.channelId, Date.now() + 600000);
     activity.activeUntil = 0;
     botClient?.user?.setPresence({ status: 'dnd' });
   } else if (intel?.stay_active) {
-    activity.activeUntil = Date.now() + 120_000;
+    activity.activeUntil = Date.now() + 120000;
   }
 
   activity.lastRepliedAt = Date.now();
   channelActivity.set(message.channelId, activity);
   botClient?.user?.setPresence({ status: 'online' });
 
-  const shouldReact   = Math.random() < 0.08;
-  const textHasEmoji  = /\p{Emoji}/u.test(visibleText || '');
+  const shouldReact = Math.random() < 0.08;
+  const textHasEmoji = /\p{Emoji}/u.test(visibleText || '');
 
-  // React-only mode (for short filler messages)
+  // ── React only mode — for short filler messages ──
   if (intel?.react_only && intel?.reaction) {
     if (shouldReact) {
-      try { await message.react(intel.reaction); } catch (e) { console.error('[React]', e); }
+      try {
+        await message.react(intel.reaction);
+      } catch (e) { console.error("Reaction failed:", e); }
     }
-    await updateMemory(message.guildId!, message.author.id, senderName, message.content, '', intel);
+    const displayName = message.member?.displayName || message.author.username;
+    await updateMemory(message.guildId!, message.author.id, displayName, message.content, '', intel);
     return;
   }
 
-  // React + reply
+  // ── React + reply — skip reaction if text already has an emoji ──
   if (intel?.reaction && !intel?.react_only && shouldReact && !textHasEmoji) {
-    try { await message.react(intel.reaction); } catch (e) { console.error('[React]', e); }
+    try {
+      await message.react(intel.reaction);
+    } catch (e) { console.error("Reaction failed:", e); }
   }
 
   if (!visibleText) return;
 
-  if ('sendTyping' in message.channel) await (message.channel as any).sendTyping();
+  if ('sendTyping' in message.channel) {
+    await (message.channel as any).sendTyping();
+  }
 
   const finalResponse = visibleText.trim();
-  const delay = 600 + finalResponse.length * 15;
+  const delay = 600 + (finalResponse.length * 15);
 
   setTimeout(async () => {
     const useReply = isMentioned || Math.random() < 0.2;
@@ -782,13 +546,14 @@ Output your reply + DATA block:`;
     } else {
       await (message.channel as any).send(finalResponse);
     }
-    await updateMemory(message.guildId!, message.author.id, senderName, message.content, finalResponse, intel);
+    const displayName = message.member?.displayName || message.author.username;
+    await updateMemory(message.guildId!, message.author.id, displayName, message.content, finalResponse, intel);
   }, delay);
 }
 
 // ─── BOT ENTRY ────────────────────────────────────────────────────────────────
 
-export async function startBot(token: string): Promise<void> {
+export async function startBot(token: string) {
   if (botClient) return;
 
   botClient = new Client({
@@ -802,246 +567,224 @@ export async function startBot(token: string): Promise<void> {
     partials: [Partials.Message, Partials.Channel],
   });
 
-  // ── Ready ────────────────────────────────────────────────────────────────
   botClient.on(Events.ClientReady, () => {
-    console.log('[ChaosBot] Online.');
+    console.log(`ChaosBot is live.`);
     botClient?.user?.setPresence({ status: 'dnd' });
     setupSelfActivityLoop();
-    setupBondDecayLoop();
   });
 
-  // ── Messages ─────────────────────────────────────────────────────────────
   botClient.on(Events.MessageCreate, async (message: Message) => {
     if (message.author.bot || !message.guildId) return;
 
-    // ────────────────────────────────────────────────────────────────────────
-    // ADMIN COMMANDS  (!chaos <sub> ...)
-    // ────────────────────────────────────────────────────────────────────────
+    // ── Admin commands ──
     if (message.content.startsWith('!chaos') && message.member?.permissions.has('Administrator')) {
-      const parts = message.content.trim().split(/\s+/);
-      const sub   = parts[1]?.toLowerCase();
+      const args = message.content.split(' ');
+      const sub = args[1];
 
-      // !chaos pause
       if (sub === 'pause') {
         guildPaused.add(message.guildId);
         botClient?.user?.setPresence({ status: 'invisible' });
-        return message.reply('aight im muting myself. see ya later.');
+        return message.reply("aight im muting myself. see ya later.");
       }
-
-      // !chaos resume
       if (sub === 'resume') {
         guildPaused.delete(message.guildId);
         botClient?.user?.setPresence({ status: 'dnd' });
-        return message.reply("im back. don't make me regret it.");
+        return message.reply("im back. dont make me regret it.");
       }
-
-      // !chaos status
       if (sub === 'status') {
-        const state     = guildPaused.has(message.guildId) ? 'paused' : 'active';
+        const state = guildPaused.has(message.guildId) ? "muted" : "active";
         const saChannel = guildSelfActivityChannel.get(message.guildId);
         return message.reply(`state: ${state} | model: ${MODEL_NAME} | sa: ${saChannel ? `<#${saChannel}>` : 'auto'}`);
       }
-
-      // !chaos memory
       if (sub === 'memory') {
         const sCtx = await getServerContext(message.guildId);
-        return message.reply(
-          `jokes: ${JSON.stringify(sCtx?.insideJokes || [])} | intent: ${sCtx?.currentIntent || 'none'}`
-        );
+        return message.reply(`jokes: ${JSON.stringify(sCtx?.insideJokes || [])} | intent: ${sCtx?.currentIntent || 'none'}`);
       }
-
-      // !chaos sa [#channel]  — pin or clear self-activity channel
+      if (sub === 'reset' && message.mentions.users.first()) {
+        const target = message.mentions.users.first()!;
+        await db.collection('servers').doc(message.guildId).collection('users').doc(target.id).set({ nicknames: [], profile: [] }, { merge: true });
+        return message.reply(`memory wiped for <@${target.id}>. who even is that?`);
+      }
+      // !chaos bond @user — show bond score
+      if (sub === 'bond' && message.mentions.users.first()) {
+        const target = message.mentions.users.first()!;
+        const score = await getBondScore(message.guildId, target.id);
+        const tier = bondTier(score);
+        return message.reply(`bond with <@${target.id}>: ${score}/100 — tier: ${tier}`);
+      }
+      // !chaos bondreset @user — reset bond to 50
+      if (sub === 'bondreset' && message.mentions.users.first()) {
+        const target = message.mentions.users.first()!;
+        await db.collection('servers').doc(message.guildId).collection('users').doc(target.id).set(
+          { bondScore: 50 }, { merge: true }
+        );
+        return message.reply(`bond reset for <@${target.id}>. back to 50. fresh start.`);
+      }
+      // !chaos bondset @user <number> — set bond to exact number
+      if (sub === 'bondset' && message.mentions.users.first()) {
+        const target = message.mentions.users.first()!;
+        const val = parseInt(args[3]);
+        if (isNaN(val) || val < 0 || val > 100) return message.reply('usage: !chaos bondset @user <0-100>');
+        await db.collection('servers').doc(message.guildId).collection('users').doc(target.id).set(
+          { bondScore: val, bondLocked: false, bondUpdatedAt: new Date().toISOString() }, { merge: true }
+        );
+        return message.reply(`bond for <@${target.id}> set to ${val}. tier: ${bondTier(val)}.`);
+      }
+      // !chaos bondlock @user — lock bond score so it never auto-changes
+      if (sub === 'bondlock' && message.mentions.users.first()) {
+        const target = message.mentions.users.first()!;
+        const current = await getBondScore(message.guildId, target.id);
+        await db.collection('servers').doc(message.guildId).collection('users').doc(target.id).set(
+          { bondLocked: true, bondUpdatedAt: new Date().toISOString() }, { merge: true }
+        );
+        return message.reply(`bond for <@${target.id}> locked at ${current}. won't change automatically.`);
+      }
+      // !chaos bondunlock @user — unlock bond score
+      if (sub === 'bondunlock' && message.mentions.users.first()) {
+        const target = message.mentions.users.first()!;
+        await db.collection('servers').doc(message.guildId).collection('users').doc(target.id).set(
+          { bondLocked: false }, { merge: true }
+        );
+        return message.reply(`bond for <@${target.id}> unlocked. feelings can flow again.`);
+      }
+      // !chaos sa #channel — pin self-activity channel, or clear it
       if (sub === 'sa') {
         const mentioned = message.mentions.channels.first();
         if (mentioned) {
           guildSelfActivityChannel.set(message.guildId, mentioned.id);
-          return message.reply(`sa channel pinned to <#${mentioned.id}>.`);
+          return message.reply(`sa channel set to <#${mentioned.id}>`);
         }
         guildSelfActivityChannel.delete(message.guildId);
-        return message.reply('sa channel cleared. back to auto.');
-      }
-
-      // !chaos reset @user  — wipe memory
-      if (sub === 'reset' && message.mentions.users.first()) {
-        const target = message.mentions.users.first()!;
-        await db.collection('servers').doc(message.guildId)
-          .collection('users').doc(target.id)
-          .set({ nicknames: [], profile: [] }, { merge: true });
-        return message.reply(`memory wiped for <@${target.id}>. who even is that?`);
-      }
-
-      // !chaos bond @user  — show bond score + visual bar
-      if (sub === 'bond' && message.mentions.users.first()) {
-        const target = message.mentions.users.first()!;
-        const entry  = await getBondEntry(message.guildId, target.id);
-        const bar    = bondProgressBar(entry.score);
-        const lock   = entry.permanent ? '  🔒 **LOCKED**' : '';
-        return message.reply(
-          `bond with <@${target.id}>:\n\`${bar}\` **${entry.score}/100** — ${entry.tier.toUpperCase()}${lock}`
-        );
-      }
-
-      // !chaos bondreset @user  — reset bond to 50 (removes lock too)
-      if (sub === 'bondreset' && message.mentions.users.first()) {
-        const target = message.mentions.users.first()!;
-        await adminSetBond(message.guildId, target.id, 50, false);
-        return message.reply(`bond reset for <@${target.id}>. back to 50. fresh start.`);
-      }
-
-      // !chaos setbond @user <0-100> [perm]
-      //   perm = permanently lock — AI cannot shift this bond
-      //   omit perm = leaves existing lock state unchanged
-      if (sub === 'setbond' && message.mentions.users.first()) {
-        const target   = message.mentions.users.first()!;
-        const scoreRaw = parseInt(parts[3]);
-        const isPerm   = parts[4]?.toLowerCase() === 'perm';
-
-        if (isNaN(scoreRaw) || scoreRaw < 0 || scoreRaw > 100) {
-          return message.reply('usage: `!chaos setbond @user <0-100> [perm]`\nexample: `!chaos setbond @Tigermask 90 perm`');
-        }
-
-        const entry = await adminSetBond(message.guildId, target.id, scoreRaw, isPerm || undefined);
-        const bar   = bondProgressBar(entry.score);
-        const lock  = entry.permanent ? '  🔒 **permanent lock applied** — AI cannot shift this.' : '';
-        return message.reply(
-          `bond for <@${target.id}> set to:\n\`${bar}\` **${entry.score}/100** — ${entry.tier.toUpperCase()}${lock}`
-        );
-      }
-
-      // !chaos unbondlock @user  — remove permanent lock, let AI shift bond again
-      if (sub === 'unbondlock' && message.mentions.users.first()) {
-        const target = message.mentions.users.first()!;
-        await unlockBond(message.guildId, target.id);
-        const entry = await getBondEntry(message.guildId, target.id);
-        return message.reply(
-          `bond lock removed for <@${target.id}>. currently at **${entry.score}/100** (${entry.tier}). AI can shift it again.`
-        );
-      }
-
-      // !chaos help  — list all admin commands
-      if (sub === 'help') {
-        return message.reply([
-          '**ChaosBot Admin Commands**',
-          '`!chaos pause` — go silent',
-          '`!chaos resume` — come back',
-          '`!chaos status` — show state',
-          '`!chaos memory` — show server memory',
-          '`!chaos sa [#channel]` — pin or clear self-activity channel',
-          '`!chaos reset @user` — wipe a user\'s memory',
-          '`!chaos bond @user` — show bond score',
-          '`!chaos bondreset @user` — reset bond to 50',
-          '`!chaos setbond @user <0-100> [perm]` — set bond; add `perm` to lock it permanently',
-          '`!chaos unbondlock @user` — remove permanent lock',
-        ].join('\n'));
+        return message.reply("sa channel cleared. back to auto.");
       }
     }
 
     if (guildPaused.has(message.guildId)) return;
 
-    const botId      = botClient!.user!.id;
-    const isMentioned = message.mentions.has(botId);
-    const now        = Date.now();
+    const botId = botClient!.user!.id;
+    const contentLowerForMention = message.content.toLowerCase();
+    const namedDirectly = BOT_KNOWN_NAMES.some(n => contentLowerForMention.includes(n));
+    const isMentioned = message.mentions.has(botId) || namedDirectly;
+    const now = Date.now();
 
-    // Track responses to self-activity messages
-    const saState = selfActivityState.get(message.channelId);
-    if (saState && !message.author.bot && saState.lastResponseAt <= saState.lastFiredAt) {
-      saState.lastResponseAt = now;
+    // ── Aggregation Window (Debounce) ──
+    // If mentioned, we respond faster, but still wait for the "burst" to conclude.
+    const windowTime = isMentioned ? 1000 : DEBOUNCE_WINDOW_MS;
+
+    if (pendingTriggers.has(message.channelId)) {
+      clearTimeout(pendingTriggers.get(message.channelId));
     }
-
-    // ── Debounce / aggregation window ─────────────────────────────────────
-    const windowTime = isMentioned ? 1_000 : DEBOUNCE_WINDOW_MS;
-    if (pendingTriggers.has(message.channelId)) clearTimeout(pendingTriggers.get(message.channelId));
 
     const trigger = setTimeout(async () => {
       pendingTriggers.delete(message.channelId);
-
+      
       const activity = channelActivity.get(message.channelId) || { count: 0, lastReset: now, lastRepliedAt: 0 };
-
+      
+      // Cooldown check
       if (!isMentioned && now - activity.lastRepliedAt < REPLY_COOLDOWN_MS) return;
 
       const mutedUntil = channelMutedUntil.get(message.channelId);
       if (mutedUntil && now < mutedUntil) return;
 
-      if (now - activity.lastReset > 300_000) { activity.count = 0; activity.lastReset = now; }
+      if (now - activity.lastReset > 300000) {
+        activity.count = 0;
+        activity.lastReset = now;
+      }
 
-      // ── Fetch history ──────────────────────────────────────────────────
+      // ── Fetch context ──
       const recentMsgs = await message.channel.messages.fetch({ limit: 20 });
-      const msgsArray  = [...recentMsgs.values()].reverse();
+      const msgsArray = [...recentMsgs.values()].reverse(); // oldest → newest
 
-      const history = msgsArray.map((m: any, idx: number) => {
-        const isBot      = m.author.id === botId;
-        const name       = isBot ? 'ME' : (m.member?.displayName || m.author.username);
+      const history = msgsArray
+        .map((m: any, idx: number) => {
+          const isBot = m.author.id === botId;
+          const name = isBot ? 'ME' : (m.member?.displayName || m.author.username);
 
-        const mentionedNames: string[] = m.mentions.users.map((u: any) => {
-          if (u.id === botId) return 'ME(bot)';
-          const member = m.guild?.members.cache.get(u.id);
-          return member?.displayName || u.username;
-        });
+          // Direct ping metadata
+          const mentionedNames: string[] = m.mentions.users.map((u: any) => {
+            if (u.id === botId) return 'ME(bot)';
+            const member = m.guild?.members.cache.get(u.id);
+            return member?.displayName || u.username;
+          });
 
-        const replyingTo  = m.reference?.messageId ? recentMsgs.get(m.reference.messageId) : null;
-        const replyTag    = replyingTo ? ` [replying to ${replyingTo.author.id === botId ? 'ME(bot)' : (replyingTo.member?.displayName || replyingTo.author.username)}]` : '';
-        const pingTag     = mentionedNames.length > 0 ? ` [pinged: ${mentionedNames.join(', ')}]` : '';
+          // Reply chain metadata
+          const replyingTo = m.reference?.messageId
+            ? recentMsgs.get(m.reference.messageId)
+            : null;
+          const replyTag = replyingTo
+            ? ` [replying to ${replyingTo.author.id === botId ? 'ME(bot)' : (replyingTo.member?.displayName || replyingTo.author.username)}]`
+            : '';
+          const pingTag = mentionedNames.length > 0 ? ` [pinged: ${mentionedNames.join(', ')}]` : '';
 
-        const prevMsg  = idx > 0 ? msgsArray[idx - 1] : null;
-        const nextMsg  = idx < msgsArray.length - 1 ? msgsArray[idx + 1] : null;
-        const prevName = prevMsg ? (prevMsg.author.id === botId ? 'ME' : (prevMsg.member?.displayName || prevMsg.author.username)) : null;
-        const nextName = nextMsg ? (nextMsg.author.id === botId ? 'ME' : (nextMsg.member?.displayName || nextMsg.author.username)) : null;
-        const ctxTag   = (prevName || nextName) ? ` [ctx: prev=${prevName || '-'} next=${nextName || '-'}]` : '';
+          // Contextual speaker tags — who is around this message
+          const prevMsg = idx > 0 ? msgsArray[idx - 1] : null;
+          const nextMsg = idx < msgsArray.length - 1 ? msgsArray[idx + 1] : null;
+          const prevName = prevMsg
+            ? (prevMsg.author.id === botId ? 'ME' : (prevMsg.member?.displayName || prevMsg.author.username))
+            : null;
+          const nextName = nextMsg
+            ? (nextMsg.author.id === botId ? 'ME' : (nextMsg.member?.displayName || nextMsg.author.username))
+            : null;
+          const contextTag = (prevName || nextName)
+            ? ` [ctx: prev=${prevName || '-'} next=${nextName || '-'}]`
+            : '';
 
-        return `${name}${replyTag}${pingTag}${ctxTag}: ${m.content}`;
-      }).join('\n');
+          return `${name}${replyTag}${pingTag}${contextTag}: ${m.content}`;
+        })
+        .join('\n');
 
-      // ── Fetch context ──────────────────────────────────────────────────
-      const serverCtx   = await getServerContext(message.guildId!);
+      const serverCtx = await getServerContext(message.guildId!);
       const chatSummary = await getOrUpdateSummary(message.guildId!, history);
-      const userCtx     = await getUserContext(message.guildId!, message.author.id);
-      const aiClient    = await getOrInitAI();
+      const userCtx = await getUserContext(message.guildId!, message.author.id);
+      const aiClient = await getOrInitAI();
       if (!aiClient) return;
 
-      const currentMood  = botMood.get(message.guildId!) || 'chill';
-      const senderName   = message.member?.displayName || message.author.username;
-      const bondEntry    = await getBondEntry(message.guildId!, message.author.id);
-
+      const currentMood = botMood.get(message.guildId!) || 'chill';
+      const senderName = message.member?.displayName || message.author.username;
+      const bondScore = await getBondScore(message.guildId!, message.author.id);
       const facts = {
-        jokes:    (serverCtx?.insideJokes || []).slice(-5),
-        intent:   serverCtx?.currentIntent || 'chill',
-        nicks:    (userCtx?.nicknames || []).slice(-3),
-        profile:  (userCtx?.profile || []).slice(-10),
-        mood:     currentMood,
-        bondScore: bondEntry.score,
-        bondCtx:  bondContext(bondEntry.score),
+        jokes: (serverCtx?.insideJokes || []).slice(-5),
+        intent: serverCtx?.currentIntent || 'chill',
+        nicks: (userCtx?.nicknames || []).slice(-3),
+        profile: (userCtx?.profile || []).slice(-10),
+        mood: currentMood,
+        bondScore,
+        bondCtx: bondContext(bondScore),
       };
 
-      console.log(`[Bond] ${senderName}: ${bondEntry.score}/100 (${bondEntry.tier}${bondEntry.permanent ? ', locked' : ''})`);
+      console.log(`[Server Summary]: ${chatSummary || 'none yet'}`);
+      console.log(`[User Knowledge - ${senderName}]: ${facts.profile.join(' | ') || 'none yet'}`);
+      console.log(`[Bond - ${senderName}]: ${facts.bondScore}/100 (${bondTier(facts.bondScore)})`);
 
-      // Maybe greet a returning homie
+      // ── Maybe greet returning homie ──
       await maybeGreetUser(message.guildId!, message.author.id, senderName, message.channel);
 
-      // ── Withdrawn mode check ───────────────────────────────────────────
+      // ── Withdrawn mode check ──
       const withdrawnUntil = channelMutedUntil.get(`withdrawn:${message.channelId}`);
-      const isWithdrawn    = !!(withdrawnUntil && now < withdrawnUntil);
-
+      const isWithdrawn = !!(withdrawnUntil && now < withdrawnUntil);
       if (isWithdrawn) {
-        const cleanMsg   = message.content.replace(/<@!?\d+>/g, '').trim();
+        // Only break withdrawn if directly pinged with real content
+        const cleanMsg = message.content.replace(/<@!?\d+>/g, '').trim();
         const isRealPing = isMentioned && cleanMsg.length > 3;
         if (!isRealPing) {
-          console.log('[Withdrawn] Skipping — not re-invited yet.');
+          console.log(`[Skip] Withdrawn mode active until ${new Date(withdrawnUntil!).toISOString()}`);
           return;
         }
         channelMutedUntil.delete(`withdrawn:${message.channelId}`);
-        console.log('[Withdrawn] Re-invited, clearing withdrawn mode.');
+        console.log(`[Withdrawn] Re-invited, clearing withdrawn mode`);
       }
 
-      // ── Decision prompt ────────────────────────────────────────────────
-      const withdrawnCtx = isWithdrawn
-        ? `[Mode]: WITHDRAWN — bot was told to back off recently. only engage if clearly re-invited.`
+      // ── Single Decision Call — handles everything ──
+      const withdrawnContext = isWithdrawn
+        ? `[Mode]: WITHDRAWN — someone told bot to back off recently. higher skip chance. only engage if clearly invited back.`
         : `[Mode]: NORMAL`;
 
       const decisionPrompt = `you are ChaosBot deciding what to do with this discord message.
 
-${withdrawnCtx}
+${withdrawnContext}
 [Bot Mood]: ${facts.mood}
-[Bot Username in history]: "ME" (marked as ME, also "ME(bot)" in ping lists)
+${BOT_IDENTITY_BLOCK}
+[Bot Username in history]: "ME" (marked as ME in history, also tagged as "ME(bot)" in ping lists)
 [Server Summary]: ${chatSummary || 'none yet'}
 [User Knowledge - ${senderName}]: ${facts.profile.join(' | ') || 'none yet'}
 ${facts.bondCtx}
@@ -1051,32 +794,65 @@ ${history}
 
 [Triggering Message]:
 ${senderName}: "${message.content}"
-[Was bot directly @mentioned?]: ${isMentioned ? 'YES' : 'NO'}
+[Was bot directly @mentioned in this message?]: ${isMentioned ? 'YES' : 'NO'}
 
 ---
-## STEP 1 — TARGETING ANALYSIS
+## STEP 1 — TARGETING ANALYSIS (do this first, silently)
 
-Read the history metadata carefully:
-- [replying to X] = direct reply to person X
-- [pinged: X] = explicit @mention of X
-- [ctx: prev=X next=Y] = speaker context
+Read the history carefully. Each message line includes rich metadata:
+- [replying to X] — this message is a direct reply to person X
+- [pinged: X] — this message explicitly @mentioned person X
+- [ctx: prev=X next=Y] — who spoke immediately before and after this message
 
-Map who is talking to whom. Is the bot part of this? Or two users in their own thread?
+Use ALL of this to map who is talking to whom:
+1. Who sent the triggering message?
+2. Does it [ping] or [reply to] anyone? If so, who — is it ME(bot), or another user?
+3. If no explicit ping/reply: look at [ctx] tags — is this part of an ongoing exchange between two specific users based on the surrounding messages?
+4. Look back 3-5 messages: has this sender been consistently replying to or pinging a specific non-bot user? If yes, they are in a private thread — bot should SKIP.
+5. Is there an ongoing 2-person thread that doesn't include the bot? If yes, bot should SKIP.
+6. Is there any ambiguity about whether the triggering message could be directed at the bot? If yes, consider the last person the sender interacted with — was it the bot?
 
 ## STEP 2 — DECIDE
 
 Output ONLY this JSON (no explanation, no markdown):
 {
   "action": "REPLY" | "SKIP" | "WITHDRAW",
-  "target_msg": "exact message line you'd reply to, or empty",
-  "reason": "one line",
+  "target_msg": "the exact message line from history you would reply to, or empty",
+  "reason": "one line explanation",
   "predicted_audience": "bot" | "user:NAME" | "group" | "unknown",
-  "targeting_analysis": "1-2 sentences"
+  "targeting_analysis": "1-2 sentences: who is talking to who, and why you concluded that"
 }
 
-REPLY when: bot is @mentioned with real content, someone replied to bot, open question to chat, people talking ABOUT the bot, clear comedic opening.
-SKIP when: message is for someone else ([replying to X] / [pinged: X] where X ≠ bot), filler reaction with no bot mention, two people clearly in their own thread, bot already replied recently with no engagement.
-WITHDRAW when: someone tells bot to stop / "not you" / "not talking to you" (only if clearly aimed at the bot).`;
+## DECISION RULES
+
+REPLY when:
+- bot is directly @mentioned with real content (not just a filler reaction like "lol", "fr", "ok", "yeah", "💀")
+- someone replied to a bot message with actual engagement
+- a question was asked open to the whole chat and bot has something good to add
+- people are talking ABOUT the bot (mocking it, testing it, talking about something it said)
+- a message has clear comedic or conversational opening that fits the bot's personality
+
+SKIP when:
+- [replying to X] or [pinged: X] where X is NOT the bot — it's for someone else, stay out
+- two people are clearly in their own exchange with no room for bot
+- triggering message is a short filler reaction (fr, lol, ok, yeah, same, bro, facts, cap, 💀, gng, "going to sleep", "gn") — UNLESS it directly mentions the bot
+- bot already replied recently and nobody is actively engaging back
+- jumping in would feel forced, desperate, or annoying
+
+WITHDRAW when:
+- someone says "stop", "shut up", "not you", "i'm not talking to you", "i didn't ask you/the bot", directed at the bot
+- only WITHDRAW if it is clearly aimed at the bot, not just general frustration between users
+
+## KEY EXAMPLE (from real logs)
+History showed:
+  manipulate: gng [going to sleep, no ping]
+  ME: [bot replied with a quip]
+  manipulate: time to sleep [still no ping, talking to herself/group]
+  ME: [bot replied AGAIN — this was wrong, nobody was talking to the bot]
+  REVOLUTION: notabot stop [told the bot to stop]
+
+Correct behavior: After "gng" with no bot ping, SKIP. Don't keep replying into a void.`;
+
 
       try {
         const decisionResp = await aiClient.models.generateContent({
@@ -1087,31 +863,35 @@ WITHDRAW when: someone tells bot to stop / "not you" / "not talking to you" (onl
 
         const decisionRaw = (decisionResp.text || '').trim().replace(/```json|```/g, '').trim();
         let parsed: any = {};
-        try {
-          parsed = JSON.parse(decisionRaw);
-        } catch {
+        try { parsed = JSON.parse(decisionRaw); } catch {
+          // fallback: check if raw text starts with SKIP
           const upper = decisionRaw.toUpperCase();
           parsed.action = upper.includes('REPLY') ? 'REPLY' : upper.includes('WITHDRAW') ? 'WITHDRAW' : 'SKIP';
         }
 
         const action = (parsed.action || 'SKIP').toUpperCase();
-        console.log(`[Decision] action=${action} | audience=${parsed.predicted_audience || '?'} | reason=${parsed.reason || ''}`);
-        if (parsed.targeting_analysis) console.log(`[Targeting] ${parsed.targeting_analysis}`);
+        console.log(`[Decision]: action=${action} | target="${parsed.target_msg?.slice(0, 60) || ''}" | audience=${parsed.predicted_audience || '?'} | reason=${parsed.reason || ''}`);
+        if (parsed.targeting_analysis) {
+          console.log(`[Targeting]: ${parsed.targeting_analysis}`);
+        }
 
-        // ── WITHDRAW ────────────────────────────────────────────────────
+        // ── WITHDRAW — bot says what it feels like then goes quiet ──
         if (action === 'WITHDRAW') {
-          channelMutedUntil.set(`withdrawn:${message.channelId}`, now + 300_000);
+          console.log(`[Withdrawn] Entering withdrawn mode for 5 mins`);
+          channelMutedUntil.set(`withdrawn:${message.channelId}`, now + 300000);
           botMood.set(message.guildId!, 'withdrawn');
 
           const withdrawPrompt = `${SYSTEM_PROMPT}
 
-someone just told you to back off or excluded you from the convo.
-say whatever feels right — could be "aight", "my bad", "didn't ask me either", or just meh energy.
-1 sentence MAX. lowercase. no DATA block.
+someone just told you to back off or said "not you" or excluded you from the convo.
+say whatever feels right in that moment — maybe you're unbothered, maybe slightly salty, maybe just meh.
+could be "aight" or "my bad" or "didn't ask me either" or just nothing dramatic.
+1 sentence max. lowercase. no DATA block.
 
 [Recent Chat]:
 ${history}
-[Triggering message]: ${senderName}: "${message.content}"`;
+[Message that triggered this]:
+${senderName}: "${message.content}"`;
 
           try {
             const resp = await aiClient.models.generateContent({
@@ -1121,15 +901,13 @@ ${history}
             });
             const text = (resp.text || 'aight').replace(/DATA:[\s\S]*$/i, '').trim();
             await (message.channel as any).send(text);
-          } catch {
-            await (message.channel as any).send('aight');
-          }
+          } catch { await (message.channel as any).send('aight'); }
           return;
         }
 
         if (action !== 'REPLY') return;
 
-        // ── REPLY ────────────────────────────────────────────────────────
+        // ── REPLY ──
         let decisionTarget = parsed.target_msg || `${senderName}: "${message.content}"`;
         if (decisionTarget.trimStart().startsWith('ME:')) {
           decisionTarget = `${senderName}: "${message.content}"`;
@@ -1137,9 +915,9 @@ ${history}
 
         // Duplicate reply guard
         const channelReplied = recentlyRepliedTargets.get(message.channelId) || new Set<string>();
-        const targetKey      = decisionTarget.slice(0, 80);
+        const targetKey = decisionTarget.slice(0, 80);
         if (channelReplied.has(targetKey)) {
-          console.log(`[Skip] Already replied to this target: ${targetKey}`);
+          console.log(`[Skip] Already replied to this target recently: ${targetKey}`);
           return;
         }
         channelReplied.add(targetKey);
@@ -1147,18 +925,14 @@ ${history}
         recentlyRepliedTargets.set(message.channelId, channelReplied);
 
         if (isMentioned) {
-          activity.activeUntil = now + 120_000;
+          activity.activeUntil = now + 120000;
+          activity.session = undefined;
         }
 
-        await generateAndSend({
-          message, history, chatSummary, facts, isMentioned,
-          aiClient, activity, decisionTarget,
-          decisionReason: parsed.reason || 'engaged',
-        });
+        await generateAndSend({ message, history, chatSummary, facts, isMentioned, aiClient, activity, decisionTarget, decisionReason: parsed.reason || 'engaged' });
 
-      } catch (e) {
-        console.error('[Decision] Error:', e);
-      }
+      } catch (e) { console.error("Decision fail:", e); }
+
     }, windowTime);
 
     pendingTriggers.set(message.channelId, trigger);
@@ -1167,14 +941,13 @@ ${history}
   await botClient.login(token);
 }
 
+
 // ─── EXPORTS ──────────────────────────────────────────────────────────────────
 
-export function stopBot(): void {
-  if (selfActivityTimer) { clearInterval(selfActivityTimer); selfActivityTimer = null; }
-  if (bondDecayTimer)    { clearInterval(bondDecayTimer);    bondDecayTimer    = null; }
-  if (botClient)         { botClient.destroy(); botClient = null; }
+export function stopBot() {
+  if (botClient) { botClient.destroy(); botClient = null; }
 }
 
-export function getBotStatus(): 'running' | 'stopped' {
+export function getBotStatus() {
   return botClient ? 'running' : 'stopped';
 }
