@@ -8,7 +8,10 @@ let ai: GoogleGenAI | null = null;
 
 // ─── PROMPTS ──────────────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `you are ChaosBot. a real member of this discord server, not an AI. you have a personality, moods, and feelings. you are NOT an assistant.
+const SYSTEM_PROMPT = `you are NotABot. a real member of this discord server, not an AI. you have a personality, moods, and feelings. you are NOT an assistant.
+
+--- YOUR IDENTITY ---
+your name in this server is "NotABot". your discord ID is 1444327543648817152. when people @mention you, it shows as <@1444327543648817152> in the raw message. both "NotABot" and that mention refer to YOU. in conversation history you appear as "ME". if someone says "not a bot" or types your @mention, they are talking to or about you. never be confused about this.
 
 --- WHO YOU ARE ---
 you are a gamer, lowkey chaotic, usually unbothered. you have a dry sense of humor. you can be warm with people you vibe with. you are NOT always in troll mode — that gets old fast. you know when to chill.
@@ -304,46 +307,7 @@ function randomSAInterval(): number {
 
 // ─── AI ───────────────────────────────────────────────────────────────────────
 
-// NOTE: These are Google AI Studio model IDs used with @google/genai SDK.
-// The "google/" prefix is OpenRouter syntax — do NOT use it here.
-const DECISION_MODEL   = 'gemma-4-31b-it';      // dense 31B — for should-I-reply logic
-const GENERATION_MODEL = 'gemma-4-26b-a4b-it';  // MoE 26B  — for all visible text output
-const FALLBACK_MODEL   = 'gemma-3-27b-it';       // original  — fallback if either primary fails
-
-// Bot identity — lets the AI unambiguously know who "ME" is in chat history
-const BOT_DISCORD_ID = '1444327543648817152';
-const BOT_MENTION    = `<@${BOT_DISCORD_ID}>`;
-
-/**
- * Single AI call entry-point with automatic fallback.
- * 'decision' → DECISION_MODEL (31B, best for targeting analysis)
- * 'generation' → GENERATION_MODEL (26B MoE, best for replies/text)
- * Either falls back to FALLBACK_MODEL on any error.
- */
-async function callAI(
-  aiClient: GoogleGenAI,
-  role: 'decision' | 'generation',
-  prompt: string,
-  temperature: number,
-): Promise<string> {
-  const primary = role === 'decision' ? DECISION_MODEL : GENERATION_MODEL;
-  try {
-    const r = await aiClient.models.generateContent({
-      model: primary,
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config: { temperature },
-    });
-    return r.text || '';
-  } catch (err) {
-    console.warn(`[AI] ${primary} failed, falling back to ${FALLBACK_MODEL}:`, (err as any)?.message ?? err);
-    const r = await aiClient.models.generateContent({
-      model: FALLBACK_MODEL,
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config: { temperature },
-    });
-    return r.text || '';
-  }
-}
+const MODEL_NAME = 'gemma-3-27b-it';
 
 async function getOrInitAI(): Promise<GoogleGenAI | null> {
   if (!ai) {
@@ -488,9 +452,16 @@ Drop something into the chat. It can be:
 1-2 sentences MAX. lowercase. no AI energy. output your message + DATA block.`;
 
   try {
-    const raw = await callAI(aiClient, 'generation', saPrompt, 1.15);
+    const aiResponse = await aiClient.models.generateContent({
+      model: MODEL_NAME,
+      contents: [{ role: 'user', parts: [{ text: saPrompt }] }],
+      config: { temperature: 1.15 },
+    });
+
+    const raw = aiResponse.text || '';
     const { visibleText } = extractDataBlock(raw);
     if (!visibleText) return;
+
     botClient?.user?.setPresence({ status: 'online' });
     await channel.send(visibleText);
 
@@ -522,7 +493,12 @@ options:
 1 sentence MAX. lowercase. don't try hard.`;
 
       try {
-        const fRaw = await callAI(aiClient, 'generation', followupPrompt, 1.1);
+        const fResp = await aiClient.models.generateContent({
+          model: MODEL_NAME,
+          contents: [{ role: 'user', parts: [{ text: followupPrompt }] }],
+          config: { temperature: 1.1 },
+        });
+        const fRaw = fResp.text || '';
         const { visibleText: fText } = extractDataBlock(fRaw);
 
         if (fText && fText.length > 2) {
@@ -614,7 +590,13 @@ ${history}
 
 output only the summary. no headers or labels.`;
 
-    const summary = (await callAI(aiClient, 'generation', summaryPrompt, 0.5)).trim();
+    const resp = await aiClient.models.generateContent({
+      model: MODEL_NAME,
+      contents: [{ role: 'user', parts: [{ text: summaryPrompt }] }],
+      config: { temperature: 0.5 },
+    });
+
+    const summary = resp.text?.trim() || '';
     await db.collection('servers').doc(guildId).set({
       chatSummary: summary,
       msgCountSinceSummary: 0,
@@ -692,7 +674,12 @@ greet them like a friend — casual, real, low-key warm. maybe a question, maybe
 1 sentence max. use their @mention. lowercase. no DATA block.`;
 
   try {
-    const text = (await callAI(aiClient, 'generation', prompt, 1.1)).replace(/DATA:[\s\S]*$/i, '').trim();
+    const resp = await aiClient.models.generateContent({
+      model: MODEL_NAME,
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      config: { temperature: 1.1 },
+    });
+    const text = (resp.text || '').replace(/DATA:[\s\S]*$/i, '').trim();
     if (text) { await channel.send(text); return true; }
   } catch {}
   return false;
@@ -742,7 +729,13 @@ ${decisionTarget || `${senderName}: "${message.content}"`}
 
 Output your reply + DATA block:`;
 
-  const raw = await callAI(aiClient, 'generation', finalPrompt, 1.0);
+  const aiResponse = await aiClient.models.generateContent({
+    model: MODEL_NAME,
+    contents: [{ role: 'user', parts: [{ text: finalPrompt }] }],
+    config: { temperature: 1.0 },
+  });
+
+  const raw = aiResponse.text || '';
   const { visibleText, intel } = extractDataBlock(raw);
 
   if (!visibleText && !intel?.reaction) return;
@@ -814,7 +807,7 @@ export async function startBot(token: string): Promise<void> {
 
   // ── Ready ────────────────────────────────────────────────────────────────
   botClient.on(Events.ClientReady, () => {
-    console.log('[ChaosBot] Online.');
+    console.log('[NotABot] Online.');
     botClient?.user?.setPresence({ status: 'dnd' });
     setupSelfActivityLoop();
     setupBondDecayLoop();
@@ -849,7 +842,7 @@ export async function startBot(token: string): Promise<void> {
       if (sub === 'status') {
         const state     = guildPaused.has(message.guildId) ? 'paused' : 'active';
         const saChannel = guildSelfActivityChannel.get(message.guildId);
-        return message.reply(`state: ${state} | decision: ${DECISION_MODEL} | gen: ${GENERATION_MODEL} | fallback: ${FALLBACK_MODEL} | sa: ${saChannel ? `<#${saChannel}>` : 'auto'}`);
+        return message.reply(`state: ${state} | model: ${MODEL_NAME} | sa: ${saChannel ? `<#${saChannel}>` : 'auto'}`);
       }
 
       // !chaos memory
@@ -931,7 +924,7 @@ export async function startBot(token: string): Promise<void> {
       // !chaos help  — list all admin commands
       if (sub === 'help') {
         return message.reply([
-          '**ChaosBot Admin Commands**',
+          '**NotABot Admin Commands**',
           '`!chaos pause` — go silent',
           '`!chaos resume` — come back',
           '`!chaos status` — show state',
@@ -1047,12 +1040,11 @@ export async function startBot(token: string): Promise<void> {
         ? `[Mode]: WITHDRAWN — bot was told to back off recently. only engage if clearly re-invited.`
         : `[Mode]: NORMAL`;
 
-      const decisionPrompt = `you are ChaosBot deciding what to do with this discord message.
-[Bot Identity]: You are NotABot. Your Discord ID is ${BOT_DISCORD_ID}. In history you appear as "ME" or "ME(bot)". Any ping of ${BOT_MENTION} is directed AT YOU.
+      const decisionPrompt = `you are NotABot (discord ID: 1444327543648817152, mention: <@1444327543648817152>) deciding what to do with this discord message.
 
 ${withdrawnCtx}
 [Bot Mood]: ${facts.mood}
-[Bot Username in history]: "ME" (marked as ME, also "ME(bot)" in ping lists)
+[Bot Username in history]: "ME" — you are "NotABot" (ID: 1444327543648817152, mention: <@1444327543648817152>). both your name and mention refer to you.
 [Server Summary]: ${chatSummary || 'none yet'}
 [User Knowledge - ${senderName}]: ${facts.profile.join(' | ') || 'none yet'}
 ${facts.bondCtx}
@@ -1090,7 +1082,13 @@ SKIP when: message is for someone else ([replying to X] / [pinged: X] where X �
 WITHDRAW when: someone tells bot to stop / "not you" / "not talking to you" (only if clearly aimed at the bot).`;
 
       try {
-        const decisionRaw = (await callAI(aiClient, 'decision', decisionPrompt, 0.5)).trim().replace(/```json|```/g, '').trim();
+        const decisionResp = await aiClient.models.generateContent({
+          model: MODEL_NAME,
+          contents: [{ role: 'user', parts: [{ text: decisionPrompt }] }],
+          config: { temperature: 0.5 },
+        });
+
+        const decisionRaw = (decisionResp.text || '').trim().replace(/```json|```/g, '').trim();
         let parsed: any = {};
         try {
           parsed = JSON.parse(decisionRaw);
@@ -1119,8 +1117,13 @@ ${history}
 [Triggering message]: ${senderName}: "${message.content}"`;
 
           try {
-            const text = (await callAI(aiClient, 'generation', withdrawPrompt, 1.1)).replace(/DATA:[\s\S]*$/i, '').trim();
-            await (message.channel as any).send(text || 'aight');
+            const resp = await aiClient.models.generateContent({
+              model: MODEL_NAME,
+              contents: [{ role: 'user', parts: [{ text: withdrawPrompt }] }],
+              config: { temperature: 1.1 },
+            });
+            const text = (resp.text || 'aight').replace(/DATA:[\s\S]*$/i, '').trim();
+            await (message.channel as any).send(text);
           } catch {
             await (message.channel as any).send('aight');
           }
@@ -1135,16 +1138,15 @@ ${history}
           decisionTarget = `${senderName}: "${message.content}"`;
         }
 
-        // Duplicate reply guard — keyed on Discord message snowflake ID, not content.
-        // This prevents the same message ever getting two replies, even if the debounce
-        // fires multiple times or the trigger races with itself.
+        // Duplicate reply guard
         const channelReplied = recentlyRepliedTargets.get(message.channelId) || new Set<string>();
-        if (channelReplied.has(message.id)) {
-          console.log(`[Skip] Already replied to message ${message.id}`);
+        const targetKey      = decisionTarget.slice(0, 80);
+        if (channelReplied.has(targetKey)) {
+          console.log(`[Skip] Already replied to this target: ${targetKey}`);
           return;
         }
-        channelReplied.add(message.id);
-        if (channelReplied.size > 20) channelReplied.delete(channelReplied.values().next().value);
+        channelReplied.add(targetKey);
+        if (channelReplied.size > 10) channelReplied.delete(channelReplied.values().next().value);
         recentlyRepliedTargets.set(message.channelId, channelReplied);
 
         if (isMentioned) {
