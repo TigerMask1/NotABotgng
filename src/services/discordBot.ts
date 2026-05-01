@@ -531,13 +531,12 @@ options:
 1 sentence MAX. lowercase. don't try hard.`;
 
       try {
-        const { text: fText } = await generateWithFallback(
+        const { text: fRaw } = await generateWithFallback(
           aiClient,
           'generation',
           [{ role: 'user', parts: [{ text: followupPrompt }] }],
           { temperature: 1.1 }
         );
-        const fRaw = fText;
         const { visibleText: fText } = extractDataBlock(fRaw);
 
         if (fText && fText.length > 2) {
