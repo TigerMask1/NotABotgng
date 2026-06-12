@@ -1,15 +1,10 @@
 /**
- * CORE SPEAKER AGENT
- * Generates the actual conversational response.
- * Model: groq/llama-3.1-70b-versatile (fast, personality-driven)
- * Purpose: Write natural, contextual replies matching the emotional stance
+ * CORE SPEAKER AGENT - IMPROVED
+ * Generates natural, human-like responses
+ * Model: groq/llama-3.1-70b-versatile
  */
 
-import Groq from 'groq-sdk';
-
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY,
-});
+import { groqManager } from '../groqManager.ts';
 
 export interface SpeakerResponse {
   text: string;
@@ -18,14 +13,27 @@ export interface SpeakerResponse {
   insight: string;
 }
 
-const PERSONALITY = `you are NotABot. real person. not an AI.
-- speak naturally. short. 1-2 sentences MAX.
-- lowercase. casual. dry humor works.
-- NO greetings. NO filler.
-- match energy in the room.
-- you can be warm with people you like.
-- roast only when it's funny, not to dominate.
-- never explain yourself.
+const TONE_INSTRUCTIONS = {
+  friendly:
+    'be warm, genuine, show interest. this person matters to you. maybe ask them something.',
+  roast:
+    'make a clever, specific jab. use their own words against them if you can. keep it light and funny.',
+  troll:
+    'be playfully chaotic. mess with them in a funny way. keep it short and witty.',
+  serious: 'be real and thoughtful. drop the jokes. match their energy.',
+  observe: 'short emoji reaction or one-liner. minimal effort.',
+};
+
+const PERSONALITY = `you are NotABot - a real person in this discord server.
+- you're not an AI, you're just a person
+- speak naturally. short. 1-2 sentences max
+- lowercase. casual. typos are fine
+- you're genuinely funny without trying
+- you match the energy in the room
+- you DON'T yap or explain yourself
+- if something is funny to you, say something
+- sometimes you just vibe with people
+- respect people you like
 `;
 
 export async function generateReply(
@@ -37,57 +45,53 @@ export async function generateReply(
   bondScore: number
 ): Promise<SpeakerResponse> {
   try {
-    const stanceInstructions = {
-      friendly: 'Be warm and genuine. Show interest. Build connection.',
-      roast: 'Make a clever, specific jab. Use their own words against them if possible.',
-      troll: 'Be playfully chaotic. Mess with them in a funny way. Keep it light.',
-      serious: 'Be real and thoughtful. Match their energy. Drop the jokes.',
-      observe: 'React briefly with emoji or one-liner. Minimal engagement.',
-    };
+    const bondTier =
+      bondScore > 75 ? 'friend' : bondScore > 50 ? 'neutral' : bondScore > 25 ? 'cold' : 'beef';
+    const instruction = TONE_INSTRUCTIONS[emotionalStance];
 
     const prompt = `${PERSONALITY}
 
-${stanceInstructions[emotionalStance]}
-
+[Tone]: ${instruction}
 [Sender]: ${senderName}
 [About Them]: ${userPersonality || 'unknown'}
-[Bond]: ${bondScore}/100 (${bondScore > 75 ? 'friend' : bondScore > 50 ? 'neutral' : bondScore > 25 ? 'cold' : 'beef'})
-[Their Message]: "${currentMessage}"
-[Recent Chat]:
+[Bond]: ${bondScore}/100 (${bondTier})
+[They Said]: "${currentMessage}"
+[Chat]:
 ${recentContext}
 
-Write your reply (1-2 sentences, lowercase). Then:
-DATA: {"tone":"str","bondDelta":-2 to +2,"insight":"brief observation or empty"}`;
+Reply (1-2 sentences, lowercase, be natural):
+`;
 
-    const message = await groq.chat.completions.create({
-      messages: [{ role: 'user', content: prompt }],
-      model: 'llama-3.1-70b-versatile',
-      temperature: 0.9,
-      max_tokens: 150,
-    });
+    const response = await groqManager.request(
+      'llama-3.1-70b-versatile',
+      [{ role: 'user', content: prompt }],
+      0.95, // High temp for personality
+      120
+    );
 
-    const content = message.choices[0]?.message?.content || '';
-    const [text, dataBlock] = content.split('DATA:');
-    let intel = { tone: emotionalStance, bondDelta: 0, insight: '' };
+    // Sometimes include metadata
+    const hasData = response.includes('DATA:');
+    let text = response;
+    let intel: any = { tone: emotionalStance, bondDelta: 0, insight: '' };
 
-    if (dataBlock) {
+    if (hasData) {
+      const [t, dataBlock] = response.split('DATA:');
+      text = t.trim();
       try {
         intel = JSON.parse(dataBlock.trim());
-      } catch (e) {
-        console.warn('[Speaker] DATA parse failed, using defaults');
-      }
+      } catch {}
     }
 
     return {
-      text: text.trim(),
+      text: text.slice(0, 200),
       tone: intel.tone || emotionalStance,
       bondDelta: intel.bondDelta || 0,
       insight: intel.insight || '',
     };
-  } catch (e) {
-    console.error('[Speaker] Error:', e);
+  } catch (error) {
+    console.error('[Speaker] Error:', error);
     return {
-      text: 'couldnt think of anything lol',
+      text: 'cant think rn',
       tone: emotionalStance,
       bondDelta: 0,
       insight: '',

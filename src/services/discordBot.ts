@@ -1,33 +1,34 @@
 /**
- * NOTABOT - PRODUCTION DISCORD BOT
- * Three-tier multi-agent architecture using Groq models
- * 
- * Architecture:
- * 1. Social Gatekeeper (groq/llama-3.1-70b) - filters & decides if reply needed
- * 2. Core Speaker (groq/llama-3.1-70b) - generates natural responses
- * 3. Memory Profiler (groq/mixtral-8x7b) - async background analysis every 10-15 min
+ * NOTABOT - PRODUCTION DISCORD BOT V2
+ * Three-tier multi-agent architecture with:
+ * - Smart greeting handling (HUMAN-LIKE)
+ * - Multi-key API management with failover
+ * - Token-aware request batching
+ * - DM & Guild support
  */
 
-import { Client, GatewayIntentBits, Message, Partials, Events, ChannelType } from 'discord.js';
+import { Client, GatewayIntentBits, Message, Partials, Events } from 'discord.js';
 import { db } from './firebase.ts';
+import { groqManager } from './groqManager.ts';
 import { evaluateMessage } from './agents/gatekeeper.ts';
 import { generateReply } from './agents/speaker.ts';
+import { generateGreeting } from './agents/greeter.ts';
 import { analyzeAndProfile, compressHistory } from './agents/profiler.ts';
 
 let botClient: Client | null = null;
 
-// ─── STATE & CONFIG ──────────────────────────────────────────────────────
+// ─── CONFIG ──────────────────────────────────────────────────────────────────────
 
-const REPLY_COOLDOWN_MS = 5000;
-const DEBOUNCE_WINDOW_MS = 1500;
-const PROFILER_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
-const MAX_HISTORY = 15;
+const REPLY_COOLDOWN_MS = 4000;
+const DEBOUNCE_WINDOW_MS = 1200;
+const PROFILER_INTERVAL_MS = 12 * 60 * 1000; // 12 minutes
+const MAX_HISTORY = 12;
 
 const pendingTriggers = new Map<string, NodeJS.Timeout>();
 const channelActivity = new Map<string, { lastReply: number; count: number }>();
 let profilerTimer: NodeJS.Timeout | null = null;
 
-// ─── HELPER: Get Bond Score ──────────────────────────────────────────────
+// ─── HELPER: Bond Score ──────────────────────────────────────────────────────────
 
 async function getBondScore(guildId: string, userId: string): Promise<number> {
   try {
@@ -39,23 +40,29 @@ async function getBondScore(guildId: string, userId: string): Promise<number> {
 }
 
 async function updateBondScore(guildId: string, userId: string, delta: number) {
+  if (delta === 0) return;
   try {
     const current = await getBondScore(guildId, userId);
     const next = Math.max(0, Math.min(100, current + delta));
-    await db.collection('servers').doc(guildId).collection('users').doc(userId).set(
-      {
-        bondScore: next,
-        bondUpdatedAt: new Date().toISOString(),
-      },
-      { merge: true }
-    );
-    console.log(`[Bond] ${userId}: ${current} → ${next}`);
+    await db
+      .collection('servers')
+      .doc(guildId)
+      .collection('users')
+      .doc(userId)
+      .set(
+        {
+          bondScore: next,
+          bondUpdatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+    if (delta !== 0) console.log(`[Bond] ${userId}: ${current} → ${next} (${delta > 0 ? '+' : ''}${delta})`);
   } catch (e) {
-    console.error(`[Bond] Update failed:`, e);
+    console.error(`[Bond] Error:`, e);
   }
 }
 
-// ─── HELPER: Get User Profile ────────────────────────────────────────────
+// ─── HELPER: User Profile ────────────────────────────────────────────────────────
 
 async function getUserProfile(guildId: string, userId: string) {
   try {
@@ -69,36 +76,36 @@ async function getUserProfile(guildId: string, userId: string) {
       };
     }
   } catch (e) {
-    console.error(`[Profile] Load failed:`, e);
+    console.error(`[Profile] Error:`, e);
   }
   return { personality: '', interests: [], dynamics: [] };
 }
 
-// ─── HELPER: Store User Insight ──────────────────────────────────────────
+// ─── HELPER: First Time Check ────────────────────────────────────────────────────
 
-async function storeInsight(guildId: string, userId: string, username: string, insight: string) {
+async function isFirstGreeting(guildId: string, userId: string): Promise<boolean> {
   try {
-    if (!insight || insight.length < 3) return;
-
     const snap = await db.collection('servers').doc(guildId).collection('users').doc(userId).get();
-    const data = snap.exists ? snap.data() : {};
-    const insights = [...(data?.insights || []), insight];
-    const deduped = Array.from(new Set(insights)).slice(-10);
-
-    await db.collection('servers').doc(guildId).collection('users').doc(userId).set(
-      {
-        insights: deduped,
-        lastSeenUsername: username,
-        lastSeenAt: new Date().toISOString(),
-      },
-      { merge: true }
-    );
-  } catch (e) {
-    console.error(`[Insight] Store failed:`, e);
+    return !snap.exists || !snap.data()?.lastGreetedAt;
+  } catch {
+    return true;
   }
 }
 
-// ─── PROFILER BACKGROUND TASK ────────────────────────────────────────────
+async function markGreeted(guildId: string, userId: string) {
+  try {
+    await db
+      .collection('servers')
+      .doc(guildId)
+      .collection('users')
+      .doc(userId)
+      .set({ lastGreetedAt: new Date().toISOString() }, { merge: true });
+  } catch (e) {
+    console.error(`[Greet] Mark error:`, e);
+  }
+}
+
+// ─── PROFILER BACKGROUND TASK ────────────────────────────────────────────────────
 
 function startProfilerLoop(botInstance: Client) {
   if (profilerTimer) clearInterval(profilerTimer);
@@ -118,31 +125,31 @@ function startProfilerLoop(botInstance: Client) {
                 content: m.content.substring(0, 100),
               }));
 
-            // Analyze each unique author
             const authors = new Set(history.map((m) => m.author));
             for (const author of authors) {
               const authorMsgs = history.filter((m) => m.author === author);
-              const user = await guild.members.fetch({ query: author, limit: 1 }).catch(() => null);
+              const user = await guild.members
+                .fetch({ query: author, limit: 1 })
+                .catch(() => null);
               if (user) {
                 await analyzeAndProfile(guild.id, user.id, author, authorMsgs);
               }
             }
 
-            // Compress channel history
             await compressHistory(guild.id, history);
           } catch (e) {
             // channel error, continue
           }
         }
       }
-      console.log('[Profiler] Cycle complete');
+      console.log(`[Profiler] Cycle complete | Available reqs: ${groqManager.getAvailableRequests()}`);
     } catch (e) {
       console.error('[Profiler] Error:', e);
     }
   }, PROFILER_INTERVAL_MS);
 }
 
-// ─── MESSAGE HANDLER ─────────────────────────────────────────────────────
+// ─── MAIN MESSAGE HANDLER ────────────────────────────────────────────────────────
 
 async function handleMessage(message: Message) {
   if (message.author.bot) return;
@@ -156,9 +163,9 @@ async function handleMessage(message: Message) {
     const botId = botClient!.user!.id;
     const isMentioned = message.mentions.has(botId);
     const now = Date.now();
-    const windowTime = isMentioned ? 500 : DEBOUNCE_WINDOW_MS;
+    const windowTime = isMentioned ? 300 : DEBOUNCE_WINDOW_MS;
 
-    // ── Debounce ──
+    // Debounce
     if (pendingTriggers.has(message.channelId)) {
       clearTimeout(pendingTriggers.get(message.channelId)!);
     }
@@ -168,25 +175,54 @@ async function handleMessage(message: Message) {
 
       try {
         const senderName = message.member?.displayName || message.author.username;
+        const guildId = isGuild ? message.guildId! : 'dm';
 
-        // ── Get Context ──
+        // Fetch context
         const recentMsgs = await message.channel.messages.fetch({ limit: MAX_HISTORY });
         const historyArray = [...recentMsgs.values()]
           .reverse()
-          .map(
-            (m: any) =>
-              `${m.author.username}: ${m.content.substring(0, 80)}`
-          )
+          .map((m: any) => `${m.author.username}: ${m.content.substring(0, 60)}`)
           .join('\n');
 
-        const guildId = isGuild ? message.guildId! : 'dm';
         const bondScore = isGuild ? await getBondScore(guildId, message.author.id) : 50;
         const profile = isGuild ? await getUserProfile(guildId, message.author.id) : { personality: '', interests: [], dynamics: [] };
 
-        // ── TIER 1: GATEKEEPER DECISION ──
+        // ═════ SPECIAL: GREETING HANDLING ═════
+        const isGreet = /^(hi|hey|hello|yo|sup|howdy|hola|what\s*s?up)\s*[!?]?$/i.test(message.content.trim());
+        if (isGreet && (isMentioned || isGuild)) {
+          const isFirst = isGuild ? await isFirstGreeting(guildId, message.author.id) : false;
+          const greeting = await generateGreeting(senderName, isFirst, bondScore, historyArray);
+
+          const delay = 100 + greeting.text.length * 5;
+          setTimeout(async () => {
+            try {
+              await message.reply({
+                content: greeting.text,
+                allowedMentions: { repliedUser: false },
+              });
+
+              if (greeting.shouldUpdateBond && isGuild) {
+                await updateBondScore(guildId, message.author.id, greeting.bondDelta);
+                await markGreeted(guildId, message.author.id);
+              }
+
+              channelActivity.set(message.channelId, {
+                lastReply: Date.now(),
+                count: (channelActivity.get(message.channelId)?.count || 0) + 1,
+              });
+
+              console.log(`[Greeting] ${greeting.text.substring(0, 40)}...`);
+            } catch (e) {
+              console.error('[Send] Error:', e);
+            }
+          }, delay);
+          return;
+        }
+
+        // ═════ TIER 1: GATEKEEPER ═════
         const decision = await evaluateMessage(
           senderName,
-          profile.dynamics || [],
+          profile.personality || '',
           message.content,
           historyArray,
           isMentioned,
@@ -199,14 +235,14 @@ async function handleMessage(message: Message) {
 
         if (!decision.shouldReply) return;
 
-        // Cooldown check
+        // Cooldown
         const activity = channelActivity.get(message.channelId);
         if (activity && !isMentioned && now - activity.lastReply < REPLY_COOLDOWN_MS) {
           console.log('[Cooldown] Rate limited');
           return;
         }
 
-        // ── TIER 2: SPEAKER GENERATION ──
+        // ═════ TIER 2: SPEAKER ═════
         const reply = await generateReply(
           senderName,
           decision.emotionalStance,
@@ -221,8 +257,8 @@ async function handleMessage(message: Message) {
           return;
         }
 
-        // ── Send Reply ──
-        const delay = 200 + reply.text.length * 8;
+        // Send reply
+        const delay = 150 + reply.text.length * 6;
         setTimeout(async () => {
           try {
             await message.reply({
@@ -230,39 +266,32 @@ async function handleMessage(message: Message) {
               allowedMentions: { repliedUser: false },
             });
 
-            // Store insight if any
-            if (isGuild && reply.insight) {
-              await storeInsight(guildId, message.author.id, senderName, reply.insight);
-            }
-
-            // Update bond
             if (isGuild && reply.bondDelta !== 0) {
               await updateBondScore(guildId, message.author.id, reply.bondDelta);
             }
 
-            // Track activity
             channelActivity.set(message.channelId, {
               lastReply: Date.now(),
               count: (activity?.count || 0) + 1,
             });
 
-            console.log(`[Reply] ${reply.text.substring(0, 50)}...`);
+            console.log(`[Reply] ${reply.text.substring(0, 40)}...`);
           } catch (e) {
-            console.error('[Send] Failed:', e);
+            console.error('[Send] Error:', e);
           }
         }, delay);
       } catch (e) {
-        console.error('[Handler] Process failed:', e);
+        console.error('[Handler] Process error:', e);
       }
     }, windowTime);
 
     pendingTriggers.set(message.channelId, trigger);
   } catch (e) {
-    console.error('[Handler] Outer error:', e);
+    console.error('[Handler] Error:', e);
   }
 }
 
-// ─── BOT STARTUP ─────────────────────────────────────────────────────────
+// ─── BOT STARTUP ─────────────────────────────────────────────────────────────────
 
 export async function startBot(token: string) {
   if (botClient) return;
@@ -279,12 +308,32 @@ export async function startBot(token: string) {
   });
 
   botClient.on(Events.ClientReady, () => {
-    console.log(`✓ NotABot online (Groq multi-agent)`);
+    console.log(`
+╔════════════════════════════════════════╗`);
+    console.log(`║  ✓ NotABot Online (V2 Multi-Agent)  ║`);
+    console.log(`║  • Groq Manager: ${groqManager.getStats().length} keys         ║`);
+    console.log(`║  • Available Reqs: ${groqManager.getAvailableRequests()}         ║`);
+    console.log(`╚════════════════════════════════════════╝\n`);
     botClient?.user?.setPresence({ status: 'online', activities: [{ name: 'messages', type: 0 }] });
     startProfilerLoop(botClient!);
   });
 
   botClient.on(Events.MessageCreate, (message) => handleMessage(message));
+
+  // Admin command to check Groq stats
+  botClient.on(Events.MessageCreate, async (message) => {
+    if (message.content === '!groq-stats' && message.member?.permissions.has('Administrator')) {
+      const stats = groqManager.getStats();
+      const available = groqManager.getAvailableRequests();
+      const info = stats
+        .map(
+          (s) =>
+            `Key **${s.key.slice(-6)}**: ${s.requestsToday} reqs, ${s.errorsToday} errs, healthy: ${s.isHealthy}`
+        )
+        .join('\n');
+      await message.reply(`\`\`\`\nGroq Stats:\n${info}\n\nTotal Available: ${available}\n\`\`\``);
+    }
+  });
 
   await botClient.login(token);
 }
