@@ -330,7 +330,7 @@ function setupSelfActivityLoop() {
 
 // ─── AI ───────────────────────────────────────────────────────────────────────
 
-const MODEL_NAME = "gemma-3-27b-it";
+const MODEL_NAME = "gemma-4-31b-it";
 
 async function getOrInitAI() {
   if (!ai) {
