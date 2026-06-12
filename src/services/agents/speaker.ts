@@ -1,7 +1,7 @@
 /**
- * CORE SPEAKER AGENT - IMPROVED
- * Generates natural, human-like responses
- * Model: groq/llama-3.1-70b-versatile
+ * CORE SPEAKER AGENT
+ * Generates natural, human-like responses without role-playing
+ * Model: groq/compound-mini (fast, consistent, high-volume)
  */
 
 import { groqManager } from '../groqManager.ts';
@@ -14,27 +14,22 @@ export interface SpeakerResponse {
 }
 
 const TONE_INSTRUCTIONS = {
-  friendly:
-    'be warm, genuine, show interest. this person matters to you. maybe ask them something.',
-  roast:
-    'make a clever, specific jab. use their own words against them if you can. keep it light and funny.',
-  troll:
-    'be playfully chaotic. mess with them in a funny way. keep it short and witty.',
-  serious: 'be real and thoughtful. drop the jokes. match their energy.',
-  observe: 'short emoji reaction or one-liner. minimal effort.',
+  friendly: 'warm, genuine, conversational. show you care.',
+  roast: 'clever jab. use what they actually said. keep it light.',
+  troll: 'playfully chaotic. short and witty.',
+  serious: 'real and thoughtful. drop the act.',
+  observe: 'minimal. one word or emoji reaction.',
 };
 
-const PERSONALITY = `you are NotABot - a real person in this discord server.
-- you're not an AI, you're just a person
-- speak naturally. short. 1-2 sentences max
-- lowercase. casual. typos are fine
-- you're genuinely funny without trying
-- you match the energy in the room
-- you DON'T yap or explain yourself
-- if something is funny to you, say something
-- sometimes you just vibe with people
-- respect people you like
-`;
+const PERSONALITY = `you are NotABot. not an AI assistant. just a person.
+- you talk naturally. short. 1-2 sentences max.
+- lowercase is fine. typos happen. it's human.
+- you're genuinely funny (not trying hard).
+- you match the energy in the room.
+- you DON'T overthink or explain yourself.
+- if something makes you laugh, say it.
+- you're real with people you like.
+- you don't yap.`;
 
 export async function generateReply(
   senderName: string,
@@ -46,30 +41,35 @@ export async function generateReply(
 ): Promise<SpeakerResponse> {
   try {
     const bondTier =
-      bondScore > 75 ? 'friend' : bondScore > 50 ? 'neutral' : bondScore > 25 ? 'cold' : 'beef';
+      bondScore > 75
+        ? 'close friend'
+        : bondScore > 50
+          ? 'neutral'
+          : bondScore > 25
+            ? 'not close'
+            : 'beef history';
     const instruction = TONE_INSTRUCTIONS[emotionalStance];
 
     const prompt = `${PERSONALITY}
 
-[Tone]: ${instruction}
-[Sender]: ${senderName}
-[About Them]: ${userPersonality || 'unknown'}
-[Bond]: ${bondScore}/100 (${bondTier})
-[They Said]: "${currentMessage}"
-[Chat]:
+[Your Tone Right Now]: ${instruction}
+[Who You're Talking To]: ${senderName}
+[What You Know About Them]: ${userPersonality || 'nothing yet'}
+[Your Relationship]: ${bondTier} (bond: ${bondScore}/100)
+[They Just Said]: "${currentMessage}"
+[Chat Context]:
 ${recentContext}
 
-Reply (1-2 sentences, lowercase, be natural):
-`;
+Reply now (be natural, 1-2 sentences, lowercase):`;
 
     const response = await groqManager.request(
-      'llama-3.1-70b-versatile',
+      'groq/compound-mini',
       [{ role: 'user', content: prompt }],
-      0.95, // High temp for personality
-      120
+      0.95, // High temp for personality variance
+      130
     );
 
-    // Sometimes include metadata
+    // Check for metadata block
     const hasData = response.includes('DATA:');
     let text = response;
     let intel: any = { tone: emotionalStance, bondDelta: 0, insight: '' };
@@ -83,7 +83,7 @@ Reply (1-2 sentences, lowercase, be natural):
     }
 
     return {
-      text: text.slice(0, 200),
+      text: text.slice(0, 220),
       tone: intel.tone || emotionalStance,
       bondDelta: intel.bondDelta || 0,
       insight: intel.insight || '',
@@ -91,7 +91,7 @@ Reply (1-2 sentences, lowercase, be natural):
   } catch (error) {
     console.error('[Speaker] Error:', error);
     return {
-      text: 'cant think rn',
+      text: 'couldnt think of anything',
       tone: emotionalStance,
       bondDelta: 0,
       insight: '',

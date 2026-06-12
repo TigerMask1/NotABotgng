@@ -1,10 +1,11 @@
 /**
- * NOTABOT - PRODUCTION DISCORD BOT V2
- * Three-tier multi-agent architecture with:
- * - Smart greeting handling (HUMAN-LIKE)
+ * NOTABOT - PRODUCTION DISCORD BOT V3
+ * Three-tier multi-agent architecture:
+ * - No hardcoded greeting detection (AI decides everything)
+ * - Unified decision path (no special-case handlers)
+ * - Updated to active Groq models (compound-mini, qwen3-32b)
  * - Multi-key API management with failover
- * - Token-aware request batching
- * - DM & Guild support
+ * - Async profiling every 12 minutes
  */
 
 import { Client, GatewayIntentBits, Message, Partials, Events } from 'discord.js';
@@ -17,7 +18,7 @@ import { analyzeAndProfile, compressHistory } from './agents/profiler.ts';
 
 let botClient: Client | null = null;
 
-// ─── CONFIG ──────────────────────────────────────────────────────────────────────
+// ─── CONFIG ──────────────────────────────────────────────────────────────────
 
 const REPLY_COOLDOWN_MS = 4000;
 const DEBOUNCE_WINDOW_MS = 1200;
@@ -28,7 +29,7 @@ const pendingTriggers = new Map<string, NodeJS.Timeout>();
 const channelActivity = new Map<string, { lastReply: number; count: number }>();
 let profilerTimer: NodeJS.Timeout | null = null;
 
-// ─── HELPER: Bond Score ──────────────────────────────────────────────────────────
+// ─── HELPER: Bond Score ──────────────────────────────────────────────────────
 
 async function getBondScore(guildId: string, userId: string): Promise<number> {
   try {
@@ -62,7 +63,7 @@ async function updateBondScore(guildId: string, userId: string, delta: number) {
   }
 }
 
-// ─── HELPER: User Profile ────────────────────────────────────────────────────────
+// ─── HELPER: User Profile ────────────────────────────────────────────────────
 
 async function getUserProfile(guildId: string, userId: string) {
   try {
@@ -81,31 +82,7 @@ async function getUserProfile(guildId: string, userId: string) {
   return { personality: '', interests: [], dynamics: [] };
 }
 
-// ─── HELPER: First Time Check ────────────────────────────────────────────────────
-
-async function isFirstGreeting(guildId: string, userId: string): Promise<boolean> {
-  try {
-    const snap = await db.collection('servers').doc(guildId).collection('users').doc(userId).get();
-    return !snap.exists || !snap.data()?.lastGreetedAt;
-  } catch {
-    return true;
-  }
-}
-
-async function markGreeted(guildId: string, userId: string) {
-  try {
-    await db
-      .collection('servers')
-      .doc(guildId)
-      .collection('users')
-      .doc(userId)
-      .set({ lastGreetedAt: new Date().toISOString() }, { merge: true });
-  } catch (e) {
-    console.error(`[Greet] Mark error:`, e);
-  }
-}
-
-// ─── PROFILER BACKGROUND TASK ────────────────────────────────────────────────────
+// ─── PROFILER BACKGROUND TASK ────────────────────────────────────────────────
 
 function startProfilerLoop(botInstance: Client) {
   if (profilerTimer) clearInterval(profilerTimer);
@@ -149,7 +126,7 @@ function startProfilerLoop(botInstance: Client) {
   }, PROFILER_INTERVAL_MS);
 }
 
-// ─── MAIN MESSAGE HANDLER ────────────────────────────────────────────────────────
+// ─── MAIN MESSAGE HANDLER ────────────────────────────────────────────────────
 
 async function handleMessage(message: Message) {
   if (message.author.bot) return;
@@ -187,39 +164,8 @@ async function handleMessage(message: Message) {
         const bondScore = isGuild ? await getBondScore(guildId, message.author.id) : 50;
         const profile = isGuild ? await getUserProfile(guildId, message.author.id) : { personality: '', interests: [], dynamics: [] };
 
-        // ═════ SPECIAL: GREETING HANDLING ═════
-        const isGreet = /^(hi|hey|hello|yo|sup|howdy|hola|what\s*s?up)\s*[!?]?$/i.test(message.content.trim());
-        if (isGreet && (isMentioned || isGuild)) {
-          const isFirst = isGuild ? await isFirstGreeting(guildId, message.author.id) : false;
-          const greeting = await generateGreeting(senderName, isFirst, bondScore, historyArray);
-
-          const delay = 100 + greeting.text.length * 5;
-          setTimeout(async () => {
-            try {
-              await message.reply({
-                content: greeting.text,
-                allowedMentions: { repliedUser: false },
-              });
-
-              if (greeting.shouldUpdateBond && isGuild) {
-                await updateBondScore(guildId, message.author.id, greeting.bondDelta);
-                await markGreeted(guildId, message.author.id);
-              }
-
-              channelActivity.set(message.channelId, {
-                lastReply: Date.now(),
-                count: (channelActivity.get(message.channelId)?.count || 0) + 1,
-              });
-
-              console.log(`[Greeting] ${greeting.text.substring(0, 40)}...`);
-            } catch (e) {
-              console.error('[Send] Error:', e);
-            }
-          }, delay);
-          return;
-        }
-
-        // ═════ TIER 1: GATEKEEPER ═════
+        // ═══════ TIER 1: UNIFIED GATEKEEPER DECISION ═══════
+        // AI decides everything: whether to reply, emotional stance, even if it's a greeting
         const decision = await evaluateMessage(
           senderName,
           profile.personality || '',
@@ -242,7 +188,7 @@ async function handleMessage(message: Message) {
           return;
         }
 
-        // ═════ TIER 2: SPEAKER ═════
+        // ═══════ TIER 2: SPEAKER GENERATION ═══════
         const reply = await generateReply(
           senderName,
           decision.emotionalStance,
@@ -291,7 +237,7 @@ async function handleMessage(message: Message) {
   }
 }
 
-// ─── BOT STARTUP ─────────────────────────────────────────────────────────────────
+// ─── BOT STARTUP ─────────────────────────────────────────────────────────────
 
 export async function startBot(token: string) {
   if (botClient) return;
@@ -310,9 +256,10 @@ export async function startBot(token: string) {
   botClient.on(Events.ClientReady, () => {
     console.log(`
 ╔════════════════════════════════════════╗`);
-    console.log(`║  ✓ NotABot Online (V2 Multi-Agent)  ║`);
+    console.log(`║  ✓ NotABot Online (V3 Pure AI)      ║`);
     console.log(`║  • Groq Manager: ${groqManager.getStats().length} keys         ║`);
     console.log(`║  • Available Reqs: ${groqManager.getAvailableRequests()}         ║`);
+    console.log(`║  • Models: compound-mini, qwen3-32b ║`);
     console.log(`╚════════════════════════════════════════╝\n`);
     botClient?.user?.setPresence({ status: 'online', activities: [{ name: 'messages', type: 0 }] });
     startProfilerLoop(botClient!);

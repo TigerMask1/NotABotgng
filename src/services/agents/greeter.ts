@@ -1,42 +1,10 @@
 /**
  * GREETING AGENT
- * Handles when someone greets the bot (hi, hey, hello, etc.)
- * Makes replies feel HUMAN - natural, varied, contextual, warm
- * Model: groq/llama-3.1-70b-versatile
+ * Generates natural greeting responses
+ * Model: groq/compound-mini (fast for real-time responses)
  */
 
 import { groqManager } from '../groqManager.ts';
-
-const GREETING_PERSONALITIES = [
-  'you just woke up, a bit groggy, reply casually',
-  'you\'re in a good mood, being warm and friendly',
-  'you\'re chill, unbothered, short response',
-  'you\'re hyped, showing actual energy',
-  'you\'re tired, one-word or minimal response',
-  'you\'re curious, asking them something back',
-];
-
-const HUMAN_GREETING_REPLIES = [
-  // Natural, human-like responses to greetings
-  'yo what\'s up',
-  'hey hey',
-  'yooo',
-  'sup',
-  'hiii',
-  'yo',
-  'heyyy',
-  'hey 👋',
-  'wassup',
-  'iiii',
-  'what\'s good',
-  'hello hello',
-  'yo how\'s it going',
-  'henlooo',
-  'yo yooo',
-  'aye aye',
-  'you good?',
-  'what\'s new',
-];
 
 export interface GreetingResponse {
   text: string;
@@ -45,42 +13,37 @@ export interface GreetingResponse {
 }
 
 /**
- * Generate a human-like greeting response
+ * Generate a greeting response
+ * AI decides if it should greet or not based on context
  */
 export async function generateGreeting(
   senderName: string,
   isFirstTime: boolean,
   bondScore: number,
+  currentMessage: string,
   recentContext: string
 ): Promise<GreetingResponse> {
   try {
-    // Sometimes just pick a pre-made response (most human)
-    if (Math.random() < 0.5) {
-      const reply = HUMAN_GREETING_REPLIES[Math.floor(Math.random() * HUMAN_GREETING_REPLIES.length)];
-      return {
-        text: reply,
-        shouldUpdateBond: true,
-        bondDelta: isFirstTime ? 2 : 0,
-      };
-    }
+    const bondTier =
+      bondScore > 75 ? 'friend' : bondScore > 50 ? 'neutral' : 'not close';
 
-    // Sometimes generate with AI for variety
-    const personality = GREETING_PERSONALITIES[Math.floor(Math.random() * GREETING_PERSONALITIES.length)];
-    const bondContext = bondScore > 75 ? 'they\'re your friend' : bondScore > 50 ? 'they\'re neutral' : 'they\'re not close';
+    const prompt = `You are NotABot greeting someone. You're a person, not an AI.
 
-    const prompt = `You are NotABot greeting someone who just said hi. You\'re a real person, not an AI.
+Context:
+[Who]: ${senderName}
+[Your bond]: ${bondTier} (${bondScore}/100)
+[First time meeting them]: ${isFirstTime}
+[They said]: "${currentMessage}"
+[Recent chat]:
+${recentContext}
 
-${personality}
-they are ${bondContext}
-they said: "hi"
-
-Greeting back (1 sentence max, casual, lowercase): \n`;
+Respond naturally to their greeting (1 sentence max, lowercase, be human):`;
 
     const response = await groqManager.request(
-      'llama-3.1-70b-versatile',
+      'groq/compound-mini',
       [{ role: 'user', content: prompt }],
-      0.95, // High temp for variety
-      50 // Short response
+      0.85, // Higher temp for personality in greetings
+      60
     );
 
     const text = response.trim().split('\n')[0];
@@ -92,7 +55,7 @@ Greeting back (1 sentence max, casual, lowercase): \n`;
     };
   } catch (error) {
     console.error('[Greeter] Error:', error);
-    // Fallback to pre-made response
+    // Simple fallback
     return {
       text: 'yo',
       shouldUpdateBond: false,

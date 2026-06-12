@@ -1,31 +1,17 @@
 /**
- * SOCIAL GATEKEEPER AGENT - IMPROVED
- * Decides if bot should respond to a message
- * Now with special handling for greetings
- * Model: groq/llama-3.1-70b-versatile
+ * SOCIAL GATEKEEPER AGENT
+ * Decides if bot should respond - AI makes ALL decisions including greetings
+ * No hardcoded patterns. Pure AI decision making.
+ * Model: groq/compound-mini (fast, high-volume, consistent)
  */
 
 import { groqManager } from '../groqManager.ts';
 
 export interface GatekeeperDecision {
   shouldReply: boolean;
-  isGreeting: boolean; // Special flag for greeting handling
   confidence: number;
   emotionalStance: 'friendly' | 'roast' | 'troll' | 'serious' | 'observe';
   reason: string;
-}
-
-const GREETING_KEYWORDS = ['hi', 'hey', 'hello', 'yo', 'sup', 'howdy', 'greetings', 'what\'s up', 'hola', 'how are you'];
-const FILLER_KEYWORDS = ['lol', 'fr', 'ok', 'yeah', 'same', 'nah', 'yep', 'no', 'yes', 'hm', 'gg', 'f', 'rip'];
-
-function isGreeting(content: string): boolean {
-  const lower = content.toLowerCase().trim();
-  return GREETING_KEYWORDS.some((g) => lower.includes(g)) && content.length < 50;
-}
-
-function isFiller(content: string): boolean {
-  const lower = content.toLowerCase().trim();
-  return FILLER_KEYWORDS.includes(lower);
 }
 
 export async function evaluateMessage(
@@ -37,94 +23,75 @@ export async function evaluateMessage(
   bondScore: number
 ): Promise<GatekeeperDecision> {
   try {
-    // Quick local checks first
-    const isGreet = isGreeting(currentMessage);
-    const isFill = isFiller(currentMessage);
-
-    // If greeting and bot is mentioned or online, ALWAYS reply
-    if (isGreet && botMentioned) {
-      return {
-        shouldReply: true,
-        isGreeting: true,
-        confidence: 0.95,
-        emotionalStance: 'friendly',
-        reason: 'direct greeting to bot',
-      };
-    }
-
-    // If pure filler and no mention, skip
-    if (isFill && !botMentioned) {
-      return {
-        shouldReply: false,
-        isGreeting: false,
-        confidence: 0.9,
-        emotionalStance: 'observe',
-        reason: 'filler message',
-      };
-    }
-
-    // If bot mentioned, always consider replying
-    if (botMentioned) {
-      return {
-        shouldReply: true,
-        isGreeting: false,
-        confidence: 0.9,
-        emotionalStance: bondScore > 75 ? 'friendly' : bondScore > 50 ? 'serious' : 'roast',
-        reason: 'bot mentioned',
-      };
-    }
-
-    // Use AI for nuanced decisions
-    const prompt = `Decide if NotABot should respond. Be selective.
+    // Let AI decide everything - no hardcoded shortcuts
+    const prompt = `You are NotABot's decision maker. Decide if you should respond to this message.
+Be natural. Be selective. Sometimes staying silent is better.
 
 [Sender]: ${senderName}
-[Profile]: ${senderProfile || 'unknown'}
-[Bond]: ${bondScore}/100
+[About Sender]: ${senderProfile || 'no info yet'}
+[Your Bond with Sender]: ${bondScore}/100
+[Bot Mentioned?]: ${botMentioned ? 'YES' : 'NO'}
 [Message]: "${currentMessage}"
-[Context]:
-${recentContext.split('\n').slice(-5).join('\n')}
+[Recent Context]:
+${recentContext.split('\n').slice(-6).join('\n')}
 
-RULES:
-- Reply if: genuine question, conversation natural, bot adds value
-- Skip if: two users talking, bot not needed, message is filler
-- ALWAYS reply if bot is directly pinged
+DECISION GUIDELINES:
+Reply if:
+- Message is directed at you (mentioned or clear intent)
+- It's a genuine greeting and feels natural to respond
+- You can add something meaningful to the conversation
+- Someone asked a real question
+- You have something funny or relevant to say
 
-JSON: {"shouldReply":bool,"emotionalStance":"friendly|roast|troll|serious|observe","reason":"one line"}`;
+Skip if:
+- Two people are having their own conversation
+- It's clearly not directed at you
+- Message is empty/filler and no personal engagement
+- You've recently replied and they haven't responded
+- Replying would interrupt or feel forced
+
+Output ONLY valid JSON, no markdown:
+{
+  "shouldReply": boolean,
+  "emotionalStance": "friendly|roast|troll|serious|observe",
+  "reason": "one line explanation",
+  "confidence": 0.0-1.0
+}`;
 
     const response = await groqManager.request(
-      'llama-3.1-70b-versatile',
+      'groq/compound-mini',
       [{ role: 'user', content: prompt }],
-      0.3, // Low temp for consistent decisions
-      150
+      0.4, // Moderate temp for consistent but thoughtful decisions
+      200
     );
 
-    const jsonMatch = response.match(/\{[^}]*\}/);
-    if (!jsonMatch) {
+    try {
+      const parsed = JSON.parse(response);
       return {
-        shouldReply: botMentioned,
-        isGreeting: false,
-        confidence: 0.5,
+        shouldReply: parsed.shouldReply,
+        confidence: parsed.confidence || 0.75,
+        emotionalStance: parsed.emotionalStance || 'observe',
+        reason: parsed.reason || 'ai decision',
+      };
+    } catch (e) {
+      // Fallback if JSON parsing fails
+      console.warn('[Gatekeeper] JSON parse failed, falling back to text analysis');
+      const shouldReply = response.toLowerCase().includes('true') || botMentioned;
+      return {
+        shouldReply,
+        confidence: botMentioned ? 0.9 : 0.6,
         emotionalStance: 'observe',
-        reason: 'parse error',
+        reason: 'fallback decision',
       };
     }
-
-    const parsed = JSON.parse(jsonMatch[0]);
-    return {
-      shouldReply: parsed.shouldReply,
-      isGreeting: false,
-      confidence: 0.8,
-      emotionalStance: parsed.emotionalStance || 'observe',
-      reason: parsed.reason || '',
-    };
   } catch (e) {
     console.error('[Gatekeeper] Error:', e);
+    // Safest fallback: only reply if explicitly mentioned
     return {
       shouldReply: botMentioned,
-      isGreeting: false,
       confidence: 0,
       emotionalStance: 'observe',
-      reason: 'gatekeeper error',
+      reason: 'gatekeeper error - safe fallback',
     };
   }
 }

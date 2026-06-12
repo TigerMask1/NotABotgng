@@ -1,7 +1,7 @@
 /**
  * MEMORY AND PROFILER AGENT - ASYNC BACKGROUND TASK
  * Runs every 10-15 minutes to build user profiles
- * Model: groq/mixtral-8x7b-32768 (long-form analysis)
+ * Model: qwen/qwen3-32b (good for deep analysis without timeout)
  */
 
 import { groqManager } from '../groqManager.ts';
@@ -26,49 +26,50 @@ export async function analyzeAndProfile(
 
     const messageText = recentMessages.map((m) => `${m.author}: ${m.content}`).join('\n');
 
-    const prompt = `Analyze this user's personality from their messages.
+    const prompt = `Analyze this user from their messages. Create a brief personality profile.
 
 User: ${username}
 Messages:
 ${messageText}
 
-JSON output:
+Profile (JSON):
 {
-  "personality": "one-line vibe",
-  "interests": ["topic1"],
-  "dynamics": ["interaction_style"],
+  "personality": "one-line vibe (e.g., casual gamer, always joking)",
+  "interests": ["topic1", "topic2"],
+  "dynamics": ["how they talk", "what they care about"],
   "sentiment": "positive|neutral|negative"
 }`;
 
     const response = await groqManager.request(
-      'mixtral-8x7b-32768',
+      'qwen/qwen3-32b',
       [{ role: 'user', content: prompt }],
       0.5,
-      300
+      250
     );
 
-    const jsonMatch = response.match(/\{[^}]*\}/);
-    if (!jsonMatch) return;
+    try {
+      const parsed = JSON.parse(response);
 
-    const parsed = JSON.parse(jsonMatch[0]);
+      await db
+        .collection('servers')
+        .doc(guildId)
+        .collection('users')
+        .doc(userId)
+        .set(
+          {
+            personality: parsed.personality,
+            interests: parsed.interests || [],
+            dynamics: parsed.dynamics || [],
+            sentiment: parsed.sentiment,
+            profiledAt: new Date().toISOString(),
+          },
+          { merge: true }
+        );
 
-    await db
-      .collection('servers')
-      .doc(guildId)
-      .collection('users')
-      .doc(userId)
-      .set(
-        {
-          personality: parsed.personality,
-          interests: parsed.interests || [],
-          dynamics: parsed.dynamics || [],
-          sentiment: parsed.sentiment,
-          profiledAt: new Date().toISOString(),
-        },
-        { merge: true }
-      );
-
-    console.log(`[Profiler] ${username} analyzed`);
+      console.log(`[Profiler] ${username} profiled`);
+    } catch (e) {
+      console.warn(`[Profiler] JSON parse failed for ${username}`);
+    }
   } catch (e) {
     console.error(`[Profiler] Error:`, e);
   }
@@ -83,34 +84,35 @@ export async function compressHistory(
 
     const text = messages.slice(-50).map((m) => `${m.author}: ${m.content}`).join('\n');
 
-    const prompt = `Summarize this chat in 2-3 key facts, inside jokes, and group vibe.
+    const prompt = `Summarize this Discord chat. Extract key facts, inside jokes, and group vibe.
 
 ${text}
 
-JSON:
-{"summary":"text","insideJokes":[],"groupVibe":"text"}`;
+Summary (JSON):
+{"summary":"brief","insideJokes":[],"groupVibe":"description"}`;
 
     const response = await groqManager.request(
-      'mixtral-8x7b-32768',
+      'qwen/qwen3-32b',
       [{ role: 'user', content: prompt }],
       0.5,
-      400
+      300
     );
 
-    const jsonMatch = response.match(/\{[^}]*\}/);
-    if (!jsonMatch) return;
+    try {
+      const parsed = JSON.parse(response);
 
-    const parsed = JSON.parse(jsonMatch[0]);
+      await db.collection('servers').doc(guildId).set(
+        {
+          compressedHistory: parsed,
+          historyCompressedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
 
-    await db.collection('servers').doc(guildId).set(
-      {
-        compressedHistory: parsed,
-        historyCompressedAt: new Date().toISOString(),
-      },
-      { merge: true }
-    );
-
-    console.log(`[Profiler] History compressed`);
+      console.log(`[Profiler] History compressed`);
+    } catch (e) {
+      console.warn(`[Profiler] JSON parse failed on compression`);
+    }
   } catch (e) {
     console.error(`[Profiler] Compression error:`, e);
   }
