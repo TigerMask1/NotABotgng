@@ -1,55 +1,49 @@
 /**
- * NOTABOT — v8 "Full Human+"
+ * NOTABOT — v9 "Mood System"
  *
- * NEW in v8 (additive — nothing from v7 removed):
- *   FIX: DMs now always trigger brain (mentioned=true in DM context) — v7 silently
- *        dropped 2/3 of DM messages due to BRAIN_EVERY_N counter gate
- *   FIX: typing indicator now fires ONLY right before sending the actual reply
- *        (not during "thinking"/brain call) — sendTyping() ~10s window, refreshed
- *        if needed for long replies
- *   NEW: per-user memory — users/{uid}/profile: facts[], relationshipNotes[],
- *        context (rolling summary string). Richer than server-global memory,
- *        feeds into brain prompt when chatting with that specific person
- *   NEW: per-user deep profiler — runs alongside existing 15-min profiler,
- *        lower frequency (every 2nd cycle), updates relationshipNotes + context
- *   NEW: proactive hop loop — every PROACTIVE_INTERVAL (jittered), asks DEEP model
- *        "given everything, do you want to say something anywhere right now?"
- *        full liberty to say no (default). If yes: picks a channel/DM + writes msg.
- *        Triggered especially when a user says "come to dm" / "hop on" type things
- *        (captured as relationshipNotes / context, surfaced in the proactive prompt)
+ * Built ON TOP of v8.1. Nothing removed. Additions:
  *
- * NEW in v8.1 — HF SPACES BACKEND SWITCHER:
- *   - Runtime toggle between Groq and your HuggingFace Spaces model
- *   - Command: !hf (switch to HF), !groqmode (switch back to Groq)
- *   - Admin-only, per-guild, persisted to Firebase
- *   - HF uses OpenAI-compatible /v1/chat/completions endpoint (same schema as Groq)
- *   - Env vars needed: HF_SPACE_BASE_URL, HF_TOKEN (optional if your Space is public)
- *   - HF errors are reported inline (no fallback — you'll see the actual error)
- *   - RPM guard only applies in Groq mode; HF mode bypasses it (your own infra)
- *   - !backend — shows current backend for this guild
+ * MOOD SYSTEM (replaces static BRAIN_EVERY_N counter):
+ *   Per-channel MoodState: active | passive
  *
- * everything from v6/v7 preserved: multi-key groq failover, RPM guard, brain loop,
- * speak states, STM, reply chains, id resolution, server memory, hourly compression,
- * admin commands.
+ *   ACTIVE mode:
+ *   - Brain fires on every message (full attention)
+ *   - Has a duration (AI-set, 5-15 min). Auto-reverts to passive after.
+ *   - Bot walks in/out naturally, knows when to exit
+ *
+ *   PASSIVE mode:
+ *   - Brain fires every N msgs (N is AI-set per channel, default 5)
+ *   - Each passive brain call also evaluates: should i switch to active?
+ *   - AI returns moodSwitch + activeDurationMins in its decision
+ *
+ *   AUTO-ACTIVE triggers (no LLM cost — observable signals):
+ *   1. Direct @mention or "notabot" text in message
+ *   2. Significant idle gap (>GAP_THRESHOLD_MS) since last message → new session
+ *   3. Bot monopoly: last N messages all unanswered by others (likely 1:1 intent)
+ *   4. DMs always active
+ *
+ *   AUTO-PASSIVE triggers:
+ *   - Brain returns action=pause or action=wait → mood goes passive on resume
+ *   - Active timer expires
+ *
+ * Everything from v8.1 preserved: multi-key Groq, HF backend switcher, RPM guard,
+ * speak states, STM, reply chains, ID resolution, server memory, per-user memory,
+ * proactive hop loop, hourly compression, all admin commands.
  */
 
-import { Client, GatewayIntentBits, Message, Partials, Events, TextChannel, DMChannel } from 'discord.js';
+import { Client, GatewayIntentBits, Message, Partials, Events, TextChannel } from 'discord.js';
 import Groq from 'groq-sdk';
 import { db } from './firebase.ts';
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 // ═══════════════════════════════════════════════════════════════════
-// GROQ MANAGER — multi-key failover, daily limit tracking
+// GROQ MANAGER
 // ═══════════════════════════════════════════════════════════════════
 
 interface KeyStats {
-  key: string;
-  requestsToday: number;
-  errorsToday:   number;
-  isHealthy:     boolean;
-  cooldownUntil?: number;
-  lastUsed?:      number;
+  key: string; requestsToday: number; errorsToday: number;
+  isHealthy: boolean; cooldownUntil?: number; lastUsed?: number;
 }
 
 class GroqManager {
@@ -73,17 +67,14 @@ class GroqManager {
   private bestKey(): string {
     const now = Date.now();
     if (now > this.resetAt) {
-      this.stats.forEach(s => {
-        s.requestsToday = 0; s.errorsToday = 0;
-        s.isHealthy = true;  s.cooldownUntil = undefined;
-      });
+      this.stats.forEach(s => { s.requestsToday = 0; s.errorsToday = 0; s.isHealthy = true; s.cooldownUntil = undefined; });
       this.resetAt = now + 86_400_000;
     }
     const avail = this.keys.filter(k => {
       const s = this.stats.get(k)!;
       if (s.cooldownUntil) {
         if (now < s.cooldownUntil) return false;
-        s.isHealthy = true; s.cooldownUntil = undefined; // expired, recover
+        s.isHealthy = true; s.cooldownUntil = undefined;
       }
       return s.requestsToday < this.limit * 0.92;
     });
@@ -93,24 +84,16 @@ class GroqManager {
     );
   }
 
-  async request(
-    model:   string,
-    msgs:    any[],
-    temp   = 0.85,
-    maxTok = 180,
-    retries = 3,
-  ): Promise<string> {
+  async request(model: string, msgs: any[], temp = 0.85, maxTok = 180, retries = 3): Promise<string> {
     let last: any;
     for (let i = 0; i < retries; i++) {
       const k = this.bestKey();
       const s = this.stats.get(k)!;
       try {
-        const r = await this.clients.get(k)!.chat.completions.create({
-          model, messages: msgs, temperature: temp, max_tokens: maxTok,
-        });
+        const r = await this.clients.get(k)!.chat.completions.create({ model, messages: msgs, temperature: temp, max_tokens: maxTok });
         s.requestsToday++; s.lastUsed = Date.now();
         rpmTick();
-        console.log(`[Groq] ${model.split('-').slice(0, 3).join('-')} ${r.usage?.total_tokens}tok ...${k.slice(-4)}`);
+        console.log(`[Groq] ${model.split('-').slice(0,3).join('-')} ${r.usage?.total_tokens}tok ...${k.slice(-4)}`);
         return r.choices[0]?.message?.content || '';
       } catch (e: any) {
         last = e; s.errorsToday++;
@@ -118,9 +101,7 @@ class GroqManager {
           const sec = parseFloat(e.message?.match(/in ([\d.]+)s/)?.[1] || '45') + 3;
           s.cooldownUntil = Date.now() + sec * 1000; s.isHealthy = false;
           console.warn(`[Groq] ...${k.slice(-4)} 429 → ${sec.toFixed(0)}s cooldown`);
-        } else {
-          console.error(`[Groq] attempt ${i + 1} ...${k.slice(-4)}: ${e.message}`);
-        }
+        } else console.error(`[Groq] attempt ${i+1} ...${k.slice(-4)}: ${e.message}`);
         if (i < retries - 1) await sleep(Math.min(1500 * 2 ** i, 12_000));
       }
     }
@@ -131,153 +112,95 @@ class GroqManager {
   available() { return this.keys.reduce((s, k) => s + Math.max(0, this.limit - this.stats.get(k)!.requestsToday), 0); }
 }
 
-// ── RPM guard ────────────────────────────────────────────────────────────────
-// Total limit: 30 RPM. Keep 10 for reserve (direct pings, admin). 20 usable passively.
-// NOTE: RPM guard only applies in Groq mode. HF mode bypasses it (your own infra).
+// ── RPM guard ─────────────────────────────────────────────────────────────────
 const RPM_CAP = 20;
-const rpm     = { calls: 0, windowStart: Date.now() };
-
-function rpmReset()  { const now = Date.now(); if (now - rpm.windowStart > 60_000) { rpm.calls = 0; rpm.windowStart = now; } }
+const rpm = { calls: 0, windowStart: Date.now() };
+function rpmReset()          { if (Date.now() - rpm.windowStart > 60_000) { rpm.calls = 0; rpm.windowStart = Date.now(); } }
 function rpmAllow(): boolean { rpmReset(); return rpm.calls < RPM_CAP; }
-function rpmTick()   { rpmReset(); rpm.calls++; }
-function rpmLeft():  number  { rpmReset(); return Math.max(0, RPM_CAP - rpm.calls); }
+function rpmTick()           { rpmReset(); rpm.calls++; }
+function rpmLeft(): number   { rpmReset(); return Math.max(0, RPM_CAP - rpm.calls); }
 
 const groq = new GroqManager();
 
 // ═══════════════════════════════════════════════════════════════════
-// HF SPACES BACKEND — NEW v8.1
-//
-// Your HuggingFace Space running TGI or vLLM exposes an OpenAI-compatible
-// /v1/chat/completions endpoint. We hit it with a plain fetch() — no SDK needed.
-//
-// Required env vars:
-//   HF_SPACE_BASE_URL  — e.g. "https://your-username-your-space.hf.space"
-//                        (no trailing slash, no /v1 — we append that)
-//   HF_TOKEN           — your HF access token (optional if Space is public)
-//   HF_MODEL_NAME      — model name to send in the request body
-//                        (some TGI setups need "tgi", others need the full model ID)
-//                        defaults to "tgi" if not set
-//
-// Backend state is stored per-guild in Firebase: servers/{gid}/backend = 'groq'|'hf'
-// In-memory cache avoids a Firebase read on every message.
+// HF SPACES BACKEND (v8.1)
 // ═══════════════════════════════════════════════════════════════════
 
-const HF_BASE_URL  = (process.env.HF_SPACE_BASE_URL || '').replace(/\/$/, '');
-const HF_TOKEN     = process.env.HF_TOKEN || '';
-const HF_MODEL     = process.env.HF_MODEL_NAME || 'tgi';
+const HF_BASE_URL = (process.env.HF_SPACE_BASE_URL || '').replace(/\/$/, '');
+const HF_TOKEN    = process.env.HF_TOKEN     || '';
+const HF_MODEL    = process.env.HF_MODEL_NAME || 'tgi';
 
-// In-memory backend cache: guildId → 'groq' | 'hf'
-// 'dm' is the guildId used for direct messages — defaults to groq.
 const backendCache = new Map<string, 'groq' | 'hf'>();
 
 async function getBackend(guildId: string): Promise<'groq' | 'hf'> {
   if (backendCache.has(guildId)) return backendCache.get(guildId)!;
   try {
     const snap = await db.collection('servers').doc(guildId).get();
-    const b = snap.data()?.backend as 'groq' | 'hf' | undefined;
-    const resolved = b === 'hf' ? 'hf' : 'groq'; // default groq
-    backendCache.set(guildId, resolved);
-    return resolved;
-  } catch {
-    backendCache.set(guildId, 'groq');
-    return 'groq';
-  }
+    const b    = (snap.data()?.backend as 'groq' | 'hf') ?? 'groq';
+    backendCache.set(guildId, b); return b;
+  } catch { backendCache.set(guildId, 'groq'); return 'groq'; }
 }
 
 async function setBackend(guildId: string, backend: 'groq' | 'hf') {
   backendCache.set(guildId, backend);
-  try {
-    await db.collection('servers').doc(guildId)
-      .set({ backend, backendSetAt: new Date().toISOString() }, { merge: true });
-  } catch {}
+  await db.collection('servers').doc(guildId).set({ backend, backendSetAt: new Date().toISOString() }, { merge: true }).catch(() => {});
   console.log(`[Backend] guild ${guildId.slice(-6)} → ${backend}`);
 }
 
-/**
- * Call HF Space's OpenAI-compatible endpoint.
- * Uses the same message format as Groq so the rest of the bot is unchanged.
- * Throws with the raw error message so you see exactly what went wrong.
- */
-async function hfRequest(
-  msgs:    any[],
-  temp  = 0.85,
-  maxTok = 180,
-): Promise<string> {
-  if (!HF_BASE_URL) throw new Error('[HF] HF_SPACE_BASE_URL is not set in env');
-
-  const url = `${HF_BASE_URL}/v1/chat/completions`;
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+async function hfRequest(msgs: any[], temp = 0.85, maxTok = 180): Promise<string> {
+  if (!HF_BASE_URL) throw new Error('[HF] HF_SPACE_BASE_URL not set');
+  const headers: Record<string,string> = { 'Content-Type': 'application/json' };
   if (HF_TOKEN) headers['Authorization'] = `Bearer ${HF_TOKEN}`;
-
-  const body = JSON.stringify({
-    model:       HF_MODEL,
-    messages:    msgs,
-    temperature: temp,
-    max_tokens:  maxTok,
+  const res  = await fetch(`${HF_BASE_URL}/v1/chat/completions`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ model: HF_MODEL, messages: msgs, temperature: temp, max_tokens: maxTok }),
   });
-
-  const res = await fetch(url, { method: 'POST', headers, body });
-
   if (!res.ok) {
-    // Surface the actual error from your Space — don't swallow it
-    let errText = '';
-    try { errText = await res.text(); } catch {}
-    throw new Error(`[HF] HTTP ${res.status} from Space: ${errText.slice(0, 300)}`);
+    let t = ''; try { t = await res.text(); } catch {}
+    throw new Error(`[HF] HTTP ${res.status}: ${t.slice(0, 300)}`);
   }
-
   const data = await res.json() as any;
   const content = data?.choices?.[0]?.message?.content;
-  if (!content) throw new Error(`[HF] Empty response from Space: ${JSON.stringify(data).slice(0, 200)}`);
-
-  console.log(`[HF] ${data?.usage?.total_tokens ?? '?'}tok | model: ${data?.model || HF_MODEL}`);
+  if (!content) throw new Error(`[HF] empty response: ${JSON.stringify(data).slice(0, 200)}`);
+  console.log(`[HF] ${data?.usage?.total_tokens ?? '?'}tok`);
   return content;
 }
 
-/**
- * Unified request dispatcher — routes to Groq or HF based on the active backend.
- * In HF mode: RPM guard is skipped (your infra, your rules).
- * Model param is used only in Groq mode; HF always uses HF_MODEL from env.
- */
-async function aiRequest(
-  guildId: string,
-  model:   string,          // groq model string — ignored in HF mode
-  msgs:    any[],
-  temp   = 0.85,
-  maxTok = 180,
-): Promise<string> {
-  const backend = await getBackend(guildId);
-
-  if (backend === 'hf') {
-    return hfRequest(msgs, temp, maxTok);
-  }
-
-  // Groq path — identical to before
-  return groq.request(model, msgs, temp, maxTok);
+async function aiRequest(guildId: string, model: string, msgs: any[], temp = 0.85, maxTok = 180): Promise<string> {
+  return (await getBackend(guildId)) === 'hf'
+    ? hfRequest(msgs, temp, maxTok)
+    : groq.request(model, msgs, temp, maxTok);
 }
 
 // ═══════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════
 
-// llama-3.1-8b-instant: 30 RPM, 20k TPM — real-time decisions, fast af
-// llama-3.3-70b-versatile: 30 RPM, 6k TPM  — background deep work only
 const FAST = 'llama-3.1-8b-instant';
 const DEEP = 'llama-3.3-70b-versatile';
 
-const DEBOUNCE_MS       = 900;
-const BRAIN_EVERY_N     = 3;           // fire brain every N non-mention msgs per channel (servers only)
-const MAX_FETCH_HISTORY = 16;          // Discord history fetch on cold start
-const SHORT_TERM_MAX    = 50;          // per-channel in-memory message log
-const PROFILER_INTERVAL = 15 * 60_000; // 15 min: profile users
-const COMPRESS_INTERVAL = 60 * 60_000; // 1 hr: STM → long-term notes
-const MEMBER_CACHE_TTL  = 5  * 60_000; // 5 min: member roster cache
+const DEBOUNCE_MS          = 900;
+const MAX_FETCH_HISTORY    = 16;
+const SHORT_TERM_MAX       = 50;
+const PROFILER_INTERVAL    = 15 * 60_000;
+const COMPRESS_INTERVAL    = 60 * 60_000;
+const MEMBER_CACHE_TTL     = 5  * 60_000;
+const USER_DEEP_PROFILE_EVERY = 2;
 
-// NEW v8: proactive hop loop timing — base interval + jitter, per "tick" the AI
-// decides per-user/per-channel whether to say something. Full liberty to decline.
-const PROACTIVE_BASE_INTERVAL = 25 * 60_000; // 25 min base
-const PROACTIVE_JITTER         = 20 * 60_000; // +/- up to 20 min
-const PROACTIVE_MIN_GAP_USER   = 45 * 60_000; // don't proactively hit same user/channel more than once per 45min
-const USER_DEEP_PROFILE_EVERY  = 2;           // run deep per-user profiler every 2nd profiler cycle
+// Mood system
+const PASSIVE_DEFAULT_EVERY  = 5;    // default msgs between brain calls in passive mode
+const PASSIVE_MIN_EVERY      = 2;    // AI can't set lower than this
+const PASSIVE_MAX_EVERY      = 10;   // AI can't set higher than this
+const ACTIVE_DEFAULT_MINS    = 7;    // default active duration if AI doesn't specify
+const ACTIVE_MIN_MINS        = 5;    // floor
+const ACTIVE_MAX_MINS        = 15;   // ceiling
+const GAP_THRESHOLD_MS       = 8 * 60_000;   // 8 min idle gap → auto-active
+const MONOPOLY_THRESHOLD     = 4;            // last N msgs all from same person → auto-active
+
+// Proactive
+const PROACTIVE_BASE_INTERVAL = 25 * 60_000;
+const PROACTIVE_JITTER        = 20 * 60_000;
+const PROACTIVE_MIN_GAP_USER  = 45 * 60_000;
 
 // ═══════════════════════════════════════════════════════════════════
 // BOT STATE
@@ -288,79 +211,212 @@ let BOT_NAME = 'NotABot';
 let BOT_ID   = '';
 
 const debounceTimers = new Map<string, NodeJS.Timeout>();
-let profilerTimer: NodeJS.Timeout | null = null;
-let proactiveTimer: NodeJS.Timeout | null = null; // NEW v8
-let profilerCycle = 0; // NEW v8 — counts profiler cycles for deep-profile cadence
+let profilerTimer:  NodeJS.Timeout | null = null;
+let proactiveTimer: NodeJS.Timeout | null = null;
+let profilerCycle = 0;
 
-// ── Per-channel message counter ─────────────────────────────────────────────
-// Prevents firing brain on every single message — only every BRAIN_EVERY_N OR on mention.
-// (DMs bypass this entirely — see handleMessage)
-// NOTE: In HF mode this counter still applies to keep things sane on your end too.
-const msgCounters = new Map<string, { n: number; windowStart: number }>();
-
-function shouldFireBrain(channelId: string, mentioned: boolean): boolean {
-  if (mentioned) return true; // always fire on direct ping (and always true for DMs now)
-
-  if (!rpmAllow()) {
-    console.log(`[RPM] budget tight (${rpmLeft()} left) — skipping passive brain`);
-    return false;
-  }
-
-  const now = Date.now();
-  let c = msgCounters.get(channelId);
-  if (!c || now - c.windowStart > 60_000) {
-    c = { n: 0, windowStart: now };
-    msgCounters.set(channelId, c);
-  }
-  c.n++;
-
-  const fire = c.n % BRAIN_EVERY_N === 0;
-  if (!fire) {
-    console.log(`[Counter] #${channelId.slice(-6)}: msg ${c.n}, brain in ${BRAIN_EVERY_N - (c.n % BRAIN_EVERY_N)} more`);
-  }
-  return fire;
-}
-
-// ── ID → DisplayName resolution ─────────────────────────────────────────────
-const idNameCache = new Map<string, string>(); // userId → displayName
-
-function cacheId(id: string, name: string) {
-  if (id && name) idNameCache.set(id, name);
-}
-
+// ── ID resolution ─────────────────────────────────────────────────────────────
+const idNameCache = new Map<string, string>();
+function cacheId(id: string, name: string) { if (id && name) idNameCache.set(id, name); }
 function resolveIds(text: string): string {
-  return text.replace(/<@!?(\d+)>/g, (_, id: string) => {
-    if (id === BOT_ID) return `@${BOT_NAME}`;
-    const name = idNameCache.get(id);
-    return name ? `@${name}` : '@someone';
-  });
+  return text.replace(/<@!?(\d+)>/g, (_, id: string) =>
+    id === BOT_ID ? `@${BOT_NAME}` : (idNameCache.get(id) ? `@${idNameCache.get(id)}` : '@someone')
+  );
 }
-
 function stripBotMention(content: string): string {
-  if (!BOT_ID) return content;
-  return content.replace(new RegExp(`<@!?${BOT_ID}>`, 'g'), '').trim();
+  return BOT_ID ? content.replace(new RegExp(`<@!?${BOT_ID}>`, 'g'), '').trim() : content;
 }
-
 function cleanContent(raw: string): string {
   return resolveIds(stripBotMention(raw)).trim();
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// SPEAK STATE
+// MOOD STATE (v9 — NEW, replaces static BRAIN_EVERY_N)
+// Per-channel. Persisted to Firebase. In-memory cache.
+// ═══════════════════════════════════════════════════════════════════
+
+interface MoodState {
+  mode:          'active' | 'passive';
+  activeUntil?:  number;    // epoch ms — when active auto-reverts to passive
+  passiveEvery:  number;    // AI-set: fire brain every N msgs in passive mode
+  passiveCount:  number;    // rolling msg counter in passive window (in-memory only)
+  reason:        string;
+  setAt:         number;
+}
+
+const moodStates = new Map<string, MoodState>();
+
+function defaultMood(): MoodState {
+  return {
+    mode: 'passive', passiveEvery: PASSIVE_DEFAULT_EVERY,
+    passiveCount: 0, reason: 'default', setAt: Date.now(),
+  };
+}
+
+async function getMoodState(channelId: string, guildId: string): Promise<MoodState> {
+  const now = Date.now();
+
+  if (moodStates.has(channelId)) {
+    const m = moodStates.get(channelId)!;
+    // Auto-revert active → passive when timer expires
+    if (m.mode === 'active' && m.activeUntil && now >= m.activeUntil) {
+      const next: MoodState = { ...m, mode: 'passive', activeUntil: undefined, reason: 'active timer expired', setAt: now };
+      moodStates.set(channelId, next);
+      persistMood(channelId, guildId, next);
+      console.log(`[Mood] #${channelId.slice(-6)} active→passive (timer expired)`);
+      return next;
+    }
+    return m;
+  }
+
+  // Load from Firebase
+  try {
+    const snap = await db.collection('servers').doc(guildId).collection('channels').doc(channelId).get();
+    const d = snap.data()?.mood as MoodState | undefined;
+    if (d) {
+      // Expire on load too, reset in-memory counter (not persisted)
+      const state: MoodState = { ...d, passiveCount: 0 };
+      if (state.mode === 'active' && state.activeUntil && now >= state.activeUntil) {
+        state.mode = 'passive'; state.activeUntil = undefined; state.reason = 'active timer expired (on load)';
+      }
+      moodStates.set(channelId, state);
+      return state;
+    }
+  } catch {}
+
+  const m = defaultMood();
+  moodStates.set(channelId, m);
+  return m;
+}
+
+async function setMoodState(channelId: string, guildId: string, update: Partial<MoodState>) {
+  const cur  = moodStates.get(channelId) ?? defaultMood();
+  // Don't persist passiveCount — it's in-memory only
+  const next: MoodState = { ...cur, ...update, setAt: Date.now() };
+  moodStates.set(channelId, next);
+  persistMood(channelId, guildId, next);
+  const modeInfo = next.mode === 'active' && next.activeUntil
+    ? `active until ${new Date(next.activeUntil).toLocaleTimeString()}`
+    : `passive (every ${next.passiveEvery} msgs)`;
+  console.log(`[Mood] #${channelId.slice(-6)} → ${modeInfo} | "${next.reason}"`);
+}
+
+function persistMood(channelId: string, guildId: string, mood: MoodState) {
+  // Don't persist passiveCount
+  const { passiveCount, ...toSave } = mood;
+  db.collection('servers').doc(guildId).collection('channels').doc(channelId)
+    .set({ mood: toSave, updatedAt: new Date().toISOString() }, { merge: true })
+    .catch(() => {});
+}
+
+// ── Auto-active signal detection (no LLM cost) ────────────────────────────────
+// Returns reason string if should go active, null if not
+
+function checkAutoActiveSignals(
+  channelId:   string,
+  content:     string,
+  authorId:    string,
+  mentioned:   boolean,
+  isDM:        boolean,
+): string | null {
+  if (isDM) return 'dm always active';
+  if (mentioned) return 'direct mention';
+
+  // Text mention of bot name (case-insensitive, no @ needed)
+  const lc = content.toLowerCase();
+  if (lc.includes(BOT_NAME.toLowerCase())) return `name "${BOT_NAME}" in message`;
+
+  // Significant idle gap — check STM
+  const msgs = stmStore.get(channelId) ?? [];
+  if (msgs.length > 0) {
+    const lastMsg = msgs[msgs.length - 1];
+    const gapMs   = Date.now() - lastMsg.ts;
+    if (gapMs > GAP_THRESHOLD_MS) {
+      return `${Math.round(gapMs / 60_000)}m idle gap → new session`;
+    }
+  }
+
+  // Bot monopoly: last MONOPOLY_THRESHOLD messages all from same author, no one else responding
+  if (msgs.length >= MONOPOLY_THRESHOLD) {
+    const recent = msgs.slice(-MONOPOLY_THRESHOLD);
+    const uniqueAuthors = new Set(recent.map(m => m.authorId).filter(id => id !== BOT_ID));
+    if (uniqueAuthors.size === 1 && uniqueAuthors.has(authorId)) {
+      return `bot monopoly: ${authorId.slice(-6)} talking to bot exclusively (last ${MONOPOLY_THRESHOLD} msgs)`;
+    }
+  }
+
+  return null;
+}
+
+// ── shouldFireBrain — replaces v8.1's static counter ─────────────────────────
+// Returns: { fire: boolean, mood: MoodState }
+// Increments passiveCount in-memory.
+
+async function shouldFireBrain(
+  channelId: string,
+  guildId:   string,
+  content:   string,
+  authorId:  string,
+  mentioned: boolean,
+  isDM:      boolean,
+): Promise<{ fire: boolean; mood: MoodState; autoActiveReason?: string }> {
+
+  const mood = await getMoodState(channelId, guildId);
+
+  // Check auto-active signals first (free)
+  const autoReason = checkAutoActiveSignals(channelId, content, authorId, mentioned, isDM);
+
+  if (autoReason && mood.mode !== 'active') {
+    // Bump to active
+    const activeMins  = ACTIVE_DEFAULT_MINS;
+    const activeUntil = Date.now() + activeMins * 60_000;
+    const next = await getMoodState(channelId, guildId); // fresh
+    await setMoodState(channelId, guildId, {
+      ...next,
+      mode: 'active', activeUntil,
+      reason: `auto: ${autoReason}`,
+    });
+    console.log(`[Mood] auto-active #${channelId.slice(-6)}: ${autoReason}`);
+    const updated = await getMoodState(channelId, guildId);
+    return { fire: true, mood: updated, autoActiveReason: autoReason };
+  }
+
+  // Already active → always fire (RPM permitting)
+  if (mood.mode === 'active') {
+    if (!rpmAllow()) {
+      console.log(`[RPM] active mode but budget tight (${rpmLeft()} left) — skip`);
+      return { fire: false, mood };
+    }
+    return { fire: true, mood };
+  }
+
+  // Passive mode — count messages, fire every passiveEvery
+  mood.passiveCount++;
+
+  if (!rpmAllow()) {
+    console.log(`[RPM] passive, budget tight — skip`);
+    return { fire: false, mood };
+  }
+
+  const fire = mood.passiveCount % mood.passiveEvery === 0;
+  console.log(`[Mood] passive #${channelId.slice(-6)}: msg ${mood.passiveCount}, fire in ${mood.passiveEvery - (mood.passiveCount % mood.passiveEvery)} more`);
+  return { fire, mood };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SPEAK STATE (unchanged from v8.1)
 // ═══════════════════════════════════════════════════════════════════
 
 interface SpeakState {
-  mode:       'active' | 'paused' | 'waiting';
-  resumeAt?:  number;
-  reason:     string;
-  setAt:      number;
+  mode:      'active' | 'paused' | 'waiting';
+  resumeAt?: number;
+  reason:    string;
+  setAt:     number;
 }
 
 const speakStates = new Map<string, SpeakState>();
 
-function defaultState(): SpeakState {
-  return { mode: 'active', reason: 'default', setAt: Date.now() };
-}
+function defaultSpeakState(): SpeakState { return { mode: 'active', reason: 'default', setAt: Date.now() }; }
 
 async function getSpeakState(channelId: string, guildId: string): Promise<SpeakState> {
   if (speakStates.has(channelId)) {
@@ -368,52 +424,42 @@ async function getSpeakState(channelId: string, guildId: string): Promise<SpeakS
     if (s.mode === 'paused' && s.resumeAt && Date.now() >= s.resumeAt) {
       const next: SpeakState = { mode: 'active', reason: 'pause expired', setAt: Date.now() };
       speakStates.set(channelId, next);
-      persistState(channelId, guildId, next);
+      persistSpeakState(channelId, guildId, next);
       return next;
     }
     return s;
   }
   try {
-    const snap = await db.collection('servers').doc(guildId)
-      .collection('channels').doc(channelId).get();
+    const snap = await db.collection('servers').doc(guildId).collection('channels').doc(channelId).get();
     const d = snap.data()?.speakState as SpeakState | undefined;
-    const state = d ?? defaultState();
-    if (state.mode === 'paused' && state.resumeAt && Date.now() >= state.resumeAt) {
-      state.mode = 'active'; state.reason = 'pause expired (on load)';
-    }
-    speakStates.set(channelId, state);
-    return state;
+    const s = d ?? defaultSpeakState();
+    if (s.mode === 'paused' && s.resumeAt && Date.now() >= s.resumeAt) { s.mode = 'active'; s.reason = 'pause expired (load)'; }
+    speakStates.set(channelId, s); return s;
   } catch {
-    const s = defaultState();
-    speakStates.set(channelId, s);
-    return s;
+    const s = defaultSpeakState(); speakStates.set(channelId, s); return s;
   }
 }
 
 async function setSpeakState(channelId: string, guildId: string, update: Partial<SpeakState>) {
-  const cur  = speakStates.get(channelId) ?? defaultState();
+  const cur  = speakStates.get(channelId) ?? defaultSpeakState();
   const next: SpeakState = { ...cur, ...update, setAt: Date.now() };
   speakStates.set(channelId, next);
-  persistState(channelId, guildId, next);
-  const info = next.resumeAt ? ` → resumes ${new Date(next.resumeAt).toLocaleTimeString()}` : '';
-  console.log(`[State] #${channelId.slice(-6)} → ${next.mode}${info} | "${next.reason}"`);
+  persistSpeakState(channelId, guildId, next);
+  const resume = next.resumeAt ? ` → resumes ${new Date(next.resumeAt).toLocaleTimeString()}` : '';
+  console.log(`[Speak] #${channelId.slice(-6)} → ${next.mode}${resume} | "${next.reason}"`);
 }
 
-function persistState(channelId: string, guildId: string, state: SpeakState) {
+function persistSpeakState(channelId: string, guildId: string, state: SpeakState) {
   db.collection('servers').doc(guildId).collection('channels').doc(channelId)
-    .set({ speakState: state, updatedAt: new Date().toISOString() }, { merge: true })
-    .catch(() => {});
+    .set({ speakState: state }, { merge: true }).catch(() => {});
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// SHORT-TERM MEMORY
+// SHORT-TERM MEMORY (unchanged from v8.1)
 // ═══════════════════════════════════════════════════════════════════
 
 interface STMessage {
-  ts:       number;
-  authorId: string;
-  author:   string;
-  content:  string;
+  ts: number; authorId: string; author: string; content: string;
   replyTo?: { author: string; content: string };
 }
 
@@ -426,257 +472,207 @@ function stmPush(channelId: string, msg: STMessage) {
   if (arr.length > SHORT_TERM_MAX) arr.shift();
 }
 
-function stmGet(channelId: string): STMessage[] {
-  return stmStore.get(channelId) ?? [];
-}
+function stmGet(channelId: string): STMessage[] { return stmStore.get(channelId) ?? []; }
 
 function stmFormat(msgs: STMessage[], nowMs: number): string {
   if (!msgs.length) return '(no recent messages)';
   return msgs.map(m => {
-    const agoMs  = nowMs - m.ts;
-    const agoStr = agoMs < 60_000
-      ? `${Math.round(agoMs / 1000)}s ago`
-      : `${Math.round(agoMs / 60_000)}m ago`;
-    let line = `[${agoStr}] ${m.author}: ${m.content}`;
-    if (m.replyTo) {
-      line += `\n   ↳ replying to ${m.replyTo.author}: "${m.replyTo.content.slice(0, 70)}"`;
-    }
+    const ago  = nowMs - m.ts;
+    const agoS = ago < 60_000 ? `${Math.round(ago/1000)}s ago` : `${Math.round(ago/60_000)}m ago`;
+    let line = `[${agoS}] ${m.author}: ${m.content}`;
+    if (m.replyTo) line += `\n   ↳ replying to ${m.replyTo.author}: "${m.replyTo.content.slice(0,70)}"`;
     return line;
   }).join('\n');
 }
 
 function seedSTM(channelId: string, msgs: Message[]) {
   if (stmStore.has(channelId)) return;
-  const arr: STMessage[] = msgs.map(m => ({
+  stmStore.set(channelId, msgs.map(m => ({
     ts:       m.createdTimestamp,
     authorId: m.author.id,
     author:   m.author.id === BOT_ID ? '[me]' : (m.member?.displayName || m.author.username),
     content:  cleanContent(m.content).slice(0, 120),
-  }));
-  stmStore.set(channelId, arr.slice(-SHORT_TERM_MAX));
+  })).slice(-SHORT_TERM_MAX));
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// FIREBASE SCHEMA (unchanged from v8)
+// FIREBASE (unchanged from v8.1)
 // ═══════════════════════════════════════════════════════════════════
 
 async function upsertServerIdentity(guild: any) {
-  try {
-    await db.collection('servers').doc(guild.id)
-      .set({ name: guild.name, memberCount: guild.memberCount, updatedAt: new Date().toISOString() }, { merge: true });
-  } catch {}
+  await db.collection('servers').doc(guild.id)
+    .set({ name: guild.name, memberCount: guild.memberCount, updatedAt: new Date().toISOString() }, { merge: true })
+    .catch(() => {});
 }
 
-async function upsertMember(guildId: string, userId: string, data: Record<string, any>) {
-  try {
-    await db.collection('servers').doc(guildId).collection('members').doc(userId)
-      .set({ ...data, updatedAt: new Date().toISOString() }, { merge: true });
-  } catch {}
+async function upsertMember(guildId: string, userId: string, data: Record<string,any>) {
+  await db.collection('servers').doc(guildId).collection('members').doc(userId)
+    .set({ ...data, updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
 }
 
-async function getMember(guildId: string, userId: string): Promise<Record<string, any>> {
-  try {
-    const s = await db.collection('servers').doc(guildId).collection('members').doc(userId).get();
-    return s.exists ? s.data()! : {};
-  } catch { return {}; }
+async function getMember(guildId: string, userId: string): Promise<Record<string,any>> {
+  try { const s = await db.collection('servers').doc(guildId).collection('members').doc(userId).get(); return s.exists ? s.data()! : {}; }
+  catch { return {}; }
 }
 
-const memberRosterCache = new Map<string, { data: Record<string, any>[]; ts: number }>();
-
-async function getAllMembers(guildId: string): Promise<Record<string, any>[]> {
-  const cached = memberRosterCache.get(guildId);
-  if (cached && Date.now() - cached.ts < MEMBER_CACHE_TTL) return cached.data;
+const memberRosterCache = new Map<string, { data: Record<string,any>[]; ts: number }>();
+async function getAllMembers(guildId: string): Promise<Record<string,any>[]> {
+  const c = memberRosterCache.get(guildId);
+  if (c && Date.now() - c.ts < MEMBER_CACHE_TTL) return c.data;
   try {
     const snap = await db.collection('servers').doc(guildId).collection('members').get();
     const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    memberRosterCache.set(guildId, { data, ts: Date.now() });
-    return data;
+    memberRosterCache.set(guildId, { data, ts: Date.now() }); return data;
   } catch { return []; }
 }
 
 async function updateBond(guildId: string, userId: string, delta: number) {
   if (!delta) return;
-  try {
-    const m    = await getMember(guildId, userId);
-    const cur  = typeof m.bond === 'number' ? m.bond : 50;
-    const next = Math.max(0, Math.min(100, cur + delta));
-    await upsertMember(guildId, userId, { bond: next });
-    console.log(`[Bond] ${userId.slice(-6)}: ${cur} → ${next}`);
-  } catch {}
+  const m   = await getMember(guildId, userId);
+  const cur = typeof m.bond === 'number' ? m.bond : 50;
+  await upsertMember(guildId, userId, { bond: Math.max(0, Math.min(100, cur + delta)) });
 }
 
 interface GlobalMemory { facts: string[]; corrections: string[]; insideJokes: string[]; }
 const memCache = new Map<string, { d: GlobalMemory; ts: number }>();
 
 async function getMemory(guildId: string): Promise<GlobalMemory> {
-  const cached = memCache.get(guildId);
-  if (cached && Date.now() - cached.ts < 90_000) return cached.d;
+  const c = memCache.get(guildId);
+  if (c && Date.now() - c.ts < 90_000) return c.d;
   try {
     const snap = await db.collection('servers').doc(guildId).collection('memory').doc('global').get();
-    const d: GlobalMemory = {
-      facts:       snap.data()?.facts       ?? [],
-      corrections: snap.data()?.corrections ?? [],
-      insideJokes: snap.data()?.insideJokes ?? [],
-    };
-    memCache.set(guildId, { d, ts: Date.now() });
-    return d;
+    const d: GlobalMemory = { facts: snap.data()?.facts ?? [], corrections: snap.data()?.corrections ?? [], insideJokes: snap.data()?.insideJokes ?? [] };
+    memCache.set(guildId, { d, ts: Date.now() }); return d;
   } catch { return { facts: [], corrections: [], insideJokes: [] }; }
 }
 
 async function writeFact(guildId: string, fact: string, bucket: keyof GlobalMemory = 'facts') {
   if (!fact?.trim()) return;
-  try {
-    const mem = await getMemory(guildId);
-    const arr = mem[bucket] as string[];
-    if (arr.some(f => f.toLowerCase() === fact.toLowerCase())) return;
-    arr.push(fact.trim());
-    if (arr.length > 40) arr.shift();
-    await db.collection('servers').doc(guildId).collection('memory').doc('global')
-      .set({ [bucket]: arr, updatedAt: new Date().toISOString() }, { merge: true });
-    memCache.delete(guildId);
-    console.log(`[Mem:${bucket}] "${fact.slice(0, 60)}"`);
-  } catch {}
+  const mem = await getMemory(guildId);
+  const arr = mem[bucket] as string[];
+  if (arr.some(f => f.toLowerCase() === fact.toLowerCase())) return;
+  arr.push(fact.trim()); if (arr.length > 40) arr.shift();
+  await db.collection('servers').doc(guildId).collection('memory').doc('global')
+    .set({ [bucket]: arr, updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+  memCache.delete(guildId);
+  console.log(`[Mem:${bucket}] "${fact.slice(0,60)}"`);
 }
 
-function memToPrompt(mem: GlobalMemory, members: Record<string, any>[]): string {
+function memToPrompt(mem: GlobalMemory, members: Record<string,any>[]): string {
   const lines: string[] = [];
-
   if (members.length) {
-    const roster = members
-      .filter(m => m.displayName || m.username)
-      .slice(0, 20)
-      .map(m => {
-        const name  = m.displayName || m.username;
-        const nicks = m.nicknames?.length ? ` [aka: ${m.nicknames.join(', ')}]` : '';
-        const vibe  = m.personality ? ` — ${m.personality}` : '';
-        return `  ${name}${nicks}${vibe}`;
-      }).join('\n');
-    lines.push(`SERVER MEMBERS:\n${roster}`);
+    lines.push(`SERVER MEMBERS:\n${members.filter(m => m.displayName || m.username).slice(0,20).map(m => {
+      const nicks = m.nicknames?.length ? ` [aka: ${m.nicknames.join(', ')}]` : '';
+      return `  ${m.displayName || m.username}${nicks}${m.personality ? ` — ${m.personality}` : ''}`;
+    }).join('\n')}`);
   }
-
-  if (mem.facts.length)
-    lines.push(`YOU KNOW:\n${mem.facts.slice(-10).map(f => `- ${f}`).join('\n')}`);
-  if (mem.corrections.length)
-    lines.push(`DON'T REPEAT:\n${mem.corrections.slice(-6).map(c => `- ${c}`).join('\n')}`);
-  if (mem.insideJokes.length)
-    lines.push(`INSIDE JOKES:\n${mem.insideJokes.slice(-6).map(j => `- ${j}`).join('\n')}`);
-
+  if (mem.facts.length)       lines.push(`YOU KNOW:\n${mem.facts.slice(-10).map(f=>`- ${f}`).join('\n')}`);
+  if (mem.corrections.length) lines.push(`DON'T REPEAT:\n${mem.corrections.slice(-6).map(c=>`- ${c}`).join('\n')}`);
+  if (mem.insideJokes.length) lines.push(`INSIDE JOKES:\n${mem.insideJokes.slice(-6).map(j=>`- ${j}`).join('\n')}`);
   return lines.join('\n\n') || '(nothing yet)';
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// PER-USER MEMORY (v8)
-// ═══════════════════════════════════════════════════════════════════
-
+// Per-user memory (unchanged from v8.1)
 interface UserProfile {
-  facts:             string[];
-  relationshipNotes: string[];
-  context:           string;
-  displayName?:      string;
-  lastDM?:           number;
-  dmChannelId?:      string;
-  lastSeenChannelId?: string;
-  lastSeenGuildId?:   string;
-  lastProactiveAt?:  number;
-  deepProfiledAt?:   string;
+  facts: string[]; relationshipNotes: string[]; context: string;
+  displayName?: string; lastDM?: number; dmChannelId?: string;
+  lastSeenChannelId?: string; lastSeenGuildId?: string;
+  lastProactiveAt?: number; deepProfiledAt?: string;
 }
 
 const userProfileCache = new Map<string, { d: UserProfile; ts: number }>();
-
-function emptyUserProfile(): UserProfile {
-  return { facts: [], relationshipNotes: [], context: '' };
-}
+function emptyUserProfile(): UserProfile { return { facts: [], relationshipNotes: [], context: '' }; }
 
 async function getUserProfile(userId: string): Promise<UserProfile> {
-  const cached = userProfileCache.get(userId);
-  if (cached && Date.now() - cached.ts < 60_000) return cached.d;
+  const c = userProfileCache.get(userId);
+  if (c && Date.now() - c.ts < 60_000) return c.d;
   try {
-    const snap = await db.collection('users').doc(userId).collection('profile').doc('main').get();
-    const d: UserProfile = snap.exists ? { ...emptyUserProfile(), ...snap.data() } as UserProfile : emptyUserProfile();
-    userProfileCache.set(userId, { d, ts: Date.now() });
-    return d;
+    const s = await db.collection('users').doc(userId).collection('profile').doc('main').get();
+    const d = s.exists ? { ...emptyUserProfile(), ...s.data() } as UserProfile : emptyUserProfile();
+    userProfileCache.set(userId, { d, ts: Date.now() }); return d;
   } catch { return emptyUserProfile(); }
 }
 
 async function upsertUserProfile(userId: string, data: Partial<UserProfile>) {
-  try {
-    await db.collection('users').doc(userId).collection('profile').doc('main')
-      .set({ ...data, updatedAt: new Date().toISOString() }, { merge: true });
-    userProfileCache.delete(userId);
-  } catch {}
+  await db.collection('users').doc(userId).collection('profile').doc('main')
+    .set({ ...data, updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+  userProfileCache.delete(userId);
 }
 
 async function writeUserFact(userId: string, fact: string, bucket: 'facts' | 'relationshipNotes' = 'facts') {
   if (!fact?.trim()) return;
-  try {
-    const p   = await getUserProfile(userId);
-    const arr = p[bucket] as string[];
-    if (arr.some(f => f.toLowerCase() === fact.toLowerCase())) return;
-    arr.push(fact.trim());
-    if (arr.length > 30) arr.shift();
-    await upsertUserProfile(userId, { [bucket]: arr } as Partial<UserProfile>);
-    console.log(`[UserMem:${bucket}] ${userId.slice(-6)}: "${fact.slice(0, 60)}"`);
-  } catch {}
+  const p   = await getUserProfile(userId);
+  const arr = p[bucket] as string[];
+  if (arr.some(f => f.toLowerCase() === fact.toLowerCase())) return;
+  arr.push(fact.trim()); if (arr.length > 30) arr.shift();
+  await upsertUserProfile(userId, { [bucket]: arr } as Partial<UserProfile>);
 }
 
 function userProfileToPrompt(p: UserProfile): string {
   const lines: string[] = [];
   if (p.context) lines.push(`ABOUT THEM: ${p.context}`);
-  if (p.facts.length) lines.push(`KNOWN FACTS:\n${p.facts.slice(-8).map(f => `- ${f}`).join('\n')}`);
-  if (p.relationshipNotes.length) lines.push(`UR RELATIONSHIP/HISTORY:\n${p.relationshipNotes.slice(-6).map(n => `- ${n}`).join('\n')}`);
-  return lines.join('\n\n') || '(nothing yet — first real convo)';
+  if (p.facts.length) lines.push(`KNOWN FACTS:\n${p.facts.slice(-8).map(f=>`- ${f}`).join('\n')}`);
+  if (p.relationshipNotes.length) lines.push(`UR HISTORY:\n${p.relationshipNotes.slice(-6).map(n=>`- ${n}`).join('\n')}`);
+  return lines.join('\n\n') || '(nothing yet)';
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// CLOCK CONTEXT
+// CLOCK CONTEXT (unchanged from v8.1)
 // ═══════════════════════════════════════════════════════════════════
 
-function clockContext(msgs: STMessage[], state: SpeakState): string {
+function clockContext(msgs: STMessage[], speakState: SpeakState, mood: MoodState): string {
   const nowMs   = Date.now();
-  const now     = new Date();
-  const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
-  const dayStr  = now.toLocaleDateString('en-US', { weekday: 'long' });
-
+  const timeStr = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+  const dayStr  = new Date().toLocaleDateString('en-US', { weekday: 'long' });
   const lastBot   = [...msgs].reverse().find(m => m.author === '[me]');
   const lastHuman = [...msgs].reverse().find(m => m.author !== '[me]');
-
   const botAgo   = lastBot   ? `${Math.round((nowMs - lastBot.ts)   / 1000)}s ago` : 'not this session';
   const humanAgo = lastHuman ? `${Math.round((nowMs - lastHuman.ts) / 1000)}s ago` : 'unknown';
-  const stateAge = Math.round((nowMs - state.setAt) / 1000);
-  const stateStr = stateAge < 60 ? `${stateAge}s` : `${Math.round(stateAge / 60)}m`;
-  const resumeStr = state.resumeAt ? ` → resumes ${new Date(state.resumeAt).toLocaleTimeString()}` : '';
+  const stateAge = Math.round((nowMs - speakState.setAt) / 1000);
+  const resume   = speakState.resumeAt ? ` → resumes ${new Date(speakState.resumeAt).toLocaleTimeString()}` : '';
 
-  return `${timeStr} ${dayStr} | u last spoke: ${botAgo} | last msg in chat: ${humanAgo} | mode: ${state.mode} (for ${stateStr})${resumeStr}`;
+  // Add mood info to clock context
+  const moodInfo = mood.mode === 'active' && mood.activeUntil
+    ? `ACTIVE until ${new Date(mood.activeUntil).toLocaleTimeString()} (${Math.round((mood.activeUntil - nowMs) / 60_000)}m left)`
+    : `PASSIVE (brain every ${mood.passiveEvery} msgs, count: ${mood.passiveCount})`;
+
+  return `${timeStr} ${dayStr} | u last spoke: ${botAgo} | last msg: ${humanAgo} | speak: ${speakState.mode}${resume} (${stateAge < 60 ? stateAge+'s' : Math.round(stateAge/60)+'m'}) | mood: ${moodInfo}`;
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// BRAIN — now routes through aiRequest() which picks Groq or HF
+// BRAIN — v9: adds moodSwitch + activeDurationMins to decision
 // ═══════════════════════════════════════════════════════════════════
 
 interface BrainDecision {
-  action:     'speak' | 'pause' | 'wait' | 'ignore';
-  reply?:     string;
-  pauseMins?: number;
-  bondDelta?: number;
-  newFact?:   string;
-  userFact?:  string;
-  userNote?:  string;
-  reason:     string;
+  action:             'speak' | 'pause' | 'wait' | 'ignore';
+  reply?:             string;
+  pauseMins?:         number;
+  bondDelta?:         number;
+  newFact?:           string;
+  userFact?:          string;
+  userNote?:          string;
+  reason:             string;
+  // v9 mood fields
+  moodSwitch?:        'active' | 'passive' | null;
+  activeDurationMins?: number;  // how long to stay active if switching to active
+  passiveEvery?:      number;   // if switching to passive, how many msgs between brain calls
 }
 
 async function brain(
-  guildId:     string,   // NEW v8.1: needed to route to correct backend
-  senderName:  string,
-  senderInfo:  string,
-  bond:        number,
-  message:     string,
-  transcript:  string,
-  memCtx:      string,
-  userCtx:     string,
-  clock:       string,
-  mentioned:   boolean,
-  state:       SpeakState,
-  isDM:        boolean,
+  guildId:    string,
+  senderName: string,
+  senderInfo: string,
+  bond:       number,
+  message:    string,
+  transcript: string,
+  memCtx:     string,
+  userCtx:    string,
+  clock:      string,
+  mentioned:  boolean,
+  speakState: SpeakState,
+  mood:       MoodState,
+  isDM:       boolean,
+  autoActiveReason?: string,
 ): Promise<BrainDecision> {
 
   const bondLabel = bond > 75 ? 'close friend' : bond > 50 ? 'neutral' : bond > 25 ? 'not close' : 'beef';
@@ -687,353 +683,270 @@ vibe: chaotic, funny, charming, lowkey unhinged. u roast ur friends but genuinel
 
 HOW U TALK:
 - all lowercase. 1-2 sentences MAX. sometimes just a word or single emoji is best.
-- slang: ngl, fr, bruh, lowkey, nah, bet, istg, deadass, lmaoo, yo, ong, idk, tbh, rn, imo, no cap, smh, bro, wtf, omg, slay
+- slang: ngl, fr, bruh, lowkey, nah, bet, istg, deadass, lmaoo, yo, ong, idk, tbh, rn, imo, no cap, smh, bro, wtf, omg
 - typos r fine. dont fix them. dont explain urself. dont be formal. dont yap.
-- match the energy — chaotic energy gets chaos back. chill gets chill.
+- match the energy — chaotic gets chaos. chill gets chill.
 
 NEVER: "certainly", "as an ai", "i understand", "how can i help", "great question", bullet points, explaining ur jokes, being an assistant.
 
-${isDM ? `THIS IS A DM (1:1, just u and them):
-- more personal, can reference shared history/inside stuff more directly
-- still short, still urself, not a customer service bot
-- if they ever said smth like "come to dm" / "hop on later" / "lemme tell u smth" — and u haven't followed up yet — this is a good time to acknowledge that if relevant` : ''}
+${isDM ? `THIS IS A DM — more personal. reference shared history. still short, still urself.` : ''}
 
-SPEAK STATE (u control this):
-- speak  → reply (put it in reply field, raw text no quotes no name prefix)
-- pause  → shut up X mins (use when someone tells u to stop / clearly interrupting)
-- wait   → stay silent until someone calls u or obvious opening appears
+━━━ SPEAK STATE (u control this) ━━━
+- speak  → reply (raw text in reply field, no quotes, no name prefix)
+- pause  → shut up X mins (someone told u to stop / clearly interrupting)
+- wait   → silent until someone calls u or obvious opening
 - ignore → skip this msg, stay active
 
-READING THE CHAT TRANSCRIPT:
-- [me] = ur own past messages
-- @Name = someone tagging/mentioning that person by their discord name
-- ↳ replying to X: "..." = shows what message someone was replying TO (thread context)
-  → this tells u who is talking to who and what they're actually responding to
+━━━ MOOD CONTROL (v9, u also control this) ━━━
+You run in two modes per channel:
+- ACTIVE: u see every message, full attention, u decide to walk in/out naturally
+- PASSIVE: u check in every few messages, mostly hands-off
 
-WHEN TO REPLY: tagged, directly asked something, u have smth actually funny/relevant
-WHEN NOT TO: two people clearly in their own convo, forced/cringe to jump in, u already said ur piece recently`;
+Return moodSwitch to change modes:
+- "active"  → go active. set activeDurationMins (5-15). use when: someone's talking to u, it's ur convo now, they called u over
+- "passive" → go passive. set passiveEvery (2-10 msgs). use when: convo clearly not for u, people are busy with each other, u've said ur piece and it's dying down, u were told off
+- null       → keep current mode
+
+Examples:
+- Someone said "shut up" or "not for u" → action=pause + moodSwitch=passive
+- Multiple people chatting among themselves → moodSwitch=passive passiveEvery=7
+- Someone @'d u and seems to want a back-and-forth → moodSwitch=active activeDurationMins=10
+- Natural end of ur conversation → moodSwitch=passive
+- Someone said "come to dm" or set up a future convo → moodSwitch=active (for this specific channel)
+
+READING THE CHAT:
+- [me] = ur own past messages
+- ↳ replying to X: "..." = shows reply chain context — who is talking to who
+- Timestamps tell u how fast/slow the convo is moving`;
 
   const user = `<clock>${clock}</clock>
-
 <server_memory>
 ${memCtx}
 </server_memory>
-
 <about_${senderName}>
 ${userCtx}
 </about_${senderName}>
-
 <recent_chat>
 ${transcript}
 </recent_chat>
 
-${senderName} (${bondLabel}, bond ${bond}/100${senderInfo ? ` — ${senderInfo}` : ''}) just said: "${message}"
-tagged you: ${mentioned ? 'YES — almost always reply' : 'no'}
+${senderName} (${bondLabel}, ${bond}/100${senderInfo ? ` — ${senderInfo}` : ''}) said: "${message}"
+tagged you: ${mentioned ? 'YES — almost always reply' : 'no'}${autoActiveReason ? `\nauto-active triggered: ${autoActiveReason}` : ''}
+current mood: ${mood.mode}${mood.activeUntil ? ` (${Math.round((mood.activeUntil - Date.now()) / 60_000)}m left)` : ''}
 
-Output ONLY valid JSON, no markdown, no extra text:
-{"action":"speak|pause|wait|ignore","reply":"ur raw reply if speaking","pauseMins":5,"bondDelta":0,"newFact":"server-wide fact worth remembering, or empty string","userFact":"fact specifically about ${senderName}, or empty string","userNote":"relationship/history note about ${senderName} (e.g. they invited u somewhere, ongoing bit, etc), or empty string","reason":"one line"}`;
-
-  const msgs = [
-    { role: 'system', content: system },
-    { role: 'user',   content: user  },
-  ];
+Output ONLY valid JSON:
+{"action":"speak|pause|wait|ignore","reply":"raw reply if speaking","pauseMins":5,"bondDelta":0,"newFact":"","userFact":"","userNote":"","moodSwitch":"active|passive|null","activeDurationMins":${ACTIVE_DEFAULT_MINS},"passiveEvery":${PASSIVE_DEFAULT_EVERY},"reason":"one line"}`;
 
   try {
-    // Route through unified dispatcher — picks Groq or HF automatically
-    const raw    = await aiRequest(guildId, FAST, msgs, 0.88, 200);
-    const clean  = raw.replace(/```json|```/g, '').trim();
-    const parsed = JSON.parse(clean);
+    const raw    = await aiRequest(guildId, FAST, [{ role: 'system', content: system }, { role: 'user', content: user }], 0.88, 220);
+    const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
 
     if (mentioned && parsed.action !== 'speak') parsed.action = 'speak';
 
+    // Clamp mood values
+    if (parsed.activeDurationMins) parsed.activeDurationMins = Math.max(ACTIVE_MIN_MINS, Math.min(ACTIVE_MAX_MINS, parsed.activeDurationMins));
+    if (parsed.passiveEvery)       parsed.passiveEvery       = Math.max(PASSIVE_MIN_EVERY, Math.min(PASSIVE_MAX_EVERY, parsed.passiveEvery));
+
     return {
-      action:    parsed.action    || 'ignore',
-      reply:     parsed.reply     || '',
-      pauseMins: parsed.pauseMins || 5,
-      bondDelta: parsed.bondDelta || 0,
-      newFact:   parsed.newFact   || '',
-      userFact:  parsed.userFact  || '',
-      userNote:  parsed.userNote  || '',
-      reason:    parsed.reason    || '?',
+      action:             parsed.action             || 'ignore',
+      reply:              parsed.reply              || '',
+      pauseMins:          parsed.pauseMins          || 5,
+      bondDelta:          parsed.bondDelta          || 0,
+      newFact:            parsed.newFact            || '',
+      userFact:           parsed.userFact           || '',
+      userNote:           parsed.userNote           || '',
+      reason:             parsed.reason             || '?',
+      moodSwitch:         parsed.moodSwitch === 'null' ? null : (parsed.moodSwitch || null),
+      activeDurationMins: parsed.activeDurationMins || ACTIVE_DEFAULT_MINS,
+      passiveEvery:       parsed.passiveEvery       || PASSIVE_DEFAULT_EVERY,
     };
   } catch (e) {
-    const errMsg = (e as any).message || 'unknown error';
-    console.warn('[Brain] error:', errMsg.slice(0, 120));
-    return {
-      action: mentioned ? 'speak' : 'ignore',
-      reply:  mentioned ? `brain lagged: ${errMsg.slice(0, 80)}` : '',
-      reason: 'error fallback',
-    };
+    console.warn('[Brain] error:', (e as any).message?.slice(0, 120));
+    return { action: mentioned ? 'speak' : 'ignore', reply: mentioned ? 'brain lagged' : '', reason: 'error fallback' };
+  }
+}
+
+// ─── Apply mood switch from brain decision ────────────────────────────────────
+
+async function applyMoodSwitch(
+  channelId: string,
+  guildId:   string,
+  decision:  BrainDecision,
+  mood:      MoodState,
+) {
+  if (!decision.moodSwitch) return;
+
+  if (decision.moodSwitch === 'active') {
+    const mins = decision.activeDurationMins ?? ACTIVE_DEFAULT_MINS;
+    await setMoodState(channelId, guildId, {
+      mode: 'active',
+      activeUntil: Date.now() + mins * 60_000,
+      reason: `brain: ${decision.reason}`,
+    });
+  } else if (decision.moodSwitch === 'passive') {
+    await setMoodState(channelId, guildId, {
+      mode:         'passive',
+      activeUntil:  undefined,
+      passiveEvery: decision.passiveEvery ?? PASSIVE_DEFAULT_EVERY,
+      passiveCount: 0,
+      reason:       `brain: ${decision.reason}`,
+    });
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// PROFILER — background, rate-aware, runs every 15 min
+// PROFILER (unchanged from v8.1)
 // ═══════════════════════════════════════════════════════════════════
 
-async function profileMember(
-  guildId: string,
-  userId:  string,
-  username: string,
-  msgs:    string[],
-) {
+async function profileMember(guildId: string, userId: string, username: string, msgs: string[]) {
   if (msgs.length < 3 || !rpmAllow()) return;
   try {
     const res = await aiRequest(guildId, DEEP, [
       { role: 'system', content: 'analyze a discord user from their messages. output ONLY valid JSON, no markdown.' },
-      { role: 'user',   content: `user: ${username}\ntheir messages:\n${msgs.join('\n')}\n\nJSON: {"personality":"one line vibe","interests":["x"],"vibes":"how they communicate","sentiment":"positive|neutral|negative","nicknames":["any names people call them"]}` },
+      { role: 'user',   content: `user: ${username}\nmessages:\n${msgs.join('\n')}\n\nJSON: {"personality":"one line vibe","interests":["x"],"vibes":"how they communicate","sentiment":"positive|neutral|negative","nicknames":["any names people call them"]}` },
     ], 0.4, 160);
     const p = JSON.parse(res.replace(/```json|```/g, '').trim());
     await upsertMember(guildId, userId, {
-      personality: p.personality  || '',
-      interests:   p.interests    || [],
-      vibes:       p.vibes        || '',
-      sentiment:   p.sentiment    || 'neutral',
-      nicknames:   p.nicknames    || [],
-      profiledAt:  new Date().toISOString(),
+      personality: p.personality || '', interests: p.interests || [],
+      vibes: p.vibes || '', sentiment: p.sentiment || 'neutral',
+      nicknames: p.nicknames || [], profiledAt: new Date().toISOString(),
     });
-    if (p.nicknames?.length) {
-      console.log(`[Profiler] ${username} aka: ${p.nicknames.join(', ')}`);
-    }
     console.log(`[Profiler] ${username} → "${p.personality}"`);
   } catch {}
 }
 
-async function deepProfileUser(userId: string, username: string, recentMsgs: string[], guildId: string) {
-  if (recentMsgs.length < 2 || !rpmAllow()) return;
+async function deepProfileUser(userId: string, username: string, msgs: string[], guildId: string) {
+  if (msgs.length < 2 || !rpmAllow()) return;
   try {
-    const existing = await getUserProfile(userId);
+    const ex = await getUserProfile(userId);
     const res = await aiRequest(guildId, DEEP, [
-      { role: 'system', content: 'you maintain a rolling private profile of a discord user for a bot persona. output ONLY valid JSON, no markdown. be concise.' },
-      { role: 'user', content:
-`user: ${username}
-existing context: ${existing.context || '(none yet)'}
-existing relationship notes: ${existing.relationshipNotes.slice(-5).join(' | ') || '(none)'}
-
-their recent messages:
-${recentMsgs.join('\n')}
-
-Update the rolling context (2-3 sentences max, merge old+new, drop stale stuff) and list any NEW relationship notes (things like: they invited the bot somewhere, ongoing jokes/bits specific to them, how they treat the bot, anything notable about this interaction pattern). Don't repeat notes already listed above.
-
-JSON: {"context":"updated rolling summary","newNotes":["x"],"newFacts":["x"]}` },
+      { role: 'system', content: 'maintain a rolling private profile of a discord user. output ONLY valid JSON, no markdown. be concise.' },
+      { role: 'user',   content: `user: ${username}\nexisting context: ${ex.context || '(none)'}\nexisting notes: ${ex.relationshipNotes.slice(-5).join(' | ') || '(none)'}\n\nrecent messages:\n${msgs.join('\n')}\n\nJSON: {"context":"updated 2-3 sentence summary","newNotes":["x"],"newFacts":["x"]}` },
     ], 0.4, 220);
-
     const p = JSON.parse(res.replace(/```json|```/g, '').trim());
     if (p.context) await upsertUserProfile(userId, { context: p.context, deepProfiledAt: new Date().toISOString(), displayName: username });
     for (const n of (p.newNotes || []).slice(0, 3)) await writeUserFact(userId, n, 'relationshipNotes');
     for (const f of (p.newFacts || []).slice(0, 3)) await writeUserFact(userId, f, 'facts');
-    console.log(`[DeepProfile] ${username} → "${(p.context || '').slice(0, 60)}"`);
   } catch {}
 }
 
 const lastCompressedAt = new Map<string, number>();
-
 async function maybeCompressHourly(guildId: string, channelId: string) {
-  const last = lastCompressedAt.get(guildId) || 0;
-  if (Date.now() - last < COMPRESS_INTERVAL) return;
+  if (Date.now() - (lastCompressedAt.get(guildId) || 0) < COMPRESS_INTERVAL) return;
   if (!rpmAllow()) return;
   lastCompressedAt.set(guildId, Date.now());
-
   const msgs = stmGet(channelId);
   if (msgs.length < 10) return;
-
   try {
-    const text = msgs.map(m => {
-      let line = `${m.author}: ${m.content}`;
-      if (m.replyTo) line += ` (↳ to ${m.replyTo.author}: "${m.replyTo.content.slice(0, 40)}")`;
-      return line;
-    }).join('\n');
-
-    const res = await aiRequest(guildId, DEEP, [
-      { role: 'system', content: 'summarize this discord server chat hour. extract the vibe, key facts, inside jokes. ONLY valid JSON, no markdown.' },
-      { role: 'user', content: `${text}\n\nJSON: {"summary":"brief summary","groupVibe":"one line vibe","insideJokes":["x"],"facts":["x"]}` },
+    const text = msgs.map(m => `${m.author}: ${m.content}${m.replyTo ? ` (↳ to ${m.replyTo.author}: "${m.replyTo.content.slice(0,40)}")` : ''}`).join('\n');
+    const res  = await aiRequest(guildId, DEEP, [
+      { role: 'system', content: 'summarize discord chat. extract vibe, facts, inside jokes. ONLY valid JSON.' },
+      { role: 'user',   content: `${text}\n\nJSON: {"summary":"brief","groupVibe":"one line","insideJokes":["x"],"facts":["x"]}` },
     ], 0.4, 250);
-
     const p = JSON.parse(res.replace(/```json|```/g, '').trim());
-
     for (const f of (p.facts       || []).slice(0, 5)) await writeFact(guildId, f, 'facts');
     for (const j of (p.insideJokes || []).slice(0, 4)) await writeFact(guildId, j, 'insideJokes');
-
-    await db.collection('servers').doc(guildId)
-      .collection('notes').doc('hourly')
+    await db.collection('servers').doc(guildId).collection('notes').doc('hourly')
       .set({ summary: p.summary, groupVibe: p.groupVibe, at: new Date().toISOString() }, { merge: true });
-
-    console.log(`[Compress] ${guildId} hourly notes saved → "${p.groupVibe}"`);
+    console.log(`[Compress] "${p.groupVibe}"`);
   } catch {}
 }
 
 function startProfilerLoop(client: Client) {
   if (profilerTimer) clearInterval(profilerTimer);
-
+  profilerCycle = 0;
   profilerTimer = setInterval(async () => {
-    if (!rpmAllow()) { console.log('[Profiler] RPM tight — skipping cycle'); return; }
+    if (!rpmAllow()) return;
     profilerCycle++;
-    const doDeepUser = profilerCycle % USER_DEEP_PROFILE_EVERY === 0;
-
+    const doDeep = profilerCycle % USER_DEEP_PROFILE_EVERY === 0;
     try {
       for (const guild of client.guilds.cache.values()) {
         await upsertServerIdentity(guild);
-
         for (const ch of guild.channels.cache.filter(c => c.isTextBased()).values()) {
           try {
             const fetched = await (ch as any).messages.fetch({ limit: 20 });
             const msgs    = ([...fetched.values()] as Message[]).reverse();
-
             seedSTM(ch.id, msgs);
-
-            const byAuthor = new Map<string, { userId: string; lines: string[] }>();
+            const byAuthor = new Map<string, string[]>();
             for (const m of msgs) {
               if (m.author.bot || !m.content.trim()) continue;
-              const uid  = m.author.id;
-              const name = m.member?.displayName || m.author.username;
-
-              cacheId(uid, name);
-
-              await upsertMember(guild.id, uid, {
-                displayName: name,
-                username:    m.author.username,
-              });
-
-              if (!byAuthor.has(uid)) byAuthor.set(uid, { userId: uid, lines: [] });
-              byAuthor.get(uid)!.lines.push(m.content.slice(0, 100));
+              cacheId(m.author.id, m.member?.displayName || m.author.username);
+              await upsertMember(guild.id, m.author.id, { displayName: m.member?.displayName || m.author.username, username: m.author.username });
+              if (!byAuthor.has(m.author.id)) byAuthor.set(m.author.id, []);
+              byAuthor.get(m.author.id)!.push(m.content.slice(0, 100));
             }
-
-            for (const [uid, { lines }] of byAuthor) {
+            for (const [uid, lines] of byAuthor) {
               if (!rpmAllow()) break;
-              const member = guild.members.cache.get(uid);
-              const name   = member?.displayName || uid;
+              const name = guild.members.cache.get(uid)?.displayName || uid;
               await profileMember(guild.id, uid, name, lines);
-              if (doDeepUser && rpmAllow()) {
-                await deepProfileUser(uid, name, lines, guild.id);
-              }
+              if (doDeep && rpmAllow()) await deepProfileUser(uid, name, lines, guild.id);
             }
           } catch {}
         }
       }
       memberRosterCache.clear();
-      console.log(`[Profiler] cycle done | deepUser=${doDeepUser} | ${groq.available()} daily reqs left | ${rpmLeft()} RPM left`);
-    } catch (e) { console.error('[Profiler] error:', e); }
+      console.log(`[Profiler] cycle ${profilerCycle} | deepUser=${doDeep} | ${groq.available()} daily | ${rpmLeft()} RPM`);
+    } catch (e) { console.error('[Profiler]', e); }
   }, PROFILER_INTERVAL);
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// PROACTIVE HOP LOOP (v8) — unchanged, now routes through aiRequest
+// PROACTIVE HOP LOOP (unchanged from v8.1)
 // ═══════════════════════════════════════════════════════════════════
 
-interface ProactiveCandidate {
-  type:        'channel' | 'dm';
-  id:          string;
-  guildId:     string;  // NEW v8.1: needed for backend routing
-  label:       string;
-  contextHint: string;
-}
+interface ProactiveCandidate { type: 'channel'|'dm'; id: string; guildId: string; label: string; contextHint: string; }
 
 async function gatherProactiveCandidates(client: Client): Promise<ProactiveCandidate[]> {
   const out: ProactiveCandidate[] = [];
   const now = Date.now();
-
   for (const [channelId, msgs] of stmStore.entries()) {
     if (!msgs.length) continue;
-    const last = msgs[msgs.length - 1];
+    const last   = msgs[msgs.length - 1];
     const idleMs = now - last.ts;
     if (idleMs < 5 * 60_000 || idleMs > 3 * 60 * 60_000) continue;
-
-    // Find which guild this channel belongs to
     let guildId = 'dm';
-    for (const guild of client.guilds.cache.values()) {
-      if (guild.channels.cache.has(channelId)) { guildId = guild.id; break; }
-    }
-
-    out.push({
-      type: 'channel',
-      id: channelId,
-      guildId,
-      label: `#${channelId.slice(-6)}`,
-      contextHint: `went quiet ${Math.round(idleMs / 60_000)}m ago, last msg: "${last.content.slice(0, 60)}"`,
-    });
+    for (const g of client.guilds.cache.values()) if (g.channels.cache.has(channelId)) { guildId = g.id; break; }
+    out.push({ type: 'channel', id: channelId, guildId, label: `#${channelId.slice(-6)}`, contextHint: `quiet ${Math.round(idleMs/60_000)}m ago, last: "${last.content.slice(0,60)}"` });
   }
-
   try {
     const snap = await db.collection('users').get();
     for (const doc of snap.docs) {
-      const userId = doc.id;
-      const profSnap = await doc.ref.collection('profile').doc('main').get();
-      if (!profSnap.exists) continue;
-      const p = profSnap.data() as UserProfile;
-
-      const lastProactive = p.lastProactiveAt || 0;
-      if (now - lastProactive < PROACTIVE_MIN_GAP_USER) continue;
-      if (!p.dmChannelId) continue;
-
-      const inviteHint = (p.relationshipNotes || []).find(n =>
-        /dm|hop on|come (here|over)|lemme tell|wanna (talk|tell)|hit (me|u) up/i.test(n)
-      );
-      if (!inviteHint && !p.context) continue;
-
-      // DM proactive always uses 'dm' as guildId → defaults to groq backend
-      out.push({
-        type: 'dm',
-        id: userId,
-        guildId: 'dm',
-        label: p.displayName || userId.slice(-6),
-        contextHint: inviteHint
-          ? `they said: "${inviteHint}"`
-          : `context: ${p.context.slice(0, 80)}`,
-      });
+      const p = (await doc.ref.collection('profile').doc('main').get()).data() as UserProfile | undefined;
+      if (!p?.dmChannelId) continue;
+      if ((p.lastProactiveAt || 0) > now - PROACTIVE_MIN_GAP_USER) continue;
+      const invite = p.relationshipNotes?.find(n => /dm|hop on|come (here|over)|lemme tell|wanna (talk|tell)|hit (me|u) up/i.test(n));
+      if (!invite && !p.context) continue;
+      out.push({ type: 'dm', id: doc.id, guildId: 'dm', label: p.displayName || doc.id.slice(-6), contextHint: invite ? `they said: "${invite}"` : `context: ${p.context?.slice(0,80)}` });
     }
   } catch {}
-
   return out;
 }
 
 async function runProactiveCycle(client: Client) {
-  if (!rpmAllow()) { console.log('[Proactive] RPM tight — skip'); return; }
-
+  if (!rpmAllow()) return;
   const candidates = await gatherProactiveCandidates(client);
-  if (!candidates.length) { console.log('[Proactive] no candidates this cycle'); return; }
-
+  if (!candidates.length) { console.log('[Proactive] no candidates'); return; }
   const sample = candidates.slice(0, 12);
-
-  const listText = sample.map((c, i) =>
-    `${i}. [${c.type}] ${c.label} — ${c.contextHint}`
-  ).join('\n');
-
-  const system = `you are ${BOT_NAME}, a chaotic gen-z discord persona (NOT an assistant). u have FULL LIBERTY to either say nothing (most common — pick "none") or proactively send ONE message to a server channel or someone's DM if it feels natural/funny/warranted.
-
-be very conservative — only pick something if it's genuinely a good moment (e.g. someone explicitly invited u to dm earlier and u haven't followed up, or a channel went quiet on something u could naturally jump back into). most cycles should result in "none". never be needy, never spam, never force a convo.
-
-if u pick a target, write the actual message — raw lowercase gen-z text, same voice as always (ngl, fr, bruh, lowkase, short, 1-2 sentences).`;
-
-  const user = `candidates:\n${listText}\n\nOutput ONLY valid JSON, no markdown:
-{"pick":"none|<index number>","message":"the raw message to send if picking something, else empty string","reason":"one line"}`;
-
+  const listText = sample.map((c, i) => `${i}. [${c.type}] ${c.label} — ${c.contextHint}`).join('\n');
   try {
-    // Use first candidate's guildId for backend routing
-    const routingGuildId = sample[0]?.guildId || 'dm';
-    const raw = await aiRequest(routingGuildId, DEEP, [
-      { role: 'system', content: system },
-      { role: 'user', content: user },
+    const raw = await aiRequest(sample[0]?.guildId || 'dm', DEEP, [
+      { role: 'system', content: `you are ${BOT_NAME}, chaotic gen-z discord persona. FULL LIBERTY to say nothing (most common — pick "none") or send ONE message if genuinely warranted. be very conservative, never needy, never force it.` },
+      { role: 'user',   content: `candidates:\n${listText}\n\nJSON: {"pick":"none|<index>","message":"raw msg if picking","reason":"one line"}` },
     ], 0.9, 150);
-
-    const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
-    console.log(`[Proactive] decision: ${parsed.pick} | "${parsed.reason}"`);
-
-    if (parsed.pick === 'none' || parsed.pick === undefined) return;
-
-    const idx = parseInt(String(parsed.pick), 10);
+    const p = JSON.parse(raw.replace(/```json|```/g, '').trim());
+    if (p.pick === 'none' || p.pick == null) return;
+    const idx = parseInt(String(p.pick), 10);
     if (isNaN(idx) || idx < 0 || idx >= sample.length) return;
     const target = sample[idx];
-    const text = (parsed.message || '').trim().replace(/^["']|["']$/g, '').slice(0, 200);
+    const text   = (p.message || '').trim().replace(/^["']|["']$/g, '').slice(0, 200);
     if (!text) return;
-
     if (target.type === 'channel') {
       const ch = client.channels.cache.get(target.id) as TextChannel | undefined;
-      if (!ch || !ch.isTextBased()) return;
+      if (!ch?.isTextBased()) return;
       await (ch as any).sendTyping().catch(() => {});
       await sleep(Math.min(400 + text.length * 22, 3000));
       await (ch as any).send(text);
       stmPush(target.id, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
-      console.log(`[Proactive→channel] ${target.label}: "${text.slice(0, 60)}"`);
     } else {
       const user = await client.users.fetch(target.id).catch(() => null);
       if (!user) return;
@@ -1044,30 +957,27 @@ if u pick a target, write the actual message — raw lowercase gen-z text, same 
       await dm.send(text);
       stmPush(dm.id, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
       await upsertUserProfile(target.id, { lastProactiveAt: Date.now() });
-      console.log(`[Proactive→dm] ${target.label}: "${text.slice(0, 60)}"`);
     }
-  } catch (e) {
-    console.warn('[Proactive] error:', (e as any).message?.slice(0, 80));
-  }
+    console.log(`[Proactive→${target.type}] ${target.label}: "${text.slice(0,60)}"`);
+  } catch (e) { console.warn('[Proactive]', (e as any).message?.slice(0,80)); }
 }
 
 function scheduleProactiveCycle(client: Client) {
   const jitter = Math.floor((Math.random() * 2 - 1) * PROACTIVE_JITTER);
   const delay  = Math.max(60_000, PROACTIVE_BASE_INTERVAL + jitter);
   proactiveTimer = setTimeout(async () => {
-    try { await runProactiveCycle(client); } catch (e) { console.error('[Proactive] cycle error:', e); }
+    try { await runProactiveCycle(client); } catch {}
     scheduleProactiveCycle(client);
   }, delay);
-  console.log(`[Proactive] next cycle in ${Math.round(delay / 60_000)}m`);
+  console.log(`[Proactive] next in ${Math.round(delay / 60_000)}m`);
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// MAIN MESSAGE HANDLER
+// MAIN MESSAGE HANDLER (v9: uses shouldFireBrain + applyMoodSwitch)
 // ═══════════════════════════════════════════════════════════════════
 
 async function handleMessage(msg: Message) {
   if (msg.author.bot || !msg.content?.trim()) return;
-
   try {
     const isDM    = msg.channel.isDMBased();
     const isGuild = !isDM && !!msg.guildId;
@@ -1075,42 +985,28 @@ async function handleMessage(msg: Message) {
 
     const guildId   = isGuild ? msg.guildId! : 'dm';
     const channelId = msg.channelId;
-
     const mentioned = isDM ? true : (BOT_ID ? msg.mentions.has(BOT_ID) : false);
-
     const sender    = msg.member?.displayName || msg.author.username;
     const msgClean  = cleanContent(msg.content);
 
     cacheId(msg.author.id, sender);
 
-    if (isDM) {
-      await upsertUserProfile(msg.author.id, {
-        dmChannelId: channelId,
-        lastDM:      Date.now(),
-        displayName: sender,
-      });
-    } else {
-      await upsertUserProfile(msg.author.id, {
-        lastSeenChannelId: channelId,
-        lastSeenGuildId:   guildId,
-        displayName:       sender,
-      });
-    }
+    if (isDM) await upsertUserProfile(msg.author.id, { dmChannelId: channelId, lastDM: Date.now(), displayName: sender });
+    else       await upsertUserProfile(msg.author.id, { lastSeenChannelId: channelId, lastSeenGuildId: guildId, displayName: sender });
 
+    // Reply chain context
     let replyRef: STMessage['replyTo'] | undefined;
     if (msg.reference?.messageId) {
       try {
-        const ref       = await msg.channel.messages.fetch(msg.reference.messageId);
-        const refAuthor = ref.author.id === BOT_ID
-          ? '[me]'
-          : (ref.member?.displayName || ref.author.username);
-        replyRef = {
-          author:  refAuthor,
+        const ref = await msg.channel.messages.fetch(msg.reference.messageId);
+        replyRef  = {
+          author:  ref.author.id === BOT_ID ? '[me]' : (ref.member?.displayName || ref.author.username),
           content: cleanContent(ref.content).slice(0, 100),
         };
       } catch {}
     }
 
+    // Push to STM immediately (before brain fires)
     stmPush(channelId, {
       ts:       msg.createdTimestamp,
       authorId: msg.author.id,
@@ -1119,20 +1015,23 @@ async function handleMessage(msg: Message) {
       replyTo:  replyRef,
     });
 
-    if (!shouldFireBrain(channelId, mentioned)) return;
+    // ── Mood gate (v9) ──────────────────────────────────────────────
+    const { fire, mood, autoActiveReason } = await shouldFireBrain(
+      channelId, guildId, msgClean, msg.author.id, mentioned, isDM
+    );
+
+    if (!fire) return;
 
     if (debounceTimers.has(channelId)) clearTimeout(debounceTimers.get(channelId)!);
 
-    const debounce = mentioned ? 200 : DEBOUNCE_MS;
-    const timer    = setTimeout(async () => {
+    const timer = setTimeout(async () => {
       debounceTimers.delete(channelId);
-
       try {
-        const state = await getSpeakState(channelId, guildId);
+        const speakState = await getSpeakState(channelId, guildId);
 
-        if (state.mode === 'paused' && state.resumeAt && Date.now() < state.resumeAt && !mentioned) {
-          const leftSec = Math.round((state.resumeAt - Date.now()) / 1000);
-          console.log(`[Paused] #${channelId.slice(-6)} ${leftSec}s left → skip`);
+        // Paused + not mentioned → skip
+        if (speakState.mode === 'paused' && speakState.resumeAt && Date.now() < speakState.resumeAt && !mentioned) {
+          console.log(`[Paused] ${Math.round((speakState.resumeAt - Date.now()) / 1000)}s left`);
           return;
         }
 
@@ -1148,37 +1047,36 @@ async function handleMessage(msg: Message) {
           getUserProfile(msg.author.id),
         ]);
 
-        const bond    = typeof memberData.bond === 'number' ? memberData.bond : 50;
-        const profile = [memberData.personality, memberData.vibes].filter(Boolean).join(' | ');
-
-        const nowMs      = Date.now();
-        const msgs       = stmGet(channelId);
-        const transcript = stmFormat(msgs, nowMs);
-        const memCtx     = memToPrompt(memory, allMembers);
-        const userCtx    = userProfileToPrompt(userProfile);
-        const clock      = clockContext(msgs, state);
+        const bond     = typeof memberData.bond === 'number' ? memberData.bond : 50;
+        const profile  = [memberData.personality, memberData.vibes].filter(Boolean).join(' | ');
+        const msgs     = stmGet(channelId);
+        const clock    = clockContext(msgs, speakState, mood);
 
         const decision = await brain(
-          guildId,       // NEW v8.1 — pass guildId for backend routing
-          sender, profile, bond,
-          msgClean, transcript, memCtx, userCtx, clock,
-          mentioned, state, isDM,
+          guildId, sender, profile, bond,
+          msgClean, stmFormat(msgs, Date.now()),
+          memToPrompt(memory, allMembers),
+          userProfileToPrompt(userProfile),
+          clock, mentioned, speakState, mood, isDM,
+          autoActiveReason,
         );
 
-        // ── Show backend in logs so you always know which model replied ──
         const activeBackend = await getBackend(guildId);
-        console.log(`[Brain:${activeBackend.toUpperCase()}] ${sender}${isDM ? ' (DM)' : ''}: ${decision.action} | "${decision.reason}"`);
+        console.log(`[Brain:${activeBackend.toUpperCase()}][${mood.mode}] ${sender}${isDM?' (DM)':''}: ${decision.action} | mood→${decision.moodSwitch ?? 'same'} | "${decision.reason}"`);
 
+        // Apply mood switch from brain (before handling action)
+        await applyMoodSwitch(channelId, guildId, decision, mood);
+
+        // ── Handle action ──────────────────────────────────────────
         switch (decision.action) {
 
           case 'speak': {
             const text = (decision.reply || '').trim()
               .replace(/^["']|["']$/g, '')
               .replace(new RegExp(`^${BOT_NAME}:\\s*`, 'i'), '')
-              .split('\n')[0]
-              .slice(0, 200);
+              .split('\n')[0].slice(0, 200);
 
-            if (!text) { console.log('[Brain] speak → empty reply'); break; }
+            if (!text) { console.log('[Brain] speak→empty'); break; }
 
             const typingMs = Math.min(400 + text.length * 22, 3000);
             try { await msg.channel.sendTyping(); } catch {}
@@ -1186,35 +1084,22 @@ async function handleMessage(msg: Message) {
 
             try {
               await msg.reply({ content: text, allowedMentions: { repliedUser: false } });
-
-              stmPush(channelId, {
-                ts:       Date.now(),
-                authorId: BOT_ID,
-                author:   '[me]',
-                content:  text,
-              });
-
+              stmPush(channelId, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
               if (isGuild) {
                 if (decision.bondDelta) await updateBond(guildId, msg.author.id, decision.bondDelta);
                 if (decision.newFact)   await writeFact(guildId, decision.newFact, 'facts');
               }
-
               if (decision.userFact) await writeUserFact(msg.author.id, decision.userFact, 'facts');
               if (decision.userNote) await writeUserFact(msg.author.id, decision.userNote, 'relationshipNotes');
-
-              if (state.mode !== 'active') {
-                await setSpeakState(channelId, guildId, { mode: 'active', reason: 'spoke → reset to active' });
-              }
-
-              console.log(`[→ ${sender}] "${text.slice(0, 60)}"`);
-            } catch (e) { console.error('[Send] error:', e); }
+              if (speakState.mode !== 'active') await setSpeakState(channelId, guildId, { mode: 'active', reason: 'spoke → reset' });
+              console.log(`[→${sender}] "${text.slice(0,60)}"`);
+            } catch (e) { console.error('[Send]', e); }
             break;
           }
 
           case 'pause': {
             const mins     = Math.max(1, Math.min(60, decision.pauseMins || 5));
-            const resumeAt = Date.now() + mins * 60_000;
-            await setSpeakState(channelId, guildId, { mode: 'paused', resumeAt, reason: decision.reason });
+            await setSpeakState(channelId, guildId, { mode: 'paused', resumeAt: Date.now() + mins * 60_000, reason: decision.reason });
             if (isGuild && decision.newFact) await writeFact(guildId, decision.newFact, 'corrections');
             if (decision.userNote) await writeUserFact(msg.author.id, decision.userNote, 'relationshipNotes');
             break;
@@ -1227,21 +1112,19 @@ async function handleMessage(msg: Message) {
             break;
           }
 
-          case 'ignore':
           default:
             if (isGuild && decision.newFact) writeFact(guildId, decision.newFact, 'facts').catch(() => {});
             if (decision.userFact) writeUserFact(msg.author.id, decision.userFact, 'facts').catch(() => {});
             if (decision.userNote) writeUserFact(msg.author.id, decision.userNote, 'relationshipNotes').catch(() => {});
-            break;
         }
 
         if (isGuild) maybeCompressHourly(guildId, channelId).catch(() => {});
 
       } catch (e) { console.error('[Handler] process error:', e); }
-    }, debounce);
+    }, mentioned ? 200 : DEBOUNCE_MS);
 
     debounceTimers.set(channelId, timer);
-  } catch (e) { console.error('[Handler] error:', e); }
+  } catch (e) { console.error('[Handler]', e); }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1253,10 +1136,8 @@ export async function startBot(token: string) {
 
   botClient = new Client({
     intents: [
-      GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.DirectMessages,
-      GatewayIntentBits.MessageContent,
+      GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.DirectMessages, GatewayIntentBits.MessageContent,
       GatewayIntentBits.GuildMembers,
     ],
     partials: [Partials.Message, Partials.Channel],
@@ -1269,16 +1150,15 @@ export async function startBot(token: string) {
 
     console.log(`
 ╔═══════════════════════════════════════════════╗
-║  ✓ ${BOT_NAME} online — v8.1 Full Human+HF
+║  ✓ ${BOT_NAME} online — v9 Mood System
 ║  • ID: ${BOT_ID}
-║  • Keys: ${groq.allStats().length}  |  Avail: ${groq.available()} daily reqs
 ║  • Fast: ${FAST}
 ║  • Deep: ${DEEP}
 ║  • HF Space: ${HF_BASE_URL || '(not set)'}
-║  • HF Model: ${HF_MODEL}
-║  • Brain: every ${BRAIN_EVERY_N} msgs or on mention (DMs always fire)
-║  • RPM budget: ${RPM_CAP} usable / 30 total (Groq mode only)
-║  • Proactive hop: every ~${Math.round(PROACTIVE_BASE_INTERVAL / 60_000)}m ± ${Math.round(PROACTIVE_JITTER / 60_000)}m
+║  • Keys: ${groq.allStats().length} | Avail: ${groq.available()} daily | RPM cap: ${RPM_CAP}
+║  • Active mode: ${ACTIVE_MIN_MINS}-${ACTIVE_MAX_MINS}min | Passive: every ${PASSIVE_MIN_EVERY}-${PASSIVE_MAX_EVERY} msgs
+║  • Auto-active: mention / name / ${Math.round(GAP_THRESHOLD_MS/60_000)}m gap / ${MONOPOLY_THRESHOLD}-msg monopoly
+║  • Proactive: every ~${Math.round(PROACTIVE_BASE_INTERVAL/60_000)}m ± ${Math.round(PROACTIVE_JITTER/60_000)}m
 ╚═══════════════════════════════════════════════╝\n`);
 
     botClient!.user!.setPresence({ status: 'online', activities: [{ name: 'the vibes', type: 3 }] });
@@ -1287,13 +1167,10 @@ export async function startBot(token: string) {
       await upsertServerIdentity(g);
       const members = await g.members.fetch().catch(() => null);
       if (members) {
-        for (const [uid, member] of members) {
-          if (member.user.bot) continue;
-          cacheId(uid, member.displayName);
-          await upsertMember(g.id, uid, {
-            displayName: member.displayName,
-            username:    member.user.username,
-          });
+        for (const [uid, m] of members) {
+          if (m.user.bot) continue;
+          cacheId(uid, m.displayName);
+          await upsertMember(g.id, uid, { displayName: m.displayName, username: m.user.username });
         }
         console.log(`[Boot] synced ${members.size} members for "${g.name}"`);
       }
@@ -1305,23 +1182,16 @@ export async function startBot(token: string) {
 
   botClient.on(Events.MessageCreate, handleMessage);
 
-  botClient.on(Events.GuildMemberAdd, async (member) => {
-    if (member.user.bot) return;
-    cacheId(member.id, member.displayName);
-    await upsertMember(member.guild.id, member.id, {
-      displayName: member.displayName,
-      username:    member.user.username,
-      joinedAt:    new Date().toISOString(),
-    });
+  botClient.on(Events.GuildMemberAdd, async (m) => {
+    if (m.user.bot) return;
+    cacheId(m.id, m.displayName);
+    await upsertMember(m.guild.id, m.id, { displayName: m.displayName, username: m.user.username, joinedAt: new Date().toISOString() });
   });
 
-  botClient.on(Events.GuildMemberUpdate, async (_, member) => {
-    if (member.user.bot) return;
-    cacheId(member.id, member.displayName);
-    await upsertMember(member.guild.id, member.id, {
-      displayName: member.displayName,
-      username:    member.user.username,
-    });
+  botClient.on(Events.GuildMemberUpdate, async (_, m) => {
+    if (m.user.bot) return;
+    cacheId(m.id, m.displayName);
+    await upsertMember(m.guild.id, m.id, { displayName: m.displayName, username: m.user.username });
   });
 
   // ── Admin commands ─────────────────────────────────────────────────────────
@@ -1329,135 +1199,110 @@ export async function startBot(token: string) {
     if (!msg.member?.permissions.has('Administrator') && !msg.member?.permissions.has('ManageMessages')) return;
     const c = msg.content.trim();
 
-    // ── NEW v8.1: Backend switcher commands ──────────────────────────────────
-
-    // !hf — switch this guild to HuggingFace Spaces backend
+    // Backend
     if (c === '!hf' && msg.guildId) {
-      if (!HF_BASE_URL) {
-        await msg.reply('❌ `HF_SPACE_BASE_URL` env var is not set — add it and restart');
-        return;
-      }
+      if (!HF_BASE_URL) { await msg.reply('`HF_SPACE_BASE_URL` not set'); return; }
       await setBackend(msg.guildId, 'hf');
-      await msg.reply(`✅ switched to **HF Spaces** backend\nSpace: \`${HF_BASE_URL}\`\nModel: \`${HF_MODEL}\`\nUse \`!groqmode\` to switch back`);
+      await msg.reply(`switched to HF Spaces\nSpace: \`${HF_BASE_URL}\`\nModel: \`${HF_MODEL}\``);
     }
-
-    // !groqmode — switch this guild back to Groq
     if (c === '!groqmode' && msg.guildId) {
       await setBackend(msg.guildId, 'groq');
-      await msg.reply(`✅ switched back to **Groq** backend (${FAST} / ${DEEP})`);
+      await msg.reply(`switched back to Groq (${FAST} / ${DEEP})`);
     }
-
-    // !backend — show current backend for this guild
     if (c === '!backend' && msg.guildId) {
-      const backend = await getBackend(msg.guildId);
-      if (backend === 'hf') {
-        await msg.reply(`current backend: **HF Spaces** 🤗\nURL: \`${HF_BASE_URL}\`\nModel: \`${HF_MODEL}\``);
-      } else {
-        await msg.reply(`current backend: **Groq** ⚡\nFast: \`${FAST}\`\nDeep: \`${DEEP}\`\nAvail: ${groq.available()} daily | ${rpmLeft()} RPM left`);
-      }
-    }
-
-    // ── All existing commands unchanged below ────────────────────────────────
-
-    if (c === '!groq') {
-      const lines = groq.allStats().map(s =>
-        `...${s.key.slice(-6)}: ${s.requestsToday}req ${s.errorsToday}err ${s.isHealthy ? '✓' : '✗'}${s.cooldownUntil && Date.now() < s.cooldownUntil ? ` cd:${Math.ceil((s.cooldownUntil - Date.now()) / 1000)}s` : ''}`
+      const b = await getBackend(msg.guildId);
+      await msg.reply(b === 'hf'
+        ? `backend: HF Spaces 🤗 | URL: \`${HF_BASE_URL}\` | model: \`${HF_MODEL}\``
+        : `backend: Groq ⚡ | fast: \`${FAST}\` | deep: \`${DEEP}\` | ${groq.available()} daily | ${rpmLeft()} RPM`
       );
-      await msg.reply(`\`\`\`\n${lines.join('\n')}\navail: ${groq.available()} | rpm left: ${rpmLeft()}/${RPM_CAP}\n\`\`\``);
     }
 
+    // Mood
+    if (c === '!mood' && msg.guildId) {
+      const m = await getMoodState(msg.channelId, msg.guildId);
+      const info = m.mode === 'active' && m.activeUntil
+        ? `active — expires ${new Date(m.activeUntil).toLocaleTimeString()} (${Math.round((m.activeUntil - Date.now())/60_000)}m left)`
+        : `passive — brain every ${m.passiveEvery} msgs (counter: ${m.passiveCount})`;
+      await msg.reply(`mood: **${info}**\nreason: ${m.reason}`);
+    }
+    if (c.startsWith('!active') && msg.guildId) {
+      const mins = parseInt(c.split(' ')[1] || '') || ACTIVE_DEFAULT_MINS;
+      await setMoodState(msg.channelId, msg.guildId, {
+        mode: 'active', activeUntil: Date.now() + mins * 60_000,
+        reason: 'admin active', passiveCount: 0,
+      });
+      await msg.reply(`active for ${mins}m`);
+    }
+    if (c.startsWith('!passive') && msg.guildId) {
+      const every = parseInt(c.split(' ')[1] || '') || PASSIVE_DEFAULT_EVERY;
+      await setMoodState(msg.channelId, msg.guildId, {
+        mode: 'passive', activeUntil: undefined,
+        passiveEvery: Math.max(PASSIVE_MIN_EVERY, Math.min(PASSIVE_MAX_EVERY, every)),
+        passiveCount: 0, reason: 'admin passive',
+      });
+      await msg.reply(`passive — brain every ${every} msgs`);
+    }
+
+    // Speak state
     if (c === '!state' && msg.guildId) {
       const s = await getSpeakState(msg.channelId, msg.guildId);
-      const resume = s.resumeAt ? ` → resumes <t:${Math.round(s.resumeAt / 1000)}:R>` : '';
-      await msg.reply(`mode: **${s.mode}**${resume}\nreason: ${s.reason}`);
+      await msg.reply(`speak: **${s.mode}**${s.resumeAt ? ` <t:${Math.round(s.resumeAt/1000)}:R>` : ''}\n${s.reason}`);
     }
-
-    if (c === '!wake' && msg.guildId) {
-      await setSpeakState(msg.channelId, msg.guildId, { mode: 'active', reason: 'admin wake' });
-      await msg.reply('im up');
-    }
-    if (c === '!sleep' && msg.guildId) {
-      await setSpeakState(msg.channelId, msg.guildId, { mode: 'waiting', reason: 'admin sleep' });
-      await msg.reply('aight going quiet');
-    }
+    if (c === '!wake' && msg.guildId)  { await setSpeakState(msg.channelId, msg.guildId, { mode: 'active', reason: 'admin' }); await msg.reply('im up'); }
+    if (c === '!sleep' && msg.guildId) { await setSpeakState(msg.channelId, msg.guildId, { mode: 'waiting', reason: 'admin' }); await msg.reply('aight going quiet'); }
     if (c.startsWith('!pause ') && msg.guildId) {
       const mins = parseInt(c.split(' ')[1]) || 10;
-      await setSpeakState(msg.channelId, msg.guildId, {
-        mode: 'paused', resumeAt: Date.now() + mins * 60_000, reason: 'admin pause',
-      });
-      await msg.reply(`paused for ${mins}m`);
+      await setSpeakState(msg.channelId, msg.guildId, { mode: 'paused', resumeAt: Date.now() + mins * 60_000, reason: 'admin' });
+      await msg.reply(`paused ${mins}m`);
     }
 
+    // Memory
     if (c === '!memory' && msg.guildId) {
       const m = await getMemory(msg.guildId);
       await msg.reply([
-        `**facts (${m.facts.length}):** ${m.facts.slice(-5).join(' | ') || 'none'}`,
-        `**corrections (${m.corrections.length}):** ${m.corrections.slice(-5).join(' | ') || 'none'}`,
-        `**inside jokes (${m.insideJokes.length}):** ${m.insideJokes.slice(-5).join(' | ') || 'none'}`,
+        `**facts(${m.facts.length}):** ${m.facts.slice(-5).join(' | ') || 'none'}`,
+        `**corrections(${m.corrections.length}):** ${m.corrections.slice(-5).join(' | ') || 'none'}`,
+        `**jokes(${m.insideJokes.length}):** ${m.insideJokes.slice(-5).join(' | ') || 'none'}`,
       ].join('\n'));
     }
-
-    if (c.startsWith('!remember ') && msg.guildId) {
-      await writeFact(msg.guildId, c.slice(10).trim(), 'facts');
-      await msg.reply('noted');
-    }
-
+    if (c.startsWith('!remember ') && msg.guildId) { await writeFact(msg.guildId, c.slice(10).trim(), 'facts'); await msg.reply('noted'); }
     if (c.startsWith('!forget ') && msg.guildId) {
-      const bucket = c.slice(8).trim() as keyof GlobalMemory;
-      if (['facts', 'corrections', 'insideJokes'].includes(bucket)) {
-        await db.collection('servers').doc(msg.guildId).collection('memory').doc('global')
-          .set({ [bucket]: [] }, { merge: true });
-        memCache.delete(msg.guildId);
-        await msg.reply(`cleared ${bucket}`);
+      const b = c.slice(8).trim() as keyof GlobalMemory;
+      if (['facts','corrections','insideJokes'].includes(b)) {
+        await db.collection('servers').doc(msg.guildId).collection('memory').doc('global').set({ [b]: [] }, { merge: true });
+        memCache.delete(msg.guildId); await msg.reply(`cleared ${b}`);
       }
     }
 
+    // Debug
+    if (c === '!groq') {
+      const lines = groq.allStats().map(s => `...${s.key.slice(-6)}: ${s.requestsToday}req ${s.errorsToday}err ${s.isHealthy?'✓':'✗'}${s.cooldownUntil&&Date.now()<s.cooldownUntil?` cd:${Math.ceil((s.cooldownUntil-Date.now())/1000)}s`:''}`);
+      await msg.reply(`\`\`\`\n${lines.join('\n')}\navail: ${groq.available()} | rpm: ${rpmLeft()}/${RPM_CAP}\n\`\`\``);
+    }
     if (c === '!stm') {
-      const msgs = stmGet(msg.channelId);
-      const out  = stmFormat(msgs, Date.now());
-      for (const chunk of (out.match(/.{1,1900}/gs) || []).slice(0, 3)) {
-        await msg.reply(`\`\`\`\n${chunk}\n\`\`\``);
-      }
+      const out = stmFormat(stmGet(msg.channelId), Date.now());
+      for (const chunk of (out.match(/.{1,1900}/gs)||[]).slice(0,3)) await msg.reply(`\`\`\`\n${chunk}\n\`\`\``);
     }
-
-    if (c === '!counter') {
-      const t = msgCounters.get(msg.channelId);
-      const windowLeft = t ? Math.round((60_000 - (Date.now() - t.windowStart)) / 1000) : 0;
-      await msg.reply(
-        `channel: msg ${t?.n ?? 0} in window (resets in ${windowLeft}s)\n` +
-        `fires every: ${BRAIN_EVERY_N} msgs\n` +
-        `rpm left: ${rpmLeft()}/${RPM_CAP}`
-      );
-    }
-
-    if (c.startsWith('!userprofile')) {
-      const target = msg.mentions.users.first();
-      const uid = target?.id || c.split(' ')[1]?.trim();
+    if (c.startsWith('!userprofile') && msg.guildId) {
+      const uid = msg.mentions.users.first()?.id || c.split(' ')[1]?.trim();
       if (!uid) { await msg.reply('usage: !userprofile @user'); return; }
       const p = await getUserProfile(uid);
       await msg.reply([
-        `**profile for ${p.displayName || uid}:**`,
+        `**${p.displayName || uid}**`,
         `context: ${p.context || '(none)'}`,
-        `facts (${p.facts.length}): ${p.facts.slice(-5).join(' | ') || 'none'}`,
-        `relationship notes (${p.relationshipNotes.length}): ${p.relationshipNotes.slice(-5).join(' | ') || 'none'}`,
-        `dm channel: ${p.dmChannelId || 'unknown'} | last proactive: ${p.lastProactiveAt ? new Date(p.lastProactiveAt).toLocaleString() : 'never'}`,
+        `facts(${p.facts.length}): ${p.facts.slice(-4).join(' | ') || 'none'}`,
+        `notes(${p.relationshipNotes.length}): ${p.relationshipNotes.slice(-4).join(' | ') || 'none'}`,
       ].join('\n'));
     }
-
-    if (c === '!proactive') {
-      await msg.reply('running proactive cycle...');
-      await runProactiveCycle(botClient!);
-      await msg.reply('done — check logs');
-    }
+    if (c === '!proactive') { await msg.reply('running...'); await runProactiveCycle(botClient!); await msg.reply('done'); }
   });
 
   await botClient.login(token);
 }
 
 export function stopBot() {
-  botClient?.destroy();
-  botClient = null;
-  if (profilerTimer) clearInterval(profilerTimer);
+  botClient?.destroy(); botClient = null;
+  if (profilerTimer)  clearInterval(profilerTimer);
   if (proactiveTimer) clearTimeout(proactiveTimer);
 }
 
