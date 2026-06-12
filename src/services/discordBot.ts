@@ -1,21 +1,29 @@
 /**
- * NOTABOT — v7 "Full Human"
+ * NOTABOT — v8 "Full Human+"
  *
- * fixes from v6:
- *   FAST = llama-3.1-8b-instant   → 20k TPM vs 70b's 6k TPM  (kills 429s)
- *   brain fires every 3 msgs OR on mention  (not every single message)
- *   global RPM guard: 30 total - 10 reserve = 20 usable/min
- *   <@USER_ID> → @DisplayName resolved everywhere before AI sees it
- *   reply chain: msg.reference fetched → shown as "↳ replying to X: ..." in STM
- *   member roster cached 5 min (not re-fetched per message)
- *   sender data = 1 Firebase read, not 2
- *   hourly STM → long-term notes (separate 1h timer from 15-min profiler)
- *   lean prompts: ~600 tokens/call (was ~1000+)
- *   GuildMemberUpdate: tracks nickname changes in real-time
- *   !counter admin cmd: inspect per-channel msg counter + RPM left
+ * NEW in v8 (additive — nothing from v7 removed):
+ *   FIX: DMs now always trigger brain (mentioned=true in DM context) — v7 silently
+ *        dropped 2/3 of DM messages due to BRAIN_EVERY_N counter gate
+ *   FIX: typing indicator now fires ONLY right before sending the actual reply
+ *        (not during "thinking"/brain call) — sendTyping() ~10s window, refreshed
+ *        if needed for long replies
+ *   NEW: per-user memory — users/{uid}/profile: facts[], relationshipNotes[],
+ *        context (rolling summary string). Richer than server-global memory,
+ *        feeds into brain prompt when chatting with that specific person
+ *   NEW: per-user deep profiler — runs alongside existing 15-min profiler,
+ *        lower frequency (every 2nd cycle), updates relationshipNotes + context
+ *   NEW: proactive hop loop — every PROACTIVE_INTERVAL (jittered), asks DEEP model
+ *        "given everything, do you want to say something anywhere right now?"
+ *        full liberty to say no (default). If yes: picks a channel/DM + writes msg.
+ *        Triggered especially when a user says "come to dm" / "hop on" type things
+ *        (captured as relationshipNotes / context, surfaced in the proactive prompt)
+ *
+ * everything from v6/v7 preserved: multi-key groq failover, RPM guard, brain loop,
+ * speak states, STM, reply chains, id resolution, server memory, hourly compression,
+ * admin commands.
  */
 
-import { Client, GatewayIntentBits, Message, Partials, Events } from 'discord.js';
+import { Client, GatewayIntentBits, Message, Partials, Events, TextChannel, DMChannel } from 'discord.js';
 import Groq from 'groq-sdk';
 import { db } from './firebase.ts';
 
@@ -135,12 +143,19 @@ const FAST = 'llama-3.1-8b-instant';
 const DEEP = 'llama-3.3-70b-versatile';
 
 const DEBOUNCE_MS       = 900;
-const BRAIN_EVERY_N     = 3;           // fire brain every N non-mention msgs per channel
+const BRAIN_EVERY_N     = 3;           // fire brain every N non-mention msgs per channel (servers only)
 const MAX_FETCH_HISTORY = 16;          // Discord history fetch on cold start
 const SHORT_TERM_MAX    = 50;          // per-channel in-memory message log
 const PROFILER_INTERVAL = 15 * 60_000; // 15 min: profile users
 const COMPRESS_INTERVAL = 60 * 60_000; // 1 hr: STM → long-term notes
 const MEMBER_CACHE_TTL  = 5  * 60_000; // 5 min: member roster cache
+
+// NEW v8: proactive hop loop timing — base interval + jitter, per "tick" the AI
+// decides per-user/per-channel whether to say something. Full liberty to decline.
+const PROACTIVE_BASE_INTERVAL = 25 * 60_000; // 25 min base
+const PROACTIVE_JITTER         = 20 * 60_000; // +/- up to 20 min
+const PROACTIVE_MIN_GAP_USER   = 45 * 60_000; // don't proactively hit same user/channel more than once per 45min
+const USER_DEEP_PROFILE_EVERY  = 2;           // run deep per-user profiler every 2nd profiler cycle
 
 // ═══════════════════════════════════════════════════════════════════
 // BOT STATE
@@ -152,13 +167,16 @@ let BOT_ID   = '';
 
 const debounceTimers = new Map<string, NodeJS.Timeout>();
 let profilerTimer: NodeJS.Timeout | null = null;
+let proactiveTimer: NodeJS.Timeout | null = null; // NEW v8
+let profilerCycle = 0; // NEW v8 — counts profiler cycles for deep-profile cadence
 
 // ── Per-channel message counter ─────────────────────────────────────────────
 // Prevents firing brain on every single message — only every BRAIN_EVERY_N OR on mention.
+// (DMs bypass this entirely — see handleMessage)
 const msgCounters = new Map<string, { n: number; windowStart: number }>();
 
 function shouldFireBrain(channelId: string, mentioned: boolean): boolean {
-  if (mentioned) return true; // always fire on direct ping
+  if (mentioned) return true; // always fire on direct ping (and always true for DMs now)
 
   if (!rpmAllow()) {
     console.log(`[RPM] budget tight (${rpmLeft()} left) — skipping passive brain`);
@@ -332,6 +350,10 @@ function seedSTM(channelId: string, msgs: Message[]) {
 // servers/{gid}/channels/{cid}→ speakState
 // servers/{gid}/memory/global → facts[], corrections[], insideJokes[]
 // servers/{gid}/notes/hourly  → compressed hourly summary
+//
+// NEW v8:
+// users/{uid}/profile         → facts[], relationshipNotes[], context (string),
+//                               lastDM, dmChannelId, lastProactiveAt, deepProfiledAt
 // ═══════════════════════════════════════════════════════════════════
 
 async function upsertServerIdentity(guild: any) {
@@ -443,6 +465,78 @@ function memToPrompt(mem: GlobalMemory, members: Record<string, any>[]): string 
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// NEW v8: PER-USER MEMORY
+// users/{uid}/profile — richer than server-global memory. Tracks:
+//   facts[]             — things learned about this specific person
+//   relationshipNotes[] — how bot+person relate, history of interactions,
+//                         explicit invitations ("come to dm", "hop on later"),
+//                         ongoing bits/jokes specific to this person
+//   context             — rolling free-text summary, updated by deep profiler
+//   lastDM, dmChannelId — for proactive hop targeting
+//   lastProactiveAt     — rate limit for proactive pings to this user
+// ═══════════════════════════════════════════════════════════════════
+
+interface UserProfile {
+  facts:             string[];
+  relationshipNotes: string[];
+  context:           string;
+  displayName?:      string;
+  lastDM?:           number;
+  dmChannelId?:      string;
+  lastSeenChannelId?: string;
+  lastSeenGuildId?:   string;
+  lastProactiveAt?:  number;
+  deepProfiledAt?:   string;
+}
+
+const userProfileCache = new Map<string, { d: UserProfile; ts: number }>();
+
+function emptyUserProfile(): UserProfile {
+  return { facts: [], relationshipNotes: [], context: '' };
+}
+
+async function getUserProfile(userId: string): Promise<UserProfile> {
+  const cached = userProfileCache.get(userId);
+  if (cached && Date.now() - cached.ts < 60_000) return cached.d;
+  try {
+    const snap = await db.collection('users').doc(userId).collection('profile').doc('main').get();
+    const d: UserProfile = snap.exists ? { ...emptyUserProfile(), ...snap.data() } as UserProfile : emptyUserProfile();
+    userProfileCache.set(userId, { d, ts: Date.now() });
+    return d;
+  } catch { return emptyUserProfile(); }
+}
+
+async function upsertUserProfile(userId: string, data: Partial<UserProfile>) {
+  try {
+    await db.collection('users').doc(userId).collection('profile').doc('main')
+      .set({ ...data, updatedAt: new Date().toISOString() }, { merge: true });
+    userProfileCache.delete(userId);
+  } catch {}
+}
+
+async function writeUserFact(userId: string, fact: string, bucket: 'facts' | 'relationshipNotes' = 'facts') {
+  if (!fact?.trim()) return;
+  try {
+    const p   = await getUserProfile(userId);
+    const arr = p[bucket] as string[];
+    if (arr.some(f => f.toLowerCase() === fact.toLowerCase())) return; // dedup
+    arr.push(fact.trim());
+    if (arr.length > 30) arr.shift();
+    await upsertUserProfile(userId, { [bucket]: arr } as Partial<UserProfile>);
+    console.log(`[UserMem:${bucket}] ${userId.slice(-6)}: "${fact.slice(0, 60)}"`);
+  } catch {}
+}
+
+// Compact per-user context block for brain prompt
+function userProfileToPrompt(p: UserProfile): string {
+  const lines: string[] = [];
+  if (p.context) lines.push(`ABOUT THEM: ${p.context}`);
+  if (p.facts.length) lines.push(`KNOWN FACTS:\n${p.facts.slice(-8).map(f => `- ${f}`).join('\n')}`);
+  if (p.relationshipNotes.length) lines.push(`UR RELATIONSHIP/HISTORY:\n${p.relationshipNotes.slice(-6).map(n => `- ${n}`).join('\n')}`);
+  return lines.join('\n\n') || '(nothing yet — first real convo)';
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // CLOCK CONTEXT — real-time awareness for the AI
 // ═══════════════════════════════════════════════════════════════════
 
@@ -467,6 +561,11 @@ function clockContext(msgs: STMessage[], state: SpeakState): string {
 // ═══════════════════════════════════════════════════════════════════
 // BRAIN — single AI call that decides action + generates reply
 // Using FAST model (8b-instant) for low latency + high throughput
+//
+// NEW v8: brain prompt now includes per-user profile context (userCtx),
+// and can emit `userNote` (relationship-level note) in addition to `newFact`
+// (server-global fact). Also gets `isDM` flag so it can adjust tone/behavior
+// for 1:1 vs group settings.
 // ═══════════════════════════════════════════════════════════════════
 
 interface BrainDecision {
@@ -474,7 +573,9 @@ interface BrainDecision {
   reply?:     string;
   pauseMins?: number;
   bondDelta?: number;
-  newFact?:   string;
+  newFact?:   string;     // server-global fact
+  userFact?:  string;     // NEW v8: fact about this specific person
+  userNote?:  string;     // NEW v8: relationship/history note about this person
   reason:     string;
 }
 
@@ -485,9 +586,11 @@ async function brain(
   message:     string,
   transcript:  string,
   memCtx:      string,
+  userCtx:     string,   // NEW v8
   clock:       string,
   mentioned:   boolean,
   state:       SpeakState,
+  isDM:        boolean,  // NEW v8
 ): Promise<BrainDecision> {
 
   const bondLabel = bond > 75 ? 'close friend' : bond > 50 ? 'neutral' : bond > 25 ? 'not close' : 'beef';
@@ -503,6 +606,11 @@ HOW U TALK:
 - match the energy — chaotic energy gets chaos back. chill gets chill.
 
 NEVER: "certainly", "as an ai", "i understand", "how can i help", "great question", bullet points, explaining ur jokes, being an assistant.
+
+${isDM ? `THIS IS A DM (1:1, just u and them):
+- more personal, can reference shared history/inside stuff more directly
+- still short, still urself, not a customer service bot
+- if they ever said smth like "come to dm" / "hop on later" / "lemme tell u smth" — and u haven't followed up yet — this is a good time to acknowledge that if relevant` : ''}
 
 SPEAK STATE (u control this):
 - speak  → reply (put it in reply field, raw text no quotes no name prefix)
@@ -521,9 +629,13 @@ WHEN NOT TO: two people clearly in their own convo, forced/cringe to jump in, u 
 
   const user = `<clock>${clock}</clock>
 
-<memory>
+<server_memory>
 ${memCtx}
-</memory>
+</server_memory>
+
+<about_${senderName}>
+${userCtx}
+</about_${senderName}>
 
 <recent_chat>
 ${transcript}
@@ -533,13 +645,13 @@ ${senderName} (${bondLabel}, bond ${bond}/100${senderInfo ? ` — ${senderInfo}`
 tagged you: ${mentioned ? 'YES — almost always reply' : 'no'}
 
 Output ONLY valid JSON, no markdown, no extra text:
-{"action":"speak|pause|wait|ignore","reply":"ur raw reply if speaking","pauseMins":5,"bondDelta":0,"newFact":"anything worth remembering, or empty string","reason":"one line"}`;
+{"action":"speak|pause|wait|ignore","reply":"ur raw reply if speaking","pauseMins":5,"bondDelta":0,"newFact":"server-wide fact worth remembering, or empty string","userFact":"fact specifically about ${senderName}, or empty string","userNote":"relationship/history note about ${senderName} (e.g. they invited u somewhere, ongoing bit, etc), or empty string","reason":"one line"}`;
 
   try {
     const raw    = await groq.request(FAST, [
       { role: 'system', content: system },
       { role: 'user',   content: user  },
-    ], 0.88, 180);
+    ], 0.88, 200);
 
     const clean  = raw.replace(/```json|```/g, '').trim();
     const parsed = JSON.parse(clean);
@@ -553,6 +665,8 @@ Output ONLY valid JSON, no markdown, no extra text:
       pauseMins: parsed.pauseMins || 5,
       bondDelta: parsed.bondDelta || 0,
       newFact:   parsed.newFact   || '',
+      userFact:  parsed.userFact  || '',
+      userNote:  parsed.userNote  || '',
       reason:    parsed.reason    || '?',
     };
   } catch (e) {
@@ -598,6 +712,35 @@ async function profileMember(
   } catch {}
 }
 
+// NEW v8: deep per-user profiler — updates relationshipNotes + rolling context.
+// Runs less often than the server profiler (every USER_DEEP_PROFILE_EVERY cycles).
+async function deepProfileUser(userId: string, username: string, recentMsgs: string[]) {
+  if (recentMsgs.length < 2 || !rpmAllow()) return;
+  try {
+    const existing = await getUserProfile(userId);
+    const res = await groq.request(DEEP, [
+      { role: 'system', content: 'you maintain a rolling private profile of a discord user for a bot persona. output ONLY valid JSON, no markdown. be concise.' },
+      { role: 'user', content:
+`user: ${username}
+existing context: ${existing.context || '(none yet)'}
+existing relationship notes: ${existing.relationshipNotes.slice(-5).join(' | ') || '(none)'}
+
+their recent messages:
+${recentMsgs.join('\n')}
+
+Update the rolling context (2-3 sentences max, merge old+new, drop stale stuff) and list any NEW relationship notes (things like: they invited the bot somewhere, ongoing jokes/bits specific to them, how they treat the bot, anything notable about this interaction pattern). Don't repeat notes already listed above.
+
+JSON: {"context":"updated rolling summary","newNotes":["x"],"newFacts":["x"]}` },
+    ], 0.4, 220);
+
+    const p = JSON.parse(res.replace(/```json|```/g, '').trim());
+    if (p.context) await upsertUserProfile(userId, { context: p.context, deepProfiledAt: new Date().toISOString(), displayName: username });
+    for (const n of (p.newNotes || []).slice(0, 3)) await writeUserFact(userId, n, 'relationshipNotes');
+    for (const f of (p.newFacts || []).slice(0, 3)) await writeUserFact(userId, f, 'facts');
+    console.log(`[DeepProfile] ${username} → "${(p.context || '').slice(0, 60)}"`);
+  } catch {}
+}
+
 // Hourly: compress STM into long-term server notes
 const lastCompressedAt = new Map<string, number>(); // guildId → epoch ms
 
@@ -619,7 +762,7 @@ async function maybeCompressHourly(guildId: string, channelId: string) {
 
     const res = await groq.request(DEEP, [
       { role: 'system', content: 'summarize this discord server chat hour. extract the vibe, key facts, inside jokes. ONLY valid JSON, no markdown.' },
-      { role: 'user',   content: `${text}\n\nJSON: {"summary":"brief summary","groupVibe":"one line vibe","insideJokes":["x"],"facts":["x"]}` },
+      { role: 'user', content: `${text}\n\nJSON: {"summary":"brief summary","groupVibe":"one line vibe","insideJokes":["x"],"facts":["x"]}` },
     ], 0.4, 250);
 
     const p = JSON.parse(res.replace(/```json|```/g, '').trim());
@@ -640,6 +783,8 @@ function startProfilerLoop(client: Client) {
 
   profilerTimer = setInterval(async () => {
     if (!rpmAllow()) { console.log('[Profiler] RPM tight — skipping cycle'); return; }
+    profilerCycle++;
+    const doDeepUser = profilerCycle % USER_DEEP_PROFILE_EVERY === 0;
 
     try {
       for (const guild of client.guilds.cache.values()) {
@@ -674,15 +819,163 @@ function startProfilerLoop(client: Client) {
               const member = guild.members.cache.get(uid);
               const name   = member?.displayName || uid;
               await profileMember(guild.id, uid, name, lines);
+              // NEW v8: deep per-user profile, lower cadence
+              if (doDeepUser && rpmAllow()) {
+                await deepProfileUser(uid, name, lines);
+              }
             }
           } catch {} // channel might not be accessible
         }
       }
       // Invalidate member roster cache so next message pick gets fresh data
       memberRosterCache.clear();
-      console.log(`[Profiler] cycle done | ${groq.available()} daily reqs left | ${rpmLeft()} RPM left`);
+      console.log(`[Profiler] cycle done | deepUser=${doDeepUser} | ${groq.available()} daily reqs left | ${rpmLeft()} RPM left`);
     } catch (e) { console.error('[Profiler] error:', e); }
   }, PROFILER_INTERVAL);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// NEW v8: PROACTIVE HOP LOOP
+//
+// Every ~25min (jittered), if RPM allows, asks DEEP model:
+// "given recent server activity + per-user notes/context, do you want to say
+//  something anywhere (a server channel or someone's DM) right now?"
+// Full liberty to say no — this should fire RARELY. Default = no.
+// If yes: picks target (channelId or userId for DM) + writes the message itself.
+// Especially primed by relationshipNotes like "they said come to dm".
+// ═══════════════════════════════════════════════════════════════════
+
+interface ProactiveCandidate {
+  type:        'channel' | 'dm';
+  id:          string;       // channelId or userId
+  label:       string;       // human-readable for logging
+  contextHint: string;       // why this might be worth considering
+}
+
+async function gatherProactiveCandidates(client: Client): Promise<ProactiveCandidate[]> {
+  const out: ProactiveCandidate[] = [];
+  const now = Date.now();
+
+  // Server channels with recent activity (from STM)
+  for (const [channelId, msgs] of stmStore.entries()) {
+    if (!msgs.length) continue;
+    const last = msgs[msgs.length - 1];
+    const idleMs = now - last.ts;
+    // only consider channels that have gone quiet for a bit (5min - 3hr) — not dead, not currently buzzing
+    if (idleMs < 5 * 60_000 || idleMs > 3 * 60 * 60_000) continue;
+    out.push({
+      type: 'channel',
+      id: channelId,
+      label: `#${channelId.slice(-6)}`,
+      contextHint: `went quiet ${Math.round(idleMs / 60_000)}m ago, last msg: "${last.content.slice(0, 60)}"`,
+    });
+  }
+
+  // Users with relationshipNotes hinting at an invite, not contacted recently
+  try {
+    const snap = await db.collection('users').get();
+    for (const doc of snap.docs) {
+      const userId = doc.id;
+      const profSnap = await doc.ref.collection('profile').doc('main').get();
+      if (!profSnap.exists) continue;
+      const p = profSnap.data() as UserProfile;
+
+      const lastProactive = p.lastProactiveAt || 0;
+      if (now - lastProactive < PROACTIVE_MIN_GAP_USER) continue;
+      if (!p.dmChannelId) continue;
+
+      const inviteHint = (p.relationshipNotes || []).find(n =>
+        /dm|hop on|come (here|over)|lemme tell|wanna (talk|tell)|hit (me|u) up/i.test(n)
+      );
+      if (!inviteHint && !p.context) continue; // need SOME signal to even consider
+
+      out.push({
+        type: 'dm',
+        id: userId,
+        label: p.displayName || userId.slice(-6),
+        contextHint: inviteHint
+          ? `they said: "${inviteHint}"`
+          : `context: ${p.context.slice(0, 80)}`,
+      });
+    }
+  } catch {}
+
+  return out;
+}
+
+async function runProactiveCycle(client: Client) {
+  if (!rpmAllow()) { console.log('[Proactive] RPM tight — skip'); return; }
+
+  const candidates = await gatherProactiveCandidates(client);
+  if (!candidates.length) { console.log('[Proactive] no candidates this cycle'); return; }
+
+  // cap to keep prompt small
+  const sample = candidates.slice(0, 12);
+
+  const listText = sample.map((c, i) =>
+    `${i}. [${c.type}] ${c.label} — ${c.contextHint}`
+  ).join('\n');
+
+  const system = `you are ${BOT_NAME}, a chaotic gen-z discord persona (NOT an assistant). u have FULL LIBERTY to either say nothing (most common — pick "none") or proactively send ONE message to a server channel or someone's DM if it feels natural/funny/warranted.
+
+be very conservative — only pick something if it's genuinely a good moment (e.g. someone explicitly invited u to dm earlier and u haven't followed up, or a channel went quiet on something u could naturally jump back into). most cycles should result in "none". never be needy, never spam, never force a convo.
+
+if u pick a target, write the actual message — raw lowercase gen-z text, same voice as always (ngl, fr, bruh, lowkase, short, 1-2 sentences).`;
+
+  const user = `candidates:\n${listText}\n\nOutput ONLY valid JSON, no markdown:
+{"pick":"none|<index number>","message":"the raw message to send if picking something, else empty string","reason":"one line"}`;
+
+  try {
+    const raw = await groq.request(DEEP, [
+      { role: 'system', content: system },
+      { role: 'user', content: user },
+    ], 0.9, 150);
+
+    const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
+    console.log(`[Proactive] decision: ${parsed.pick} | "${parsed.reason}"`);
+
+    if (parsed.pick === 'none' || parsed.pick === undefined) return;
+
+    const idx = parseInt(String(parsed.pick), 10);
+    if (isNaN(idx) || idx < 0 || idx >= sample.length) return;
+    const target = sample[idx];
+    const text = (parsed.message || '').trim().replace(/^["']|["']$/g, '').slice(0, 200);
+    if (!text) return;
+
+    if (target.type === 'channel') {
+      const ch = client.channels.cache.get(target.id) as TextChannel | undefined;
+      if (!ch || !ch.isTextBased()) return;
+      await (ch as any).sendTyping().catch(() => {});
+      await sleep(Math.min(400 + text.length * 22, 3000));
+      await (ch as any).send(text);
+      stmPush(target.id, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
+      console.log(`[Proactive→channel] ${target.label}: "${text.slice(0, 60)}"`);
+    } else {
+      // DM
+      const user = await client.users.fetch(target.id).catch(() => null);
+      if (!user) return;
+      const dm = await user.createDM().catch(() => null);
+      if (!dm) return;
+      await dm.sendTyping().catch(() => {});
+      await sleep(Math.min(400 + text.length * 22, 3000));
+      await dm.send(text);
+      stmPush(dm.id, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
+      await upsertUserProfile(target.id, { lastProactiveAt: Date.now() });
+      console.log(`[Proactive→dm] ${target.label}: "${text.slice(0, 60)}"`);
+    }
+  } catch (e) {
+    console.warn('[Proactive] error:', (e as any).message?.slice(0, 80));
+  }
+}
+
+function scheduleProactiveCycle(client: Client) {
+  const jitter = Math.floor((Math.random() * 2 - 1) * PROACTIVE_JITTER); // +/- jitter
+  const delay  = Math.max(60_000, PROACTIVE_BASE_INTERVAL + jitter);
+  proactiveTimer = setTimeout(async () => {
+    try { await runProactiveCycle(client); } catch (e) { console.error('[Proactive] cycle error:', e); }
+    scheduleProactiveCycle(client); // reschedule with fresh jitter
+  }, delay);
+  console.log(`[Proactive] next cycle in ${Math.round(delay / 60_000)}m`);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -699,12 +992,31 @@ async function handleMessage(msg: Message) {
 
     const guildId   = isGuild ? msg.guildId! : 'dm';
     const channelId = msg.channelId;
-    const mentioned = BOT_ID ? msg.mentions.has(BOT_ID) : false;
+
+    // FIX v8: in DMs, always treat as "mentioned" — v7's BRAIN_EVERY_N counter
+    // silently dropped 2/3 of DM messages since users never @-mention in DMs.
+    const mentioned = isDM ? true : (BOT_ID ? msg.mentions.has(BOT_ID) : false);
+
     const sender    = msg.member?.displayName || msg.author.username;
     const msgClean  = cleanContent(msg.content);
 
     // Keep id→name cache populated on every message
     cacheId(msg.author.id, sender);
+
+    // NEW v8: track DM channel for proactive targeting
+    if (isDM) {
+      await upsertUserProfile(msg.author.id, {
+        dmChannelId: channelId,
+        lastDM:      Date.now(),
+        displayName: sender,
+      });
+    } else {
+      await upsertUserProfile(msg.author.id, {
+        lastSeenChannelId: channelId,
+        lastSeenGuildId:   guildId,
+        displayName:       sender,
+      });
+    }
 
     // ── Resolve reply chain ───────────────────────────────────────────
     // If this message is a reply to another message, fetch the original.
@@ -733,6 +1045,7 @@ async function handleMessage(msg: Message) {
     });
 
     // ── Rate gate: only fire brain every N msgs OR on mention ─────────
+    // (DMs always pass since mentioned=true above)
     if (!shouldFireBrain(channelId, mentioned)) return;
 
     // ── Debounce: collapse rapid-fire messages into one brain call ────
@@ -746,7 +1059,7 @@ async function handleMessage(msg: Message) {
         // ── Speak state check ─────────────────────────────────────────
         const state = await getSpeakState(channelId, guildId);
 
-        // Hard skip if paused and not mentioned
+        // Hard skip if paused and not mentioned (DMs are always "mentioned" so never skip here)
         if (state.mode === 'paused' && state.resumeAt && Date.now() < state.resumeAt && !mentioned) {
           const leftSec = Math.round((state.resumeAt - Date.now()) / 1000);
           console.log(`[Paused] #${channelId.slice(-6)} ${leftSec}s left → skip`);
@@ -760,10 +1073,11 @@ async function handleMessage(msg: Message) {
         }
 
         // ── Load context in parallel (minimise await latency) ─────────
-        const [memberData, memory, allMembers] = await Promise.all([
+        const [memberData, memory, allMembers, userProfile] = await Promise.all([
           isGuild ? getMember(guildId, msg.author.id) : Promise.resolve({}),
           isGuild ? getMemory(guildId)                : Promise.resolve({ facts: [], corrections: [], insideJokes: [] } as GlobalMemory),
           isGuild ? getAllMembers(guildId)             : Promise.resolve([]),
+          getUserProfile(msg.author.id), // NEW v8 — works for both DM and guild
         ]);
 
         const bond    = typeof memberData.bond === 'number' ? memberData.bond : 50;
@@ -773,16 +1087,17 @@ async function handleMessage(msg: Message) {
         const msgs       = stmGet(channelId);
         const transcript = stmFormat(msgs, nowMs);
         const memCtx     = memToPrompt(memory, allMembers);
+        const userCtx    = userProfileToPrompt(userProfile); // NEW v8
         const clock      = clockContext(msgs, state);
 
         // ── BRAIN: decides action + generates reply ───────────────────
         const decision = await brain(
           sender, profile, bond,
-          msgClean, transcript, memCtx, clock,
-          mentioned, state,
+          msgClean, transcript, memCtx, userCtx, clock,
+          mentioned, state, isDM,
         );
 
-        console.log(`[Brain] ${sender}: ${decision.action} | "${decision.reason}"`);
+        console.log(`[Brain] ${sender}${isDM ? ' (DM)' : ''}: ${decision.action} | "${decision.reason}"`);
 
         // ── Apply decision ────────────────────────────────────────────
         switch (decision.action) {
@@ -796,8 +1111,11 @@ async function handleMessage(msg: Message) {
 
             if (!text) { console.log('[Brain] speak → empty reply'); break; }
 
-            // Simulate human typing delay
+            // FIX v8: typing indicator only NOW, right before sending — not during
+            // the brain "thinking" call above. sendTyping() lasts ~10s in Discord;
+            // our typingMs is capped at 3000ms so a single call covers it.
             const typingMs = Math.min(400 + text.length * 22, 3000);
+            try { await msg.channel.sendTyping(); } catch {}
             await sleep(typingMs);
 
             try {
@@ -816,6 +1134,10 @@ async function handleMessage(msg: Message) {
                 if (decision.newFact)   await writeFact(guildId, decision.newFact, 'facts');
               }
 
+              // NEW v8: per-user memory writes (works in both DM and guild)
+              if (decision.userFact) await writeUserFact(msg.author.id, decision.userFact, 'facts');
+              if (decision.userNote) await writeUserFact(msg.author.id, decision.userNote, 'relationshipNotes');
+
               if (state.mode !== 'active') {
                 await setSpeakState(channelId, guildId, { mode: 'active', reason: 'spoke → reset to active' });
               }
@@ -830,18 +1152,22 @@ async function handleMessage(msg: Message) {
             const resumeAt = Date.now() + mins * 60_000;
             await setSpeakState(channelId, guildId, { mode: 'paused', resumeAt, reason: decision.reason });
             if (isGuild && decision.newFact) await writeFact(guildId, decision.newFact, 'corrections');
+            if (decision.userNote) await writeUserFact(msg.author.id, decision.userNote, 'relationshipNotes');
             break;
           }
 
           case 'wait': {
             await setSpeakState(channelId, guildId, { mode: 'waiting', reason: decision.reason });
             if (isGuild && decision.newFact) await writeFact(guildId, decision.newFact, 'corrections');
+            if (decision.userNote) await writeUserFact(msg.author.id, decision.userNote, 'relationshipNotes');
             break;
           }
 
           case 'ignore':
           default:
             if (isGuild && decision.newFact) writeFact(guildId, decision.newFact, 'facts').catch(() => {});
+            if (decision.userFact) writeUserFact(msg.author.id, decision.userFact, 'facts').catch(() => {});
+            if (decision.userNote) writeUserFact(msg.author.id, decision.userNote, 'relationshipNotes').catch(() => {});
             break;
         }
 
@@ -880,13 +1206,14 @@ export async function startBot(token: string) {
 
     console.log(`
 ╔═══════════════════════════════════════════════╗
-║  ✓ ${BOT_NAME} online — v7 Full Human
+║  ✓ ${BOT_NAME} online — v8 Full Human+
 ║  • ID: ${BOT_ID}
 ║  • Keys: ${groq.allStats().length}  |  Avail: ${groq.available()} daily reqs
 ║  • Fast: ${FAST}
 ║  • Deep: ${DEEP}
-║  • Brain: every ${BRAIN_EVERY_N} msgs or on mention
+║  • Brain: every ${BRAIN_EVERY_N} msgs or on mention (DMs always fire)
 ║  • RPM budget: ${RPM_CAP} usable / 30 total
+║  • Proactive hop: every ~${Math.round(PROACTIVE_BASE_INTERVAL / 60_000)}m ± ${Math.round(PROACTIVE_JITTER / 60_000)}m
 ╚═══════════════════════════════════════════════╝\n`);
 
     botClient!.user!.setPresence({ status: 'online', activities: [{ name: 'the vibes', type: 3 }] });
@@ -909,6 +1236,7 @@ export async function startBot(token: string) {
     }
 
     startProfilerLoop(botClient!);
+    scheduleProactiveCycle(botClient!); // NEW v8
   });
 
   botClient.on(Events.MessageCreate, handleMessage);
@@ -1017,6 +1345,28 @@ export async function startBot(token: string) {
         `rpm left: ${rpmLeft()}/${RPM_CAP}`
       );
     }
+
+    // NEW v8: !userprofile @user or !userprofile <id> — inspect per-user memory
+    if (c.startsWith('!userprofile')) {
+      const target = msg.mentions.users.first();
+      const uid = target?.id || c.split(' ')[1]?.trim();
+      if (!uid) { await msg.reply('usage: !userprofile @user'); return; }
+      const p = await getUserProfile(uid);
+      await msg.reply([
+        `**profile for ${p.displayName || uid}:**`,
+        `context: ${p.context || '(none)'}`,
+        `facts (${p.facts.length}): ${p.facts.slice(-5).join(' | ') || 'none'}`,
+        `relationship notes (${p.relationshipNotes.length}): ${p.relationshipNotes.slice(-5).join(' | ') || 'none'}`,
+        `dm channel: ${p.dmChannelId || 'unknown'} | last proactive: ${p.lastProactiveAt ? new Date(p.lastProactiveAt).toLocaleString() : 'never'}`,
+      ].join('\n'));
+    }
+
+    // NEW v8: !proactive — force-run a proactive cycle now (admin testing)
+    if (c === '!proactive') {
+      await msg.reply('running proactive cycle...');
+      await runProactiveCycle(botClient!);
+      await msg.reply('done — check logs');
+    }
   });
 
   await botClient.login(token);
@@ -1026,6 +1376,7 @@ export function stopBot() {
   botClient?.destroy();
   botClient = null;
   if (profilerTimer) clearInterval(profilerTimer);
+  if (proactiveTimer) clearTimeout(proactiveTimer);
 }
 
 export function getBotStatus() { return botClient ? 'running' : 'stopped'; }
