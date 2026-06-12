@@ -92,7 +92,7 @@ const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 // CONSTANTS
 // ══════════════════════════════════════════════════════════════
 
-const FAST  = 'llama-3.1-8b-instant';
+const FAST  = 'llama-3.3-70b-versatile';
 const DEEP  = 'llama-3.3-70b-versatile';
 const DEBOUNCE_MS       = 900;
 const MAX_FETCH_HISTORY = 16;   // Discord API fetch
