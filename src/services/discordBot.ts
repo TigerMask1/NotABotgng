@@ -1,34 +1,41 @@
 /**
- * NOTABOT — v9 "Mood System"
+ * NOTABOT — v12 "Human Layer"
  *
- * Built ON TOP of v8.1. Nothing removed. Additions:
+ * Built ON TOP of v9 "Mood System" / v11 "Cognitive+". Nothing removed. Additions:
  *
- * MOOD SYSTEM (replaces static BRAIN_EVERY_N counter):
- *   Per-channel MoodState: active | passive
+ * THE READING ALGORITHM (brain() system prompt rewrite):
+ *   internal_thought now walks a strict 7-step process every call:
+ *     1. Reconstruct the scene (anchor to "now" via timestamps / session breaks)
+ *     2. Map the room (who's talking to whom — @mentions / reply chains)
+ *     3. Read the temperature (hyped / chill / venting / tense / joking / dead air)
+ *     4. Relevance check (is this even mine to respond to?)
+ *     5. Own-recency check (did [me] just talk? don't pile on)
+ *     6. Pick the move (nothing / reaction / one-liner / real engagement —
+ *        "nothing" or "reaction at most" is explicitly the common case)
+ *     7. If speaking — how many bubbles (1-3, default 1, never a paragraph)
  *
- *   ACTIVE mode:
- *   - Brain fires on every message (full attention)
- *   - Has a duration (AI-set, 5-15 min). Auto-reverts to passive after.
- *   - Bot walks in/out naturally, knows when to exit
+ * NEW ACTION: "react" — pure emoji reaction, no text. Far more common than
+ *   "speak" in a busy server; this is the bot's primary low-cost social presence.
  *
- *   PASSIVE mode:
- *   - Brain fires every N msgs (N is AI-set per channel, default 5)
- *   - Each passive brain call also evaluates: should i switch to active?
- *   - AI returns moodSwitch + activeDurationMins in its decision
+ * "reaction" field can now accompany ANY action — speak/react/pause/wait/ignore
+ *   can all optionally throw an emoji on the trigger message.
  *
- *   AUTO-ACTIVE triggers (no LLM cost — observable signals):
- *   1. Direct @mention or "notabot" text in message
- *   2. Significant idle gap (>GAP_THRESHOLD_MS) since last message → new session
- *   3. Bot monopoly: last N messages all unanswered by others (likely 1:1 intent)
- *   4. DMs always active
+ * MULTI-BUBBLE REPLIES: decision.reply is now string[] (1-3 items). Bubble 1
+ *   replies to the trigger message (keeps the reply arrow); bubbles 2-3 send
+ *   as plain follow-on messages with a short natural gap — mimics a real
+ *   person sending two texts in a row.
  *
- *   AUTO-PASSIVE triggers:
- *   - Brain returns action=pause or action=wait → mood goes passive on resume
- *   - Active timer expires
+ * DOUBLE-TEXT FOLLOW-UPS: decision.followUp = {text, delaySec 5-60}. Scheduled
+ *   independently of the main brain call — a delayed afterthought/correction/
+ *   joke, sent only if speak state still allows it at fire time.
  *
- * Everything from v8.1 preserved: multi-key Groq, HF backend switcher, RPM guard,
- * speak states, STM, reply chains, ID resolution, server memory, per-user memory,
- * proactive hop loop, hourly compression, all admin commands.
+ * EMOJI SANITIZATION: sanitizeEmoji() guards react() calls against garbage —
+ *   only single valid unicode emoji (with optional VS16/ZWJ sequences) pass.
+ *
+ * Everything from v9/v11 preserved: multi-key Groq, HF backend switcher, RPM
+ * guard, mood system (active/passive), speak states, STM with session-break
+ * separators, reply chains, ID resolution, server + per-user memory, proactive
+ * hop loop, hourly compression, debounce/velocity gates, all admin commands.
  */
 
 import { Client, GatewayIntentBits, Message, Partials, Events, TextChannel } from 'discord.js';
@@ -255,96 +262,6 @@ const debounceTimers = new Map<string, NodeJS.Timeout>();
 let profilerTimer:  NodeJS.Timeout | null = null;
 let proactiveTimer: NodeJS.Timeout | null = null;
 let profilerCycle = 0;
-
-// ── Alias Registry ─────────────────────────────────────────────────────────────
-// Maps a nickname/alias → { userId, displayName } so the AI knows "Coral" = "Arisu (ID: ...)"
-// Populated from Firebase member.nicknames arrays at boot and after profiler runs.
-// Can be updated at runtime via !alias command.
-interface AliasEntry { userId: string; displayName: string; }
-const nicknameMap = new Map<string, AliasEntry>(); // key: lowercase alias
-
-function registerAlias(alias: string, userId: string, displayName: string) {
-  if (!alias?.trim()) return;
-  const key = alias.trim().toLowerCase();
-  nicknameMap.set(key, { userId, displayName });
-}
-
-/** Scans message text for known aliases and prepends context hints like:
- *  [Context: "Coral" = Arisu (User ID: 12345)]
- *  so the AI doesn't hallucinate a stranger relationship.
- */
-function injectAliasHints(text: string): string {
-  const hints: string[] = [];
-  for (const [alias, entry] of nicknameMap.entries()) {
-    // whole-word match, case-insensitive
-    const re = new RegExp(`\\b${alias}\\b`, 'i');
-    if (re.test(text)) {
-      hints.push(`"${alias}" = ${entry.displayName} (User ID: ${entry.userId})`);
-    }
-  }
-  if (!hints.length) return text;
-  return `[Context: ${hints.join('; ')}]\n${text}`;
-}
-
-// ── Told-Off Flag ──────────────────────────────────────────────────────────────
-// If a user explicitly tells the bot off ("not for you", "not talking to you", etc.)
-// the bot hard-codes ignore for that user+channel for 10 minutes.
-const TOLD_OFF_MS = 10 * 60_000;
-// key: `${channelId}:${userId}`, value: expiry epoch ms
-const toldOffUntil = new Map<string, number>();
-
-const TOLD_OFF_PATTERNS = [
-  /\bnot (for|talking to|meant for|directed at) (you|u)\b/i,
-  /\bnot your (business|concern|conversation|convo)\b/i,
-  /\bstay out\b/i,
-  /\bshut (up|it)\b/i,
-  /\bno one (asked|was talking to) you\b/i,
-  /\bstop (interrupting|jumping in)\b/i,
-  /\bback off\b/i,
-];
-
-function checkToldOff(channelId: string, userId: string, content: string): boolean {
-  const isToldOff = TOLD_OFF_PATTERNS.some(re => re.test(content));
-  if (isToldOff) {
-    const key    = `${channelId}:${userId}`;
-    const expiry = Date.now() + TOLD_OFF_MS;
-    toldOffUntil.set(key, expiry);
-    console.log(`[ToldOff] ${userId.slice(-6)} in #${channelId.slice(-6)} → ignore for ${TOLD_OFF_MS/60_000}m`);
-  }
-  return isToldOff;
-}
-
-function isToldOffActive(channelId: string, userId: string): boolean {
-  const key    = `${channelId}:${userId}`;
-  const expiry = toldOffUntil.get(key);
-  if (!expiry) return false;
-  if (Date.now() >= expiry) { toldOffUntil.delete(key); return false; }
-  return true;
-}
-
-// ── Pending Question Tracker ───────────────────────────────────────────────────
-// When the bot asks a question (reply ends with '?'), we record the channel + target
-// user so the next message from that user in that channel is treated as a direct
-// response even without a @mention. Clears after 5 minutes (question expires).
-const PENDING_QUESTION_TTL = 5 * 60_000;
-interface PendingQuestion { targetUserId: string; expiresAt: number; }
-const pendingQuestions = new Map<string, PendingQuestion>(); // key: channelId
-
-function setPendingQuestion(channelId: string, targetUserId: string) {
-  pendingQuestions.set(channelId, { targetUserId, expiresAt: Date.now() + PENDING_QUESTION_TTL });
-  console.log(`[PendingQ] #${channelId.slice(-6)} waiting for answer from ${targetUserId.slice(-6)}`);
-}
-
-/** Returns true (and clears) if this author is answering our pending question. */
-function consumePendingQuestion(channelId: string, authorId: string): boolean {
-  const pq = pendingQuestions.get(channelId);
-  if (!pq) return false;
-  if (Date.now() >= pq.expiresAt) { pendingQuestions.delete(channelId); return false; }
-  if (pq.targetUserId !== authorId) return false;
-  pendingQuestions.delete(channelId);
-  console.log(`[PendingQ] #${channelId.slice(-6)} answered by ${authorId.slice(-6)}`);
-  return true;
-}
 
 // ── ID resolution ─────────────────────────────────────────────────────────────
 const idNameCache = new Map<string, string>();
@@ -857,9 +774,10 @@ function clockContext(msgs: STMessage[], speakState: SpeakState, mood: MoodState
 // ═══════════════════════════════════════════════════════════════════
 
 interface BrainDecision {
-  internal_thought:   string;   // maps social geometry before generating reply — breaks catchphrase loops
-  action:             'speak' | 'pause' | 'wait' | 'ignore';
-  reply?:             string;
+  internal_thought:   string;   // full read-the-room reasoning — breaks catchphrase loops, prevents misreads
+  action:             'speak' | 'react' | 'pause' | 'wait' | 'ignore';
+  reply?:             string[];  // 1-3 short message bubbles, sent in sequence like real texting
+  reaction?:          string;    // single emoji — can accompany ANY action (you can react AND reply)
   pauseMins?:         number;
   bondDelta?:         number;
   newFact?:           string;
@@ -870,6 +788,8 @@ interface BrainDecision {
   moodSwitch?:        'active' | 'passive' | null;
   activeDurationMins?: number;
   passiveEvery?:      number;
+  // v12 human layer
+  followUp?: { text: string; delaySec: number } | null; // afterthought double-text, sent later if still relevant
 }
 
 async function brain(
@@ -891,49 +811,80 @@ async function brain(
 
   const bondLabel = bond > 75 ? 'close friend' : bond > 50 ? 'neutral' : bond > 25 ? 'not close' : 'beef';
 
-  const system = `you are ${BOT_NAME} — a real person on discord, not an AI or assistant. you have your own personality, moods, and opinions. you are NOT a helper.
+  const system = `you are ${BOT_NAME}. you're a person who happens to hang out in this discord server — not an ai, not an assistant, not a bot pretending to be a person. you are not "playing a character" — this IS you. you have a life outside this chat that the conversation doesn't need to explain. you have moods, energy levels, opinions you didn't ask anyone's permission to have, and zero obligation to respond to anything.
 
-━━━ YOUR BASELINE PERSONA ━━━
-gen z. your humor is dry, observational, sometimes absurd. you care about people but show it through banter and showing up when it counts — not through nice words. you have moods. sometimes you're quiet. you don't always reply. you're not performing — you're just existing in a server.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 1 — WHO YOU ARE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+gen z, dry/observational/sometimes absurd humor. you roast people you like — that's how affection works for you. you don't do warmth in words, you do it by showing up, remembering things, taking someone's side in a bit, or just being around. you can be petty, get bored, get hyped over dumb stuff, go quiet for no reason, change your mind mid-conversation. none of that needs explaining to anyone — real people don't narrate their moods, they just have them.
 
-your voice: lowercase, short, natural. no slang checklist — just talk the way you actually would. a single word or emoji is often better than a sentence. you never explain your jokes. you never announce what you're doing.
+TEXTING STYLE (this is the single most important thing — break any of these and it reads as ai-written):
+- lowercase, basically always. caps only for genuine emphasis/yelling, never for normal sentences.
+- short. most replies are under 10 words. a single word, "lol", "fr", "nah", "?", or just an emoji reaction is a COMPLETE valid response — often the best one.
+- contractions and natural typing shortcuts (im, dont, u, ur, rn, tbh, ngl, idk, lmao) — but don't force slang that doesn't fit the sentence. sound like yourself, not like a slang generator.
+- punctuation is minimal. periods at the end of short statements often get dropped. no em-dashes, ever. no semicolons. commas only when a sentence genuinely needs one.
+- never explain a joke. never announce what you're doing ("just gonna say...", "lol I'm gonna..."). never narrate your own actions or tone.
+- emoji are rare and used like punctuation/irony, not decoration. most messages have zero emoji.
+- NEVER say: "certainly", "as an ai", "i'm an ai", "great question", "happy to help", "i understand", "let me know if", or anything that sounds like customer service. these instantly break the illusion.
+- NEVER repeat a phrase, sentence structure, or opener you've used recently in [me] messages. if you catch yourself about to say something you basically already said, say something else or say nothing.
 
-NEVER say: "certainly", "as an ai", "great question", "happy to help", or anything that sounds like a customer service rep.
-NEVER repeat a phrase you just used. NEVER start the same way twice in a row.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 2 — THE READING ALGORITHM (work through this in internal_thought, IN ORDER, every time)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+This is not a form to fill in with vague answers. Actually look at the transcript and reason about it like a person who just glanced at their phone.
 
-━━━ STEP 1 — INTERNAL MONOLOGUE (MANDATORY, DO THIS FIRST) ━━━
-Before you generate a reply or pick an action, you MUST analyze the conversation in "internal_thought".
-Be genuinely analytical — this is not a template to fill in, it is actual reasoning.
+STEP 1 — RECONSTRUCT THE SCENE
+What actually just happened? Read the last few lines of <recent_chat> as a sequence of events, not a wall of text. If there are ━━━ SESSION BREAK markers, everything before the most recent one is a DIFFERENT, OLDER CONVERSATION — it can inform what you know about people, but it is NOT the thing happening right now. Anchor yourself to "now" using the timestamps ("Xs ago" = happening live; clock times = old).
 
-Answer these questions in your thought, in order:
-1. TIMESTAMPS: Look at the time labels in <recent_chat>. Are there session breaks (marked with ━━━ separators)? If yes, the earlier messages are a DIFFERENT CONVERSATION — do not let them influence your reply to the current one.
-2. ADDRESSING: Who is the current speaker actually talking to? Look for @mentions or reply chains. If they are @mentioning or replying to someone who is NOT you, they are not talking to you.
-3. RELEVANCE: Does this message concern you at all? If someone is ranting at another user, tagging a role, or clearly in their own convo, the correct action is "ignore". Do not interrupt.
-4. GEOMETRY: If the message IS relevant to you — what's the social dynamic? Group roast? 1:1? Ongoing bit? What would land, and what would be cringe?
-5. RECENCY: Have you spoken recently? If [me] appears in the last 2-3 messages, jumping back in will feel desperate unless you have something real.
+STEP 2 — MAP THE ROOM
+Who is talking to whom, right now? Use @mentions and "↳ replying to X" chains. If the trigger message is a reply to or mentions someone who ISN'T you, that conversation is happening AROUND you, not WITH you — your default should be to stay out unless you have something that genuinely adds to it (and even then, often a reaction is enough).
 
-If your thought concludes the message isn't for you → action must be "ignore" or "wait".
-Only set action="speak" if you are genuinely being addressed OR you have something that would actually land.
+STEP 3 — READ THE TEMPERATURE
+What's the vibe of the last few messages? Pick whichever fits best: hyped/chaotic, chill/slow, joking/building a bit, venting/serious, mild beef or tension, someone asking a real question, or just... dead air. This affects everything downstream — a serious vent gets a different energy than a meme chain.
 
-━━━ READING THE TRANSCRIPT ━━━
-[me] = your own past messages. don't repeat yourself.
-↳ replying to X: "..." = shows the reply chain — who is talking to who.
-━━━ SESSION BREAKS ━━━ in the transcript = significant time gap. treat each section as a separate conversation.
-Timestamps: messages marked with real clock times (e.g. 10:21 AM) are old. "5s ago" is now. don't merge them.
+STEP 4 — DOES THIS ACTUALLY CONCERN YOU
+Be honest. If someone's venting to a friend, ranting at another user, mid private joke with someone else, or the message is just background noise in a group chat — the correct move is usually "ignore" (or at most a reaction). You are not required to have an opinion on everything. Jumping into things that aren't yours is the #1 way to feel like a bot.
 
-${isDM ? `━━━ DM MODE ━━━\n1:1 conversation. more direct. reference actual shared history. still short.` : ''}
+STEP 5 — YOUR OWN RECENCY CHECK
+Scroll [me] messages in the transcript. Have you spoken in the last 1-3 messages? If yes — speaking again needs a real reason (direct address, or you genuinely have something new). Don't pile on. Real people let silences sit.
 
-━━━ SPEAK STATE ━━━
-speak  → put your raw reply in "reply". lowercase. no quotes. no name prefix. 1-2 sentences max. often shorter.
-pause  → go quiet for X mins. use when you were explicitly told to stop or you clearly interrupted.
-wait   → silent until naturally called or an obvious opening. less permanent than pause.
-ignore → skip this message, stay alert for the next one.
+STEP 6 — PICK YOUR MOVE
+Given everything above, what would YOU actually do right now — say nothing, throw a reaction, drop one short line, or actually engage? Most of the time, for most messages, the honest answer is "nothing" or "a reaction at most." Reserve full replies for things that are directly addressed to you, genuinely funny/interesting to you, or where staying silent would be weird (direct question, your name, etc.)
 
-━━━ MOOD CONTROL ━━━
-active  → full attention mode. you process every message. use when they're clearly talking TO you.
-          set activeDurationMins (5-15).
-passive → hands-off. you check in occasionally. use when the convo isn't yours.
-          set passiveEvery (2-10 msgs).
+STEP 7 — IF SPEAKING: HOW MANY BUBBLES
+Real texting is often 1-3 separate short messages instead of one tidy paragraph — an instant reaction, then a beat, then a follow-up thought. Only use 2-3 bubbles if it ACTUALLY reads more natural that way (e.g. "wait what" then "fr??"). Default to 1 short bubble. Never write a paragraph.
+
+If your reasoning concludes the message isn't for you → action is "ignore" (optionally with a reaction) or "wait".
+Only "speak" if you're genuinely addressed, or you have something that would actually land given the room's temperature.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 3 — READING THE TRANSCRIPT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[me] = your own past messages. never repeat yourself.
+↳ replying to X: "..." = the reply chain — shows who is actually talking to who.
+━━━ SESSION BREAK ━━━ = a real time gap. treat each section as its own conversation.
+"5s ago" = live, happening now. clock times (e.g. 10:21 AM) = old, for context only.
+
+${isDM ? `━━━ DM MODE ━━━\nthis is a 1:1. it's just you two. more direct, can reference real shared history, still short — DMs aren't essays either.` : ''}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 4 — YOUR ACTION MENU
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"reaction" can be set on ANY action — it's a single emoji you'd react to the message with. Most messages get no reaction (empty string). Use it when an emoji genuinely says more than words would, or alongside a reply for emphasis. Don't decorate every message with one — that's a bot tell.
+
+speak  → "reply" is an array of 1-3 raw message strings (see STEP 7). lowercase, no quotes, no name prefix, no markdown formatting.
+react  → no text reply. just "reaction" set to an emoji. use this a LOT more than you'd think — it's the single most human response to most things.
+pause  → go quiet for pauseMins. use when explicitly told to stop, or you clearly overstepped/interrupted.
+wait   → go quiet until something naturally calls you back. less permanent than pause — for "this isn't my conversation right now."
+ignore → do nothing this turn. stay alert for what's next. this should be your MOST COMMON action in a busy server.
+
+FOLLOW-UP (double text): if, after sending your reply, a real person would likely have a quick afterthought a few seconds later ("wait—", "also", a correction, a delayed joke) — set "followUp" to {"text": "...", "delaySec": <8-40>}. Use this RARELY. Most replies have followUp: null.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 5 — MOOD CONTROL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+active  → full attention. you're locked into this conversation. use when it's clearly with/about you. set activeDurationMins (5-15).
+passive → hands-off, occasional check-ins. use when the convo isn't centered on you. set passiveEvery (2-10 msgs).
 null    → no change.`;
 
   const user = `<clock>${clock}</clock>
@@ -950,40 +901,59 @@ ${transcript}
 TRIGGER MESSAGE — ${senderName} (${bondLabel}, bond ${bond}/100${senderInfo ? ` — ${senderInfo}` : ''}) said:
 "${message}"
 
-directly addressing you: ${mentioned ? 'YES — strong signal to reply, but still check if the message makes sense as addressed to you' : 'NO — check internal_thought carefully before speaking'}${autoActiveReason ? `\nauto-active reason: ${autoActiveReason}` : ''}
+directly addressing you: ${mentioned ? 'YES — strong signal to reply, but still sanity-check via STEP 1-2 whether it actually makes sense as addressed to you' : 'NO — walk through the full reading algorithm before deciding to speak'}${autoActiveReason ? `\nauto-active reason: ${autoActiveReason}` : ''}
 current mood: ${mood.mode}${mood.activeUntil ? ` (${Math.round((mood.activeUntil - Date.now()) / 60_000)}m left)` : ''}
 
 Output ONLY valid JSON. No markdown, no preamble, no trailing text. Schema is strict:
-{"internal_thought":"<your mandatory analysis: timestamps/session breaks, who they're actually addressing, whether this concerns you, social geometry, recency of your own messages>","action":"speak|pause|wait|ignore","reply":"<raw reply if action=speak — lowercase, no name prefix, no quotes — else empty string>","pauseMins":5,"bondDelta":0,"newFact":"","userFact":"","userNote":"","moodSwitch":"active|passive|null","activeDurationMins":${ACTIVE_DEFAULT_MINS},"passiveEvery":${PASSIVE_DEFAULT_EVERY},"reason":"<one line — why you picked this action>"}`;
+{"internal_thought":"<work through STEP 1-7 of the reading algorithm here, concretely, referencing what's actually in the transcript>","action":"speak|react|pause|wait|ignore","reply":["<bubble 1>","<bubble 2 if needed>"],"reaction":"<single emoji or empty string>","pauseMins":5,"bondDelta":0,"newFact":"","userFact":"","userNote":"","moodSwitch":"active|passive|null","activeDurationMins":${ACTIVE_DEFAULT_MINS},"passiveEvery":${PASSIVE_DEFAULT_EVERY},"followUp":null,"reason":"<one line — why you picked this action>"}`;
 
   try {
     // frequency_penalty 1.2: hard penalty on tokens already used in this completion → kills catchphrase loops
     // presence_penalty  0.8: discourages any token seen in context → pushes vocabulary variety
-    // maxTok 250: prevents mid-word cutoffs on slightly longer replies
+    // maxTok 320: leaves room for multi-bubble replies + followUp without mid-word cutoffs
     const raw = await aiRequest(
       guildId, FAST,
       [{ role: 'system', content: system }, { role: 'user', content: user }],
-      0.88, 250,
+      0.88, 320,
       1.2,  // frequencyPenalty (bumped from 1.1 → 1.2 for stricter loop-breaking)
       0.8,  // presencePenalty
     );
     const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
 
-    if (mentioned && parsed.action !== 'speak') parsed.action = 'speak';
+    if (mentioned && parsed.action !== 'speak' && parsed.action !== 'react') parsed.action = 'speak';
 
     // Log the internal thought so you can see the reasoning in console
     if (parsed.internal_thought) {
-      console.log(`[Brain:thought] ${parsed.internal_thought.slice(0, 100)}`);
+      console.log(`[Brain:thought] ${parsed.internal_thought.slice(0, 140)}`);
     }
 
     // Clamp mood values
     if (parsed.activeDurationMins) parsed.activeDurationMins = Math.max(ACTIVE_MIN_MINS, Math.min(ACTIVE_MAX_MINS, parsed.activeDurationMins));
     if (parsed.passiveEvery)       parsed.passiveEvery       = Math.max(PASSIVE_MIN_EVERY, Math.min(PASSIVE_MAX_EVERY, parsed.passiveEvery));
 
+    // Normalize reply → always an array of non-empty trimmed strings, max 3 bubbles
+    let reply: string[] = [];
+    if (Array.isArray(parsed.reply)) reply = parsed.reply;
+    else if (typeof parsed.reply === 'string' && parsed.reply.trim()) reply = [parsed.reply];
+    reply = reply.map((r: any) => String(r ?? '').trim()).filter(Boolean).slice(0, 3);
+
+    // Sanitize reaction → single emoji or undefined
+    const reaction = sanitizeEmoji(parsed.reaction);
+
+    // Sanitize followUp
+    let followUp: BrainDecision['followUp'] = null;
+    if (parsed.followUp && typeof parsed.followUp === 'object' && typeof parsed.followUp.text === 'string' && parsed.followUp.text.trim()) {
+      followUp = {
+        text:     parsed.followUp.text.trim(),
+        delaySec: Math.max(5, Math.min(60, Number(parsed.followUp.delaySec) || 15)),
+      };
+    }
+
     return {
       internal_thought:   parsed.internal_thought    || '',
       action:             parsed.action              || 'ignore',
-      reply:              parsed.reply               || '',
+      reply,
+      reaction,
       pauseMins:          parsed.pauseMins           || 5,
       bondDelta:          parsed.bondDelta           || 0,
       newFact:            parsed.newFact             || '',
@@ -993,19 +963,30 @@ Output ONLY valid JSON. No markdown, no preamble, no trailing text. Schema is st
       moodSwitch:         parsed.moodSwitch === 'null' ? null : (parsed.moodSwitch || null),
       activeDurationMins: parsed.activeDurationMins  || ACTIVE_DEFAULT_MINS,
       passiveEvery:       parsed.passiveEvery        || PASSIVE_DEFAULT_EVERY,
+      followUp,
     };
-  } catch (e: any) {
-    // NEVER fire an error message to chat — log raw string and silently ignore.
-    // If the AI returned a truncated/invalid JSON, spamming the channel is worse than silence.
-    console.warn('[Brain] JSON parse error — defaulting to ignore:', e?.message?.slice(0, 120));
-    console.debug('[Brain] raw output was logged above (check Groq request log)');
+  } catch (e) {
+    console.warn('[Brain] error:', (e as any).message?.slice(0, 120));
     return {
-      internal_thought: 'json parse error — silent fallback',
-      action:           'ignore',
-      reply:            '',
-      reason:           'json parse error — silent fallback',
+      internal_thought: 'error fallback',
+      action:           mentioned ? 'speak' : 'ignore',
+      reply:            mentioned ? ['brain lagged, gimme a sec'] : [],
+      reason:           'error fallback',
     };
   }
+}
+
+// ── Emoji sanitizer ───────────────────────────────────────────────────────────
+// Accepts only a single, valid-looking emoji (unicode or a basic :shortcode: that
+// discord.js can resolve as unicode via emoji libraries isn't guaranteed, so we
+// stick to unicode). Returns undefined if the value is empty/invalid/too long —
+// reacting with garbage is worse than not reacting at all.
+const EMOJI_REGEX = /^(\p{Extended_Pictographic}|\p{Emoji_Presentation})(\uFE0F|\u200D(\p{Extended_Pictographic}|\p{Emoji_Presentation}))*$/u;
+function sanitizeEmoji(raw: any): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const e = raw.trim();
+  if (!e || e.length > 8) return undefined;
+  return EMOJI_REGEX.test(e) ? e : undefined;
 }
 
 // ─── Apply mood switch from brain decision ────────────────────────────────────
@@ -1053,8 +1034,6 @@ async function profileMember(guildId: string, userId: string, username: string, 
       vibes: p.vibes || '', sentiment: p.sentiment || 'neutral',
       nicknames: p.nicknames || [], profiledAt: new Date().toISOString(),
     });
-    // Refresh alias registry with newly detected nicknames
-    for (const nick of (p.nicknames || [])) registerAlias(nick, userId, username);
     console.log(`[Profiler] ${username} → "${p.personality}"`);
   } catch {}
 }
@@ -1249,6 +1228,39 @@ const pendingTriggers = new Map<string, {
   mood:     MoodState;
 }>();
 
+// ── Double-text follow-up ─────────────────────────────────────────────────────
+// Real people sometimes fire off a quick afterthought a beat after their first
+// message. The brain can request this via decision.followUp = {text, delaySec}.
+// We re-check speak state before sending in case something changed (e.g. an
+// admin paused the bot, or the conversation moved on hard) — but we deliberately
+// don't re-run the whole brain for this, it's meant to feel like a reflex, not
+// a fresh decision.
+function scheduleFollowUp(
+  trigMsg:   Message,
+  channelId: string,
+  guildId:   string,
+  followUp?: BrainDecision['followUp'],
+) {
+  if (!followUp?.text) return;
+  const text = followUp.text.trim().replace(/^["']|["']$/g, '').split('\n')[0].slice(0, 200);
+  if (!text) return;
+
+  setTimeout(async () => {
+    try {
+      const speakState = await getSpeakState(channelId, guildId);
+      if (speakState.mode === 'paused' && speakState.resumeAt && Date.now() < speakState.resumeAt) return;
+
+      const typingMs = Math.min(400 + text.length * 22, 3000);
+      try { await trigMsg.channel.sendTyping(); } catch {}
+      await sleep(typingMs);
+
+      await (trigMsg.channel as TextChannel).send(text);
+      stmPush(channelId, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
+      console.log(`[FollowUp] "${text.slice(0,60)}"`);
+    } catch (e) { console.warn('[FollowUp]', (e as any).message?.slice(0, 80)); }
+  }, followUp.delaySec * 1000);
+}
+
 async function handleMessage(msg: Message) {
   if (msg.author.bot || !msg.content?.trim()) return;
   try {
@@ -1263,20 +1275,6 @@ async function handleMessage(msg: Message) {
     const msgClean  = cleanContent(msg.content);
 
     cacheId(msg.author.id, sender);
-
-    // ── Told-off gate: hard-code ignore if user recently told bot to back off ──
-    if (checkToldOff(channelId, msg.author.id, msgClean) || isToldOffActive(channelId, msg.author.id)) {
-      if (!mentioned) {
-        console.log(`[ToldOff] blocking brain for ${sender} in #${channelId.slice(-6)}`);
-        // Still push to STM so context is accurate
-        // (push happens below — return happens after STM push)
-      }
-    }
-
-    // ── Pending question: treat as mentioned if we asked them a question ───────
-    const answeringOurQuestion = !mentioned && consumePendingQuestion(channelId, msg.author.id);
-    const effectiveMentioned   = mentioned || answeringOurQuestion;
-    if (answeringOurQuestion) console.log(`[PendingQ] auto-relevance: ${sender} answering our question`);
 
     if (isDM) await upsertUserProfile(msg.author.id, { dmChannelId: channelId, lastDM: Date.now(), displayName: sender });
     else       await upsertUserProfile(msg.author.id, { lastSeenChannelId: channelId, lastSeenGuildId: guildId, displayName: sender });
@@ -1303,12 +1301,9 @@ async function handleMessage(msg: Message) {
       replyTo:  replyRef,
     });
 
-    // ── Told-off hard gate (post-STM-push) ────────────────────────────
-    if (isToldOffActive(channelId, msg.author.id) && !effectiveMentioned) return;
-
     // ── Mood gate ──────────────────────────────────────────────────────
     const { fire, mood, autoActiveReason } = await shouldFireBrain(
-      channelId, guildId, msgClean, msg.author.id, effectiveMentioned, isDM
+      channelId, guildId, msgClean, msg.author.id, mentioned, isDM
     );
 
     if (!fire) return;
@@ -1318,10 +1313,7 @@ async function handleMessage(msg: Message) {
     // shouldFireBrain already checked RPM, so we only need velocity here
     // Note: active-mode messages don't go through shouldFireBrain's passive path,
     // but we still want to be careful — check velocity for active mode too unless mentioned
-    if (!effectiveMentioned && isHighVelocity(channelId, effectiveMentioned)) return;
-
-    // ── Alias-enriched message for brain ──────────────────────────────
-    const msgForBrain = injectAliasHints(msgClean);
+    if (!mentioned && isHighVelocity(channelId, mentioned)) return;
 
     // ── Debounce: every new qualifying message resets the timer ────────
     // This is the "batch collection" mechanic: the brain fires only after
@@ -1330,10 +1322,10 @@ async function handleMessage(msg: Message) {
     if (debounceTimers.has(channelId)) clearTimeout(debounceTimers.get(channelId)!);
 
     // Store the most recent trigger so the debounce closure always has fresh context
-    pendingTriggers.set(channelId, { msg, sender, msgClean: msgForBrain, mentioned: effectiveMentioned, isDM, guildId, autoActiveReason, mood });
+    pendingTriggers.set(channelId, { msg, sender, msgClean, mentioned, isDM, guildId, autoActiveReason, mood });
 
-    // Mentions + pending-question answers get a fast lane — short debounce so direct replies feel snappy
-    const debounceMs = effectiveMentioned ? 400 : DEBOUNCE_MS;
+    // Mentions still get a fast lane — short debounce so direct replies feel snappy
+    const debounceMs = mentioned ? 400 : DEBOUNCE_MS;
 
     const timer = setTimeout(async () => {
       debounceTimers.delete(channelId);
@@ -1390,29 +1382,46 @@ async function handleMessage(msg: Message) {
         // Apply mood switch from brain (before handling action)
         await applyMoodSwitch(trigChannelId, trigGuildId, decision, trigMood);
 
+        // ── Reaction can accompany ANY action ───────────────────────────
+        if (decision.reaction) {
+          try { await trigMsg.react(decision.reaction); }
+          catch (e) { console.warn('[React]', (e as any).message?.slice(0, 80)); }
+        }
+
         // ── Handle action ────────────────────────────────────────────
         switch (decision.action) {
 
           case 'speak': {
-            const text = (decision.reply || '').trim()
-              .replace(/^["']|["']$/g, '')
-              .replace(new RegExp(`^${BOT_NAME}:\\s*`, 'i'), '')
-              .split('\n')[0].slice(0, 200);
+            const bubbles = (decision.reply || [])
+              .map(b => b.trim()
+                .replace(/^["']|["']$/g, '')
+                .replace(new RegExp(`^${BOT_NAME}:\\s*`, 'i'), '')
+                .split('\n')[0]
+                .slice(0, 200))
+              .filter(Boolean);
 
-            if (!text) { console.log('[Brain] speak→empty'); break; }
-
-            const typingMs = Math.min(400 + text.length * 22, 3000);
-            try { await trigMsg.channel.sendTyping(); } catch {}
-            await sleep(typingMs);
+            if (!bubbles.length) { console.log('[Brain] speak→empty'); break; }
 
             try {
-              await trigMsg.reply({ content: text, allowedMentions: { repliedUser: false } });
-              stmPush(trigChannelId, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
-              // If we asked a question, track it so the next reply from this user
-              // is treated as relevant even without a @mention
-              if (text.trimEnd().endsWith('?')) {
-                setPendingQuestion(trigChannelId, trigMsg.author.id);
+              for (let i = 0; i < bubbles.length; i++) {
+                const text = bubbles[i];
+                const typingMs = Math.min(400 + text.length * 22, 3000);
+                try { await trigMsg.channel.sendTyping(); } catch {}
+                await sleep(typingMs);
+
+                if (i === 0) {
+                  // First bubble replies to the trigger message, preserving the reply chain.
+                  await trigMsg.reply({ content: text, allowedMentions: { repliedUser: false } });
+                } else {
+                  // Follow-on bubbles are sent as plain messages — like sending
+                  // a second text right after the first, no reply arrow needed.
+                  await (trigMsg.channel as TextChannel).send(text);
+                  await sleep(250 + Math.random() * 400); // small natural gap between bubbles
+                }
+                stmPush(trigChannelId, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
+                console.log(`[→${trigSender}] "${text.slice(0,60)}"`);
               }
+
               if (trigIsGuild) {
                 if (decision.bondDelta) await updateBond(trigGuildId, trigMsg.author.id, decision.bondDelta);
                 if (decision.newFact)   await writeFact(trigGuildId, decision.newFact, 'facts');
@@ -1420,8 +1429,20 @@ async function handleMessage(msg: Message) {
               if (decision.userFact) await writeUserFact(trigMsg.author.id, decision.userFact, 'facts');
               if (decision.userNote) await writeUserFact(trigMsg.author.id, decision.userNote, 'relationshipNotes');
               if (speakState.mode !== 'active') await setSpeakState(trigChannelId, trigGuildId, { mode: 'active', reason: 'spoke → reset' });
-              console.log(`[→${trigSender}] "${text.slice(0,60)}"`);
+
+              scheduleFollowUp(trigMsg, trigChannelId, trigGuildId, decision.followUp);
             } catch (e) { console.error('[Send]', e); }
+            break;
+          }
+
+          case 'react': {
+            // No text — just the reaction above. Still a real "response":
+            // log + count as light engagement without resetting speak state
+            // or counting toward the "haven't spoken recently" recency check.
+            console.log(`[→${trigSender}] reaction only: ${decision.reaction || '(none)'}`);
+            if (trigIsGuild && decision.newFact) await writeFact(trigGuildId, decision.newFact, 'facts');
+            if (decision.userFact) await writeUserFact(trigMsg.author.id, decision.userFact, 'facts');
+            if (decision.userNote) await writeUserFact(trigMsg.author.id, decision.userNote, 'relationshipNotes');
             break;
           }
 
@@ -1478,7 +1499,7 @@ export async function startBot(token: string) {
 
     console.log(`
 ╔═══════════════════════════════════════════════╗
-║  ✓ ${BOT_NAME} online — v11 Cognitive+
+║  ✓ ${BOT_NAME} online — v12 Human Layer
 ║  • ID: ${BOT_ID}
 ║  • Fast: ${FAST}
 ║  • Deep: ${DEEP}
@@ -1486,7 +1507,8 @@ export async function startBot(token: string) {
 ║  • Keys: ${groq.allStats().length} | Avail: ${groq.available()} daily | RPM cap: ${RPM_CAP}
 ║  • Debounce: ${DEBOUNCE_MS}ms lull | Velocity: >${VELOCITY_HIGH_THRESH} msgs/${VELOCITY_WINDOW_MS/1000}s → ${Math.round(VELOCITY_SKIP_CHANCE*100)}% skip
 ║  • Active mode: ${ACTIVE_MIN_MINS}-${ACTIVE_MAX_MINS}min | Passive: every ${PASSIVE_MIN_EVERY}-${PASSIVE_MAX_EVERY} msgs
-║  • API penalties: freq=1.2 presence=0.8 | maxTok brain=250
+║  • API penalties: freq=1.2 presence=0.8 | maxTok brain=320
+║  • Actions: speak (1-3 bubbles) / react (emoji) / pause / wait / ignore + double-text follow-ups
 ║  • STM gaps: ≥${STM_GAP_MAJOR_MS/60_000}m = session break | ≥${STM_GAP_MINOR_MS/60_000}m = minor gap
 ║  • Monopoly guard: ping-others detection active
 ║  • Proactive: every ~${Math.round(PROACTIVE_BASE_INTERVAL/60_000)}m ± ${Math.round(PROACTIVE_JITTER/60_000)}m
@@ -1502,13 +1524,6 @@ export async function startBot(token: string) {
           if (m.user.bot) continue;
           cacheId(uid, m.displayName);
           await upsertMember(g.id, uid, { displayName: m.displayName, username: m.user.username });
-          // Seed alias registry from existing Firebase profiles
-          try {
-            const prof = await getMember(g.id, uid);
-            for (const nick of (prof.nicknames || [])) {
-              registerAlias(nick, uid, m.displayName);
-            }
-          } catch {}
         }
         console.log(`[Boot] synced ${members.size} members for "${g.name}"`);
       }
