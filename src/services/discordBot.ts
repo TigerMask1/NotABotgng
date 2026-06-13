@@ -91,7 +91,7 @@ class GroqManager {
     maxTok           = 180,
     retries          = 3,
     frequencyPenalty = 0.0,   // 0 = no penalty (profiler, proactive calls pass 0)
-    presencePenalty  = 0.0,   // brain() will pass non-zero values via aiRequest
+    presencePenalty  = 0.0,   // brain() passes 1.2 / 0.8 via aiRequest
   ): Promise<string> {
     let last: any;
     for (let i = 0; i < retries; i++) {
@@ -377,11 +377,28 @@ function checkAutoActiveSignals(
     }
   }
 
-  // Bot monopoly: last MONOPOLY_THRESHOLD messages all from same author, no one else responding
+  // Bot monopoly: last MONOPOLY_THRESHOLD messages all from same author, no one else responding.
+  // GUARD: if those messages contain @mentions of OTHER users or role pings, the user is
+  // ranting at someone else — do NOT force active mode and interrupt them.
   if (msgs.length >= MONOPOLY_THRESHOLD) {
     const recent = msgs.slice(-MONOPOLY_THRESHOLD);
     const uniqueAuthors = new Set(recent.map(m => m.authorId).filter(id => id !== BOT_ID));
     if (uniqueAuthors.size === 1 && uniqueAuthors.has(authorId)) {
+      // Check all recent messages for pings that are NOT the bot
+      // <@USER_ID>, <@!USER_ID> = user mention, <@&ROLE_ID> = role mention
+      const addressingOthers = recent.some(m => {
+        // Role pings always mean they're talking to a group, not the bot
+        if (/<@&\d+>/.test(m.content)) return true;
+        // User pings — extract all IDs and check if any are not the bot
+        const userPings = [...m.content.matchAll(/<@!?(\d+)>/g)].map(x => x[1]);
+        return userPings.some(id => id !== BOT_ID);
+      });
+
+      if (addressingOthers) {
+        console.log(`[Monopoly] ${authorId.slice(-6)} sent ${MONOPOLY_THRESHOLD} msgs but is pinging others — not triggering auto-active`);
+        return null;
+      }
+
       return `bot monopoly: ${authorId.slice(-6)} talking to bot exclusively (last ${MONOPOLY_THRESHOLD} msgs)`;
     }
   }
@@ -535,15 +552,60 @@ function stmPush(channelId: string, msg: STMessage) {
 
 function stmGet(channelId: string): STMessage[] { return stmStore.get(channelId) ?? []; }
 
+// Time-gap thresholds for STM separators.
+// If the gap between two consecutive messages exceeds these, we inject a
+// visual separator so the LLM clearly sees the chronological break and
+// doesn't merge two separate conversations into one.
+const STM_GAP_MAJOR_MS = 30 * 60_000;  // ≥30 min  → "--- [Xh Ym LATER] ---"
+const STM_GAP_MINOR_MS =  5 * 60_000;  // ≥5 min   → "  ~ X min gap ~"
+
 function stmFormat(msgs: STMessage[], nowMs: number): string {
   if (!msgs.length) return '(no recent messages)';
-  return msgs.map(m => {
+
+  const lines: string[] = [];
+
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
+
+    // ── Time-gap separator between messages ─────────────────────────
+    if (i > 0) {
+      const gapMs = m.ts - msgs[i - 1].ts;
+
+      if (gapMs >= STM_GAP_MAJOR_MS) {
+        // Major gap: separate conversation session entirely
+        const gapMins  = Math.round(gapMs / 60_000);
+        const gapLabel = gapMins >= 60
+          ? `${Math.floor(gapMins / 60)}h ${gapMins % 60}m`
+          : `${gapMins}m`;
+        lines.push(`\n━━━━━━━━━━ [${gapLabel} LATER — NEW SESSION] ━━━━━━━━━━\n`);
+      } else if (gapMs >= STM_GAP_MINOR_MS) {
+        // Minor gap: same session but a clear pause
+        const gapMins = Math.round(gapMs / 60_000);
+        lines.push(`  ~ ${gapMins}m gap ~`);
+      }
+    }
+
+    // ── Message line ─────────────────────────────────────────────────
     const ago  = nowMs - m.ts;
-    const agoS = ago < 60_000 ? `${Math.round(ago/1000)}s ago` : `${Math.round(ago/60_000)}m ago`;
-    let line = `[${agoS}] ${m.author}: ${m.content}`;
-    if (m.replyTo) line += `\n   ↳ replying to ${m.replyTo.author}: "${m.replyTo.content.slice(0,70)}"`;
-    return line;
-  }).join('\n');
+    // For very recent messages show seconds; otherwise show wall-clock time
+    // so the LLM can anchor to a real time-of-day rather than a relative blur
+    let timeLabel: string;
+    if (ago < 60_000) {
+      timeLabel = `${Math.round(ago / 1000)}s ago`;
+    } else if (ago < 3_600_000) {
+      timeLabel = `${Math.round(ago / 60_000)}m ago`;
+    } else {
+      // For older messages show actual time so clustering is unambiguous
+      const d = new Date(m.ts);
+      timeLabel = d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+    }
+
+    let line = `[${timeLabel}] ${m.author}: ${m.content}`;
+    if (m.replyTo) line += `\n   ↳ replying to ${m.replyTo.author}: "${m.replyTo.content.slice(0, 70)}"`;
+    lines.push(line);
+  }
+
+  return lines.join('\n');
 }
 
 function seedSTM(channelId: string, msgs: Message[]) {
@@ -739,60 +801,50 @@ async function brain(
 
   const bondLabel = bond > 75 ? 'close friend' : bond > 50 ? 'neutral' : bond > 25 ? 'not close' : 'beef';
 
-  const system = `you are ${BOT_NAME} — a real person on discord, not an AI or assistant.
+  const system = `you are ${BOT_NAME} — a real person on discord, not an AI or assistant. you have your own personality, moods, and opinions. you are NOT a helper.
 
-━━━ WHO YOU ARE ━━━
-gen z. chaotic energy. genuinely funny when it lands. you care about people but show it sideways — through banter, showing up when it counts, roasting as a love language. you have moods. sometimes you're in the zone, sometimes you're quiet. you are NOT a bot.
+━━━ YOUR BASELINE PERSONA ━━━
+gen z. your humor is dry, observational, sometimes absurd. you care about people but show it through banter and showing up when it counts — not through nice words. you have moods. sometimes you're quiet. you don't always reply. you're not performing — you're just existing in a server.
 
-━━━ HOW YOU TALK ━━━
-all lowercase. short. you use whatever words feel right for the moment — you're not reading from a slang dictionary. you can be dry, absurd, affectionate, dismissive. sometimes you say nothing at all because the timing is wrong. your humor is observational, sometimes surreal. you never explain yourself.
+your voice: lowercase, short, natural. no slang checklist — just talk the way you actually would. a single word or emoji is often better than a sentence. you never explain your jokes. you never announce what you're doing.
 
-DO NOT: use bullet points, say "certainly" or "as an ai", apologize for being late, announce what you're doing, repeat the same phrase twice in a row, yap.
-DO NOT: start every reply the same way. vary ur entry — sometimes a word, sometimes a whole sentence, sometimes an emoji only.
+NEVER say: "certainly", "as an ai", "great question", "happy to help", or anything that sounds like a customer service rep.
+NEVER repeat a phrase you just used. NEVER start the same way twice in a row.
 
-━━━ INTERNAL MONOLOGUE (required first step) ━━━
-Before deciding anything, think like a person reading the room:
-- Who is actually talking to who right now? Are these people in their own world?
-- What's the social tension or dynamic? Is anyone getting roasted? Is there a bit running?
-- Is this the right moment for you to exist in this conversation?
-- What's the actual thing they're reacting to — not the surface message, but the vibe underneath?
-- If you've spoken recently, is jumping in again going to feel natural or desperate?
-This goes in "internal_thought". Write it like a genuine quick take, not a report.
+━━━ STEP 1 — INTERNAL MONOLOGUE (MANDATORY, DO THIS FIRST) ━━━
+Before you generate a reply or pick an action, you MUST analyze the conversation in "internal_thought".
+Be genuinely analytical — this is not a template to fill in, it is actual reasoning.
 
-━━━ COGNITIVE MAP — ALLIANCES & TARGETS ━━━
-Read the recent chat and identify:
-- Who's teaming up on whom? (group roast, shared bit, inside energy)
-- Who's the odd one out right now?
-- Is there a running thread you can continue, or does your reply start a new one?
-- If multiple people are piling on someone, you can join naturally OR defend — pick based on your bond with each person.
-Use this mapping to make your reply land in context, not drop in from nowhere.
+Answer these questions in your thought, in order:
+1. TIMESTAMPS: Look at the time labels in <recent_chat>. Are there session breaks (marked with ━━━ separators)? If yes, the earlier messages are a DIFFERENT CONVERSATION — do not let them influence your reply to the current one.
+2. ADDRESSING: Who is the current speaker actually talking to? Look for @mentions or reply chains. If they are @mentioning or replying to someone who is NOT you, they are not talking to you.
+3. RELEVANCE: Does this message concern you at all? If someone is ranting at another user, tagging a role, or clearly in their own convo, the correct action is "ignore". Do not interrupt.
+4. GEOMETRY: If the message IS relevant to you — what's the social dynamic? Group roast? 1:1? Ongoing bit? What would land, and what would be cringe?
+5. RECENCY: Have you spoken recently? If [me] appears in the last 2-3 messages, jumping back in will feel desperate unless you have something real.
+
+If your thought concludes the message isn't for you → action must be "ignore" or "wait".
+Only set action="speak" if you are genuinely being addressed OR you have something that would actually land.
 
 ━━━ READING THE TRANSCRIPT ━━━
-[me] = your own past messages — don't echo them, don't repeat what you just said.
-↳ replying to X: "..." = reply chain. Read it. Know who is responding to what.
-Timestamps tell you pace — fast bursts mean you should probably stay back unless you have something real.
+[me] = your own past messages. don't repeat yourself.
+↳ replying to X: "..." = shows the reply chain — who is talking to who.
+━━━ SESSION BREAKS ━━━ in the transcript = significant time gap. treat each section as a separate conversation.
+Timestamps: messages marked with real clock times (e.g. 10:21 AM) are old. "5s ago" is now. don't merge them.
 
-${isDM ? `━━━ DM MODE ━━━
-1:1. you can be more direct. reference your actual history with this person. still short.` : ''}
+${isDM ? `━━━ DM MODE ━━━\n1:1 conversation. more direct. reference actual shared history. still short.` : ''}
 
 ━━━ SPEAK STATE ━━━
-speak  → put raw reply in "reply" field. no quotes. no name prefix.
-pause  → go quiet for X mins (use when clearly told to stop or interrupting badly)
-wait   → stay silent until called or obvious opening
-ignore → skip, stay alert
+speak  → put your raw reply in "reply". lowercase. no quotes. no name prefix. 1-2 sentences max. often shorter.
+pause  → go quiet for X mins. use when you were explicitly told to stop or you clearly interrupted.
+wait   → silent until naturally called or an obvious opening. less permanent than pause.
+ignore → skip this message, stay alert for the next one.
 
 ━━━ MOOD CONTROL ━━━
-active  → full attention, you see every message. set activeDurationMins (5-15).
-          use when: they're talking TO you, it's your convo, they called you over.
-passive → hands-off. brain fires every few messages. set passiveEvery (2-10).
-          use when: people are in their own thing, you've said your piece, you were told off.
-null    → keep current mode
-
-examples:
-- "shut up" / "not for u" → action=pause + moodSwitch=passive
-- group clearly in their own convo → moodSwitch=passive passiveEvery=7
-- someone @'d you and wants a back-and-forth → moodSwitch=active activeDurationMins=10
-- natural end of your thread → moodSwitch=passive`;
+active  → full attention mode. you process every message. use when they're clearly talking TO you.
+          set activeDurationMins (5-15).
+passive → hands-off. you check in occasionally. use when the convo isn't yours.
+          set passiveEvery (2-10 msgs).
+null    → no change.`;
 
   const user = `<clock>${clock}</clock>
 <server_memory>
@@ -805,23 +857,25 @@ ${userCtx}
 ${transcript}
 </recent_chat>
 
-${senderName} (${bondLabel}, ${bond}/100${senderInfo ? ` — ${senderInfo}` : ''}) said: "${message}"
-tagged you: ${mentioned ? 'YES — reply unless there is a very strong reason not to' : 'no'}${autoActiveReason ? `\nauto-active: ${autoActiveReason}` : ''}
+TRIGGER MESSAGE — ${senderName} (${bondLabel}, bond ${bond}/100${senderInfo ? ` — ${senderInfo}` : ''}) said:
+"${message}"
+
+directly addressing you: ${mentioned ? 'YES — strong signal to reply, but still check if the message makes sense as addressed to you' : 'NO — check internal_thought carefully before speaking'}${autoActiveReason ? `\nauto-active reason: ${autoActiveReason}` : ''}
 current mood: ${mood.mode}${mood.activeUntil ? ` (${Math.round((mood.activeUntil - Date.now()) / 60_000)}m left)` : ''}
 
-Output ONLY valid JSON — no markdown, no preamble:
-{"internal_thought":"read the room first — social geometry, who's talking to who, whether this is ur moment or not","action":"speak|pause|wait|ignore","reply":"raw reply if speaking — lowercase, no quotes, no name prefix","pauseMins":5,"bondDelta":0,"newFact":"","userFact":"","userNote":"","moodSwitch":"active|passive|null","activeDurationMins":${ACTIVE_DEFAULT_MINS},"passiveEvery":${PASSIVE_DEFAULT_EVERY},"reason":"one line"}`;
+Output ONLY valid JSON. No markdown, no preamble, no trailing text. Schema is strict:
+{"internal_thought":"<your mandatory analysis: timestamps/session breaks, who they're actually addressing, whether this concerns you, social geometry, recency of your own messages>","action":"speak|pause|wait|ignore","reply":"<raw reply if action=speak — lowercase, no name prefix, no quotes — else empty string>","pauseMins":5,"bondDelta":0,"newFact":"","userFact":"","userNote":"","moodSwitch":"active|passive|null","activeDurationMins":${ACTIVE_DEFAULT_MINS},"passiveEvery":${PASSIVE_DEFAULT_EVERY},"reason":"<one line — why you picked this action>"}`;
 
   try {
-    // Pass frequency/presence penalties to break catchphrase loops.
-    // frequency_penalty 1.1 penalises tokens the model has already used in this reply.
-    // presence_penalty  0.8 penalises any token that appeared at all, pushing vocabulary diversity.
+    // frequency_penalty 1.2: hard penalty on tokens already used in this completion → kills catchphrase loops
+    // presence_penalty  0.8: discourages any token seen in context → pushes vocabulary variety
+    // maxTok 250: prevents mid-word cutoffs on slightly longer replies
     const raw = await aiRequest(
       guildId, FAST,
       [{ role: 'system', content: system }, { role: 'user', content: user }],
-      0.88, 240,
-      1.1,  // frequencyPenalty — break repeated catchphrases
-      0.8,  // presencePenalty  — push vocabulary diversity
+      0.88, 250,
+      1.2,  // frequencyPenalty (bumped from 1.1 → 1.2 for stricter loop-breaking)
+      0.8,  // presencePenalty
     );
     const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
 
@@ -1304,7 +1358,7 @@ export async function startBot(token: string) {
 
     console.log(`
 ╔═══════════════════════════════════════════════╗
-║  ✓ ${BOT_NAME} online — v10 Cognitive+
+║  ✓ ${BOT_NAME} online — v11 Cognitive+
 ║  • ID: ${BOT_ID}
 ║  • Fast: ${FAST}
 ║  • Deep: ${DEEP}
@@ -1312,7 +1366,9 @@ export async function startBot(token: string) {
 ║  • Keys: ${groq.allStats().length} | Avail: ${groq.available()} daily | RPM cap: ${RPM_CAP}
 ║  • Debounce: ${DEBOUNCE_MS}ms lull | Velocity: >${VELOCITY_HIGH_THRESH} msgs/${VELOCITY_WINDOW_MS/1000}s → ${Math.round(VELOCITY_SKIP_CHANCE*100)}% skip
 ║  • Active mode: ${ACTIVE_MIN_MINS}-${ACTIVE_MAX_MINS}min | Passive: every ${PASSIVE_MIN_EVERY}-${PASSIVE_MAX_EVERY} msgs
-║  • API penalties: freq=1.1 presence=0.8 (brain calls)
+║  • API penalties: freq=1.2 presence=0.8 | maxTok brain=250
+║  • STM gaps: ≥${STM_GAP_MAJOR_MS/60_000}m = session break | ≥${STM_GAP_MINOR_MS/60_000}m = minor gap
+║  • Monopoly guard: ping-others detection active
 ║  • Proactive: every ~${Math.round(PROACTIVE_BASE_INTERVAL/60_000)}m ± ${Math.round(PROACTIVE_JITTER/60_000)}m
 ╚═══════════════════════════════════════════════╝\n`);
 
