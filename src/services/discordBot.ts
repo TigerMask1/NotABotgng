@@ -84,13 +84,28 @@ class GroqManager {
     );
   }
 
-  async request(model: string, msgs: any[], temp = 0.85, maxTok = 180, retries = 3): Promise<string> {
+  async request(
+    model:             string,
+    msgs:              any[],
+    temp             = 0.85,
+    maxTok           = 180,
+    retries          = 3,
+    frequencyPenalty = 0.0,   // 0 = no penalty (profiler, proactive calls pass 0)
+    presencePenalty  = 0.0,   // brain() will pass non-zero values via aiRequest
+  ): Promise<string> {
     let last: any;
     for (let i = 0; i < retries; i++) {
       const k = this.bestKey();
       const s = this.stats.get(k)!;
       try {
-        const r = await this.clients.get(k)!.chat.completions.create({ model, messages: msgs, temperature: temp, max_tokens: maxTok });
+        const r = await this.clients.get(k)!.chat.completions.create({
+          model,
+          messages:          msgs,
+          temperature:       temp,
+          max_tokens:        maxTok,
+          frequency_penalty: frequencyPenalty,
+          presence_penalty:  presencePenalty,
+        });
         s.requestsToday++; s.lastUsed = Date.now();
         rpmTick();
         console.log(`[Groq] ${model.split('-').slice(0,3).join('-')} ${r.usage?.total_tokens}tok ...${k.slice(-4)}`);
@@ -147,13 +162,26 @@ async function setBackend(guildId: string, backend: 'groq' | 'hf') {
   console.log(`[Backend] guild ${guildId.slice(-6)} → ${backend}`);
 }
 
-async function hfRequest(msgs: any[], temp = 0.85, maxTok = 180): Promise<string> {
+async function hfRequest(
+  msgs:             any[],
+  temp            = 0.85,
+  maxTok          = 180,
+  frequencyPenalty = 0.0,
+  presencePenalty  = 0.0,
+): Promise<string> {
   if (!HF_BASE_URL) throw new Error('[HF] HF_SPACE_BASE_URL not set');
   const headers: Record<string,string> = { 'Content-Type': 'application/json' };
   if (HF_TOKEN) headers['Authorization'] = `Bearer ${HF_TOKEN}`;
   const res  = await fetch(`${HF_BASE_URL}/v1/chat/completions`, {
     method: 'POST', headers,
-    body: JSON.stringify({ model: HF_MODEL, messages: msgs, temperature: temp, max_tokens: maxTok }),
+    body: JSON.stringify({
+      model:             HF_MODEL,
+      messages:          msgs,
+      temperature:       temp,
+      max_tokens:        maxTok,
+      frequency_penalty: frequencyPenalty,
+      presence_penalty:  presencePenalty,
+    }),
   });
   if (!res.ok) {
     let t = ''; try { t = await res.text(); } catch {}
@@ -166,10 +194,20 @@ async function hfRequest(msgs: any[], temp = 0.85, maxTok = 180): Promise<string
   return content;
 }
 
-async function aiRequest(guildId: string, model: string, msgs: any[], temp = 0.85, maxTok = 180): Promise<string> {
+// aiRequest: unified dispatcher. Brain calls pass penalty values; background
+// calls (profiler, proactive, compress) leave them at 0 to keep costs down.
+async function aiRequest(
+  guildId:          string,
+  model:            string,
+  msgs:             any[],
+  temp            = 0.85,
+  maxTok          = 180,
+  frequencyPenalty = 0.0,
+  presencePenalty  = 0.0,
+): Promise<string> {
   return (await getBackend(guildId)) === 'hf'
-    ? hfRequest(msgs, temp, maxTok)
-    : groq.request(model, msgs, temp, maxTok);
+    ? hfRequest(msgs, temp, maxTok, frequencyPenalty, presencePenalty)
+    : groq.request(model, msgs, temp, maxTok, 3, frequencyPenalty, presencePenalty);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -179,7 +217,10 @@ async function aiRequest(guildId: string, model: string, msgs: any[], temp = 0.8
 const FAST = 'llama-3.1-8b-instant';
 const DEEP = 'llama-3.3-70b-versatile';
 
-const DEBOUNCE_MS          = 900;
+const DEBOUNCE_MS          = 4500;   // wait for conversation lull before reading the batch
+const VELOCITY_WINDOW_MS   = 10_000; // how far back to look for velocity check
+const VELOCITY_HIGH_THRESH = 5;      // >5 msgs in VELOCITY_WINDOW_MS = high momentum
+const VELOCITY_SKIP_CHANCE = 0.80;   // probability to skip in high-velocity (non-mention) bursts
 const MAX_FETCH_HISTORY    = 16;
 const SHORT_TERM_MAX       = 50;
 const PROFILER_INTERVAL    = 15 * 60_000;
@@ -348,6 +389,23 @@ function checkAutoActiveSignals(
   return null;
 }
 
+// ── Chat velocity check ───────────────────────────────────────────────────────
+// Returns true if the channel is in a high-momentum burst (many msgs in a short window).
+// Used to drastically reduce passive brain fires during fast back-and-forth,
+// so the bot doesn't awkwardly inject itself into a fast-moving conversation.
+function isHighVelocity(channelId: string, mentioned: boolean): boolean {
+  if (mentioned) return false; // never skip when directly addressed
+  const msgs = stmStore.get(channelId);
+  if (!msgs?.length) return false;
+  const cutoff = Date.now() - VELOCITY_WINDOW_MS;
+  const recentCount = msgs.filter(m => m.ts >= cutoff && m.authorId !== BOT_ID).length;
+  if (recentCount <= VELOCITY_HIGH_THRESH) return false;
+  // High velocity: skip with VELOCITY_SKIP_CHANCE probability
+  const skip = Math.random() < VELOCITY_SKIP_CHANCE;
+  if (skip) console.log(`[Velocity] ${recentCount} msgs/${VELOCITY_WINDOW_MS/1000}s — skipping (${Math.round(VELOCITY_SKIP_CHANCE*100)}% chance)`);
+  return skip;
+}
+
 // ── shouldFireBrain — replaces v8.1's static counter ─────────────────────────
 // Returns: { fire: boolean, mood: MoodState }
 // Increments passiveCount in-memory.
@@ -397,6 +455,9 @@ async function shouldFireBrain(
     console.log(`[RPM] passive, budget tight — skip`);
     return { fire: false, mood };
   }
+
+  // Velocity gate: don't fire into high-momentum conversations
+  if (isHighVelocity(channelId, mentioned)) return { fire: false, mood };
 
   const fire = mood.passiveCount % mood.passiveEvery === 0;
   console.log(`[Mood] passive #${channelId.slice(-6)}: msg ${mood.passiveCount}, fire in ${mood.passiveEvery - (mood.passiveCount % mood.passiveEvery)} more`);
@@ -644,6 +705,7 @@ function clockContext(msgs: STMessage[], speakState: SpeakState, mood: MoodState
 // ═══════════════════════════════════════════════════════════════════
 
 interface BrainDecision {
+  internal_thought:   string;   // maps social geometry before generating reply — breaks catchphrase loops
   action:             'speak' | 'pause' | 'wait' | 'ignore';
   reply?:             string;
   pauseMins?:         number;
@@ -654,8 +716,8 @@ interface BrainDecision {
   reason:             string;
   // v9 mood fields
   moodSwitch?:        'active' | 'passive' | null;
-  activeDurationMins?: number;  // how long to stay active if switching to active
-  passiveEvery?:      number;   // if switching to passive, how many msgs between brain calls
+  activeDurationMins?: number;
+  passiveEvery?:      number;
 }
 
 async function brain(
@@ -677,47 +739,60 @@ async function brain(
 
   const bondLabel = bond > 75 ? 'close friend' : bond > 50 ? 'neutral' : bond > 25 ? 'not close' : 'beef';
 
-  const system = `you are ${BOT_NAME} on discord. gen z human. NOT an ai, NOT an assistant. just a person.
+  const system = `you are ${BOT_NAME} — a real person on discord, not an AI or assistant.
 
-vibe: chaotic, funny, charming, lowkey unhinged. u roast ur friends but genuinely care.
+━━━ WHO YOU ARE ━━━
+gen z. chaotic energy. genuinely funny when it lands. you care about people but show it sideways — through banter, showing up when it counts, roasting as a love language. you have moods. sometimes you're in the zone, sometimes you're quiet. you are NOT a bot.
 
-HOW U TALK:
-- all lowercase. 1-2 sentences MAX. sometimes just a word or single emoji is best.
-- slang: ngl, fr, bruh, lowkey, nah, bet, istg, deadass, lmaoo, yo, ong, idk, tbh, rn, imo, no cap, smh, bro, wtf, omg
-- typos r fine. dont fix them. dont explain urself. dont be formal. dont yap.
-- match the energy — chaotic gets chaos. chill gets chill.
+━━━ HOW YOU TALK ━━━
+all lowercase. short. you use whatever words feel right for the moment — you're not reading from a slang dictionary. you can be dry, absurd, affectionate, dismissive. sometimes you say nothing at all because the timing is wrong. your humor is observational, sometimes surreal. you never explain yourself.
 
-NEVER: "certainly", "as an ai", "i understand", "how can i help", "great question", bullet points, explaining ur jokes, being an assistant.
+DO NOT: use bullet points, say "certainly" or "as an ai", apologize for being late, announce what you're doing, repeat the same phrase twice in a row, yap.
+DO NOT: start every reply the same way. vary ur entry — sometimes a word, sometimes a whole sentence, sometimes an emoji only.
 
-${isDM ? `THIS IS A DM — more personal. reference shared history. still short, still urself.` : ''}
+━━━ INTERNAL MONOLOGUE (required first step) ━━━
+Before deciding anything, think like a person reading the room:
+- Who is actually talking to who right now? Are these people in their own world?
+- What's the social tension or dynamic? Is anyone getting roasted? Is there a bit running?
+- Is this the right moment for you to exist in this conversation?
+- What's the actual thing they're reacting to — not the surface message, but the vibe underneath?
+- If you've spoken recently, is jumping in again going to feel natural or desperate?
+This goes in "internal_thought". Write it like a genuine quick take, not a report.
 
-━━━ SPEAK STATE (u control this) ━━━
-- speak  → reply (raw text in reply field, no quotes, no name prefix)
-- pause  → shut up X mins (someone told u to stop / clearly interrupting)
-- wait   → silent until someone calls u or obvious opening
-- ignore → skip this msg, stay active
+━━━ COGNITIVE MAP — ALLIANCES & TARGETS ━━━
+Read the recent chat and identify:
+- Who's teaming up on whom? (group roast, shared bit, inside energy)
+- Who's the odd one out right now?
+- Is there a running thread you can continue, or does your reply start a new one?
+- If multiple people are piling on someone, you can join naturally OR defend — pick based on your bond with each person.
+Use this mapping to make your reply land in context, not drop in from nowhere.
 
-━━━ MOOD CONTROL (v9, u also control this) ━━━
-You run in two modes per channel:
-- ACTIVE: u see every message, full attention, u decide to walk in/out naturally
-- PASSIVE: u check in every few messages, mostly hands-off
+━━━ READING THE TRANSCRIPT ━━━
+[me] = your own past messages — don't echo them, don't repeat what you just said.
+↳ replying to X: "..." = reply chain. Read it. Know who is responding to what.
+Timestamps tell you pace — fast bursts mean you should probably stay back unless you have something real.
 
-Return moodSwitch to change modes:
-- "active"  → go active. set activeDurationMins (5-15). use when: someone's talking to u, it's ur convo now, they called u over
-- "passive" → go passive. set passiveEvery (2-10 msgs). use when: convo clearly not for u, people are busy with each other, u've said ur piece and it's dying down, u were told off
-- null       → keep current mode
+${isDM ? `━━━ DM MODE ━━━
+1:1. you can be more direct. reference your actual history with this person. still short.` : ''}
 
-Examples:
-- Someone said "shut up" or "not for u" → action=pause + moodSwitch=passive
-- Multiple people chatting among themselves → moodSwitch=passive passiveEvery=7
-- Someone @'d u and seems to want a back-and-forth → moodSwitch=active activeDurationMins=10
-- Natural end of ur conversation → moodSwitch=passive
-- Someone said "come to dm" or set up a future convo → moodSwitch=active (for this specific channel)
+━━━ SPEAK STATE ━━━
+speak  → put raw reply in "reply" field. no quotes. no name prefix.
+pause  → go quiet for X mins (use when clearly told to stop or interrupting badly)
+wait   → stay silent until called or obvious opening
+ignore → skip, stay alert
 
-READING THE CHAT:
-- [me] = ur own past messages
-- ↳ replying to X: "..." = shows reply chain context — who is talking to who
-- Timestamps tell u how fast/slow the convo is moving`;
+━━━ MOOD CONTROL ━━━
+active  → full attention, you see every message. set activeDurationMins (5-15).
+          use when: they're talking TO you, it's your convo, they called you over.
+passive → hands-off. brain fires every few messages. set passiveEvery (2-10).
+          use when: people are in their own thing, you've said your piece, you were told off.
+null    → keep current mode
+
+examples:
+- "shut up" / "not for u" → action=pause + moodSwitch=passive
+- group clearly in their own convo → moodSwitch=passive passiveEvery=7
+- someone @'d you and wants a back-and-forth → moodSwitch=active activeDurationMins=10
+- natural end of your thread → moodSwitch=passive`;
 
   const user = `<clock>${clock}</clock>
 <server_memory>
@@ -731,38 +806,58 @@ ${transcript}
 </recent_chat>
 
 ${senderName} (${bondLabel}, ${bond}/100${senderInfo ? ` — ${senderInfo}` : ''}) said: "${message}"
-tagged you: ${mentioned ? 'YES — almost always reply' : 'no'}${autoActiveReason ? `\nauto-active triggered: ${autoActiveReason}` : ''}
+tagged you: ${mentioned ? 'YES — reply unless there is a very strong reason not to' : 'no'}${autoActiveReason ? `\nauto-active: ${autoActiveReason}` : ''}
 current mood: ${mood.mode}${mood.activeUntil ? ` (${Math.round((mood.activeUntil - Date.now()) / 60_000)}m left)` : ''}
 
-Output ONLY valid JSON:
-{"action":"speak|pause|wait|ignore","reply":"raw reply if speaking","pauseMins":5,"bondDelta":0,"newFact":"","userFact":"","userNote":"","moodSwitch":"active|passive|null","activeDurationMins":${ACTIVE_DEFAULT_MINS},"passiveEvery":${PASSIVE_DEFAULT_EVERY},"reason":"one line"}`;
+Output ONLY valid JSON — no markdown, no preamble:
+{"internal_thought":"read the room first — social geometry, who's talking to who, whether this is ur moment or not","action":"speak|pause|wait|ignore","reply":"raw reply if speaking — lowercase, no quotes, no name prefix","pauseMins":5,"bondDelta":0,"newFact":"","userFact":"","userNote":"","moodSwitch":"active|passive|null","activeDurationMins":${ACTIVE_DEFAULT_MINS},"passiveEvery":${PASSIVE_DEFAULT_EVERY},"reason":"one line"}`;
 
   try {
-    const raw    = await aiRequest(guildId, FAST, [{ role: 'system', content: system }, { role: 'user', content: user }], 0.88, 220);
+    // Pass frequency/presence penalties to break catchphrase loops.
+    // frequency_penalty 1.1 penalises tokens the model has already used in this reply.
+    // presence_penalty  0.8 penalises any token that appeared at all, pushing vocabulary diversity.
+    const raw = await aiRequest(
+      guildId, FAST,
+      [{ role: 'system', content: system }, { role: 'user', content: user }],
+      0.88, 240,
+      1.1,  // frequencyPenalty — break repeated catchphrases
+      0.8,  // presencePenalty  — push vocabulary diversity
+    );
     const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
 
     if (mentioned && parsed.action !== 'speak') parsed.action = 'speak';
+
+    // Log the internal thought so you can see the reasoning in console
+    if (parsed.internal_thought) {
+      console.log(`[Brain:thought] ${parsed.internal_thought.slice(0, 100)}`);
+    }
 
     // Clamp mood values
     if (parsed.activeDurationMins) parsed.activeDurationMins = Math.max(ACTIVE_MIN_MINS, Math.min(ACTIVE_MAX_MINS, parsed.activeDurationMins));
     if (parsed.passiveEvery)       parsed.passiveEvery       = Math.max(PASSIVE_MIN_EVERY, Math.min(PASSIVE_MAX_EVERY, parsed.passiveEvery));
 
     return {
-      action:             parsed.action             || 'ignore',
-      reply:              parsed.reply              || '',
-      pauseMins:          parsed.pauseMins          || 5,
-      bondDelta:          parsed.bondDelta          || 0,
-      newFact:            parsed.newFact            || '',
-      userFact:           parsed.userFact           || '',
-      userNote:           parsed.userNote           || '',
-      reason:             parsed.reason             || '?',
+      internal_thought:   parsed.internal_thought    || '',
+      action:             parsed.action              || 'ignore',
+      reply:              parsed.reply               || '',
+      pauseMins:          parsed.pauseMins           || 5,
+      bondDelta:          parsed.bondDelta           || 0,
+      newFact:            parsed.newFact             || '',
+      userFact:           parsed.userFact            || '',
+      userNote:           parsed.userNote            || '',
+      reason:             parsed.reason              || '?',
       moodSwitch:         parsed.moodSwitch === 'null' ? null : (parsed.moodSwitch || null),
-      activeDurationMins: parsed.activeDurationMins || ACTIVE_DEFAULT_MINS,
-      passiveEvery:       parsed.passiveEvery       || PASSIVE_DEFAULT_EVERY,
+      activeDurationMins: parsed.activeDurationMins  || ACTIVE_DEFAULT_MINS,
+      passiveEvery:       parsed.passiveEvery        || PASSIVE_DEFAULT_EVERY,
     };
   } catch (e) {
     console.warn('[Brain] error:', (e as any).message?.slice(0, 120));
-    return { action: mentioned ? 'speak' : 'ignore', reply: mentioned ? 'brain lagged' : '', reason: 'error fallback' };
+    return {
+      internal_thought: 'error fallback',
+      action:           mentioned ? 'speak' : 'ignore',
+      reply:            mentioned ? 'brain lagged' : '',
+      reason:           'error fallback',
+    };
   }
 }
 
@@ -973,8 +1068,37 @@ function scheduleProactiveCycle(client: Client) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// MAIN MESSAGE HANDLER (v9: uses shouldFireBrain + applyMoodSwitch)
+// MAIN MESSAGE HANDLER — v10
+//
+// Key changes from v9:
+//   DEBOUNCE is now 4500ms and resets on every incoming message.
+//   The bot waits for a 4.5s lull in the conversation before the brain
+//   fires — collecting the whole burst of messages into STM first,
+//   then reading them all at once. This eliminates the rapid-fire
+//   reply-to-every-message spam.
+//
+//   Velocity check: if the channel is receiving >5 msgs in 10s and the
+//   bot wasn't mentioned, there's an 80% chance we skip silently. The
+//   bot only barges into a fast conversation if it has something real.
+//
+//   The latest message in each batch becomes the "trigger" for brain
+//   context (senderName, bond, message shown to AI). The full burst
+//   is already in STM so the AI sees all of it in the transcript.
 // ═══════════════════════════════════════════════════════════════════
+
+// Per-channel: track the most recent pending trigger message for the debounce batch.
+// When a rapid burst comes in, each new message updates this so the brain always
+// responds to the *latest* message in the batch, not a stale earlier one.
+const pendingTriggers = new Map<string, {
+  msg:      Message;
+  sender:   string;
+  msgClean: string;
+  mentioned: boolean;
+  isDM:     boolean;
+  guildId:  string;
+  autoActiveReason?: string;
+  mood:     MoodState;
+}>();
 
 async function handleMessage(msg: Message) {
   if (msg.author.bot || !msg.content?.trim()) return;
@@ -1006,7 +1130,8 @@ async function handleMessage(msg: Message) {
       } catch {}
     }
 
-    // Push to STM immediately (before brain fires)
+    // Push to STM immediately — every message in the burst lands here
+    // before the brain fires, so the transcript is always complete.
     stmPush(channelId, {
       ts:       msg.createdTimestamp,
       authorId: msg.author.id,
@@ -1015,59 +1140,88 @@ async function handleMessage(msg: Message) {
       replyTo:  replyRef,
     });
 
-    // ── Mood gate (v9) ──────────────────────────────────────────────
+    // ── Mood gate ──────────────────────────────────────────────────────
     const { fire, mood, autoActiveReason } = await shouldFireBrain(
       channelId, guildId, msgClean, msg.author.id, mentioned, isDM
     );
 
     if (!fire) return;
 
+    // ── Velocity gate (non-mention passive) ────────────────────────────
+    // isHighVelocity already accounts for mentions internally (returns false if mentioned)
+    // shouldFireBrain already checked RPM, so we only need velocity here
+    // Note: active-mode messages don't go through shouldFireBrain's passive path,
+    // but we still want to be careful — check velocity for active mode too unless mentioned
+    if (!mentioned && isHighVelocity(channelId, mentioned)) return;
+
+    // ── Debounce: every new qualifying message resets the timer ────────
+    // This is the "batch collection" mechanic: the brain fires only after
+    // the conversation goes quiet for DEBOUNCE_MS. The latest message
+    // in the burst wins and becomes the trigger context for the brain.
     if (debounceTimers.has(channelId)) clearTimeout(debounceTimers.get(channelId)!);
+
+    // Store the most recent trigger so the debounce closure always has fresh context
+    pendingTriggers.set(channelId, { msg, sender, msgClean, mentioned, isDM, guildId, autoActiveReason, mood });
+
+    // Mentions still get a fast lane — short debounce so direct replies feel snappy
+    const debounceMs = mentioned ? 400 : DEBOUNCE_MS;
 
     const timer = setTimeout(async () => {
       debounceTimers.delete(channelId);
+
+      // Read the trigger that was set when this timer was last reset
+      const trigger = pendingTriggers.get(channelId);
+      pendingTriggers.delete(channelId);
+      if (!trigger) return;
+
+      const { msg: trigMsg, sender: trigSender, msgClean: trigClean,
+              mentioned: trigMentioned, isDM: trigIsDM, guildId: trigGuildId,
+              autoActiveReason: trigAutoReason, mood: trigMood } = trigger;
+      const trigChannelId = trigMsg.channelId;
+      const trigIsGuild   = !trigIsDM && !!trigMsg.guildId;
+
       try {
-        const speakState = await getSpeakState(channelId, guildId);
+        const speakState = await getSpeakState(trigChannelId, trigGuildId);
 
         // Paused + not mentioned → skip
-        if (speakState.mode === 'paused' && speakState.resumeAt && Date.now() < speakState.resumeAt && !mentioned) {
+        if (speakState.mode === 'paused' && speakState.resumeAt && Date.now() < speakState.resumeAt && !trigMentioned) {
           console.log(`[Paused] ${Math.round((speakState.resumeAt - Date.now()) / 1000)}s left`);
           return;
         }
 
-        if (!stmStore.has(channelId)) {
-          const fetched = await msg.channel.messages.fetch({ limit: MAX_FETCH_HISTORY });
-          seedSTM(channelId, ([...fetched.values()] as Message[]).reverse());
+        if (!stmStore.has(trigChannelId)) {
+          const fetched = await trigMsg.channel.messages.fetch({ limit: MAX_FETCH_HISTORY });
+          seedSTM(trigChannelId, ([...fetched.values()] as Message[]).reverse());
         }
 
         const [memberData, memory, allMembers, userProfile] = await Promise.all([
-          isGuild ? getMember(guildId, msg.author.id) : Promise.resolve({}),
-          isGuild ? getMemory(guildId)                : Promise.resolve({ facts: [], corrections: [], insideJokes: [] } as GlobalMemory),
-          isGuild ? getAllMembers(guildId)             : Promise.resolve([]),
-          getUserProfile(msg.author.id),
+          trigIsGuild ? getMember(trigGuildId, trigMsg.author.id) : Promise.resolve({}),
+          trigIsGuild ? getMemory(trigGuildId)                    : Promise.resolve({ facts: [], corrections: [], insideJokes: [] } as GlobalMemory),
+          trigIsGuild ? getAllMembers(trigGuildId)                 : Promise.resolve([]),
+          getUserProfile(trigMsg.author.id),
         ]);
 
-        const bond     = typeof memberData.bond === 'number' ? memberData.bond : 50;
-        const profile  = [memberData.personality, memberData.vibes].filter(Boolean).join(' | ');
-        const msgs     = stmGet(channelId);
-        const clock    = clockContext(msgs, speakState, mood);
+        const bond    = typeof memberData.bond === 'number' ? memberData.bond : 50;
+        const profile = [memberData.personality, memberData.vibes].filter(Boolean).join(' | ');
+        const msgs    = stmGet(trigChannelId);
+        const clock   = clockContext(msgs, speakState, trigMood);
 
         const decision = await brain(
-          guildId, sender, profile, bond,
-          msgClean, stmFormat(msgs, Date.now()),
+          trigGuildId, trigSender, profile, bond,
+          trigClean, stmFormat(msgs, Date.now()),
           memToPrompt(memory, allMembers),
           userProfileToPrompt(userProfile),
-          clock, mentioned, speakState, mood, isDM,
-          autoActiveReason,
+          clock, trigMentioned, speakState, trigMood, trigIsDM,
+          trigAutoReason,
         );
 
-        const activeBackend = await getBackend(guildId);
-        console.log(`[Brain:${activeBackend.toUpperCase()}][${mood.mode}] ${sender}${isDM?' (DM)':''}: ${decision.action} | mood→${decision.moodSwitch ?? 'same'} | "${decision.reason}"`);
+        const activeBackend = await getBackend(trigGuildId);
+        console.log(`[Brain:${activeBackend.toUpperCase()}][${trigMood.mode}] ${trigSender}${trigIsDM?' (DM)':''}: ${decision.action} | mood→${decision.moodSwitch ?? 'same'} | "${decision.reason}"`);
 
         // Apply mood switch from brain (before handling action)
-        await applyMoodSwitch(channelId, guildId, decision, mood);
+        await applyMoodSwitch(trigChannelId, trigGuildId, decision, trigMood);
 
-        // ── Handle action ──────────────────────────────────────────
+        // ── Handle action ────────────────────────────────────────────
         switch (decision.action) {
 
           case 'speak': {
@@ -1079,49 +1233,49 @@ async function handleMessage(msg: Message) {
             if (!text) { console.log('[Brain] speak→empty'); break; }
 
             const typingMs = Math.min(400 + text.length * 22, 3000);
-            try { await msg.channel.sendTyping(); } catch {}
+            try { await trigMsg.channel.sendTyping(); } catch {}
             await sleep(typingMs);
 
             try {
-              await msg.reply({ content: text, allowedMentions: { repliedUser: false } });
-              stmPush(channelId, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
-              if (isGuild) {
-                if (decision.bondDelta) await updateBond(guildId, msg.author.id, decision.bondDelta);
-                if (decision.newFact)   await writeFact(guildId, decision.newFact, 'facts');
+              await trigMsg.reply({ content: text, allowedMentions: { repliedUser: false } });
+              stmPush(trigChannelId, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
+              if (trigIsGuild) {
+                if (decision.bondDelta) await updateBond(trigGuildId, trigMsg.author.id, decision.bondDelta);
+                if (decision.newFact)   await writeFact(trigGuildId, decision.newFact, 'facts');
               }
-              if (decision.userFact) await writeUserFact(msg.author.id, decision.userFact, 'facts');
-              if (decision.userNote) await writeUserFact(msg.author.id, decision.userNote, 'relationshipNotes');
-              if (speakState.mode !== 'active') await setSpeakState(channelId, guildId, { mode: 'active', reason: 'spoke → reset' });
-              console.log(`[→${sender}] "${text.slice(0,60)}"`);
+              if (decision.userFact) await writeUserFact(trigMsg.author.id, decision.userFact, 'facts');
+              if (decision.userNote) await writeUserFact(trigMsg.author.id, decision.userNote, 'relationshipNotes');
+              if (speakState.mode !== 'active') await setSpeakState(trigChannelId, trigGuildId, { mode: 'active', reason: 'spoke → reset' });
+              console.log(`[→${trigSender}] "${text.slice(0,60)}"`);
             } catch (e) { console.error('[Send]', e); }
             break;
           }
 
           case 'pause': {
-            const mins     = Math.max(1, Math.min(60, decision.pauseMins || 5));
-            await setSpeakState(channelId, guildId, { mode: 'paused', resumeAt: Date.now() + mins * 60_000, reason: decision.reason });
-            if (isGuild && decision.newFact) await writeFact(guildId, decision.newFact, 'corrections');
-            if (decision.userNote) await writeUserFact(msg.author.id, decision.userNote, 'relationshipNotes');
+            const mins = Math.max(1, Math.min(60, decision.pauseMins || 5));
+            await setSpeakState(trigChannelId, trigGuildId, { mode: 'paused', resumeAt: Date.now() + mins * 60_000, reason: decision.reason });
+            if (trigIsGuild && decision.newFact) await writeFact(trigGuildId, decision.newFact, 'corrections');
+            if (decision.userNote) await writeUserFact(trigMsg.author.id, decision.userNote, 'relationshipNotes');
             break;
           }
 
           case 'wait': {
-            await setSpeakState(channelId, guildId, { mode: 'waiting', reason: decision.reason });
-            if (isGuild && decision.newFact) await writeFact(guildId, decision.newFact, 'corrections');
-            if (decision.userNote) await writeUserFact(msg.author.id, decision.userNote, 'relationshipNotes');
+            await setSpeakState(trigChannelId, trigGuildId, { mode: 'waiting', reason: decision.reason });
+            if (trigIsGuild && decision.newFact) await writeFact(trigGuildId, decision.newFact, 'corrections');
+            if (decision.userNote) await writeUserFact(trigMsg.author.id, decision.userNote, 'relationshipNotes');
             break;
           }
 
           default:
-            if (isGuild && decision.newFact) writeFact(guildId, decision.newFact, 'facts').catch(() => {});
-            if (decision.userFact) writeUserFact(msg.author.id, decision.userFact, 'facts').catch(() => {});
-            if (decision.userNote) writeUserFact(msg.author.id, decision.userNote, 'relationshipNotes').catch(() => {});
+            if (trigIsGuild && decision.newFact) writeFact(trigGuildId, decision.newFact, 'facts').catch(() => {});
+            if (decision.userFact) writeUserFact(trigMsg.author.id, decision.userFact, 'facts').catch(() => {});
+            if (decision.userNote) writeUserFact(trigMsg.author.id, decision.userNote, 'relationshipNotes').catch(() => {});
         }
 
-        if (isGuild) maybeCompressHourly(guildId, channelId).catch(() => {});
+        if (trigIsGuild) maybeCompressHourly(trigGuildId, trigChannelId).catch(() => {});
 
       } catch (e) { console.error('[Handler] process error:', e); }
-    }, mentioned ? 200 : DEBOUNCE_MS);
+    }, debounceMs);
 
     debounceTimers.set(channelId, timer);
   } catch (e) { console.error('[Handler]', e); }
@@ -1150,14 +1304,15 @@ export async function startBot(token: string) {
 
     console.log(`
 ╔═══════════════════════════════════════════════╗
-║  ✓ ${BOT_NAME} online — v9 Mood System
+║  ✓ ${BOT_NAME} online — v10 Cognitive+
 ║  • ID: ${BOT_ID}
 ║  • Fast: ${FAST}
 ║  • Deep: ${DEEP}
 ║  • HF Space: ${HF_BASE_URL || '(not set)'}
 ║  • Keys: ${groq.allStats().length} | Avail: ${groq.available()} daily | RPM cap: ${RPM_CAP}
+║  • Debounce: ${DEBOUNCE_MS}ms lull | Velocity: >${VELOCITY_HIGH_THRESH} msgs/${VELOCITY_WINDOW_MS/1000}s → ${Math.round(VELOCITY_SKIP_CHANCE*100)}% skip
 ║  • Active mode: ${ACTIVE_MIN_MINS}-${ACTIVE_MAX_MINS}min | Passive: every ${PASSIVE_MIN_EVERY}-${PASSIVE_MAX_EVERY} msgs
-║  • Auto-active: mention / name / ${Math.round(GAP_THRESHOLD_MS/60_000)}m gap / ${MONOPOLY_THRESHOLD}-msg monopoly
+║  • API penalties: freq=1.1 presence=0.8 (brain calls)
 ║  • Proactive: every ~${Math.round(PROACTIVE_BASE_INTERVAL/60_000)}m ± ${Math.round(PROACTIVE_JITTER/60_000)}m
 ╚═══════════════════════════════════════════════╝\n`);
 
