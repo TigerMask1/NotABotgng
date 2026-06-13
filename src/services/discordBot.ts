@@ -256,6 +256,96 @@ let profilerTimer:  NodeJS.Timeout | null = null;
 let proactiveTimer: NodeJS.Timeout | null = null;
 let profilerCycle = 0;
 
+// ── Alias Registry ─────────────────────────────────────────────────────────────
+// Maps a nickname/alias → { userId, displayName } so the AI knows "Coral" = "Arisu (ID: ...)"
+// Populated from Firebase member.nicknames arrays at boot and after profiler runs.
+// Can be updated at runtime via !alias command.
+interface AliasEntry { userId: string; displayName: string; }
+const nicknameMap = new Map<string, AliasEntry>(); // key: lowercase alias
+
+function registerAlias(alias: string, userId: string, displayName: string) {
+  if (!alias?.trim()) return;
+  const key = alias.trim().toLowerCase();
+  nicknameMap.set(key, { userId, displayName });
+}
+
+/** Scans message text for known aliases and prepends context hints like:
+ *  [Context: "Coral" = Arisu (User ID: 12345)]
+ *  so the AI doesn't hallucinate a stranger relationship.
+ */
+function injectAliasHints(text: string): string {
+  const hints: string[] = [];
+  for (const [alias, entry] of nicknameMap.entries()) {
+    // whole-word match, case-insensitive
+    const re = new RegExp(`\\b${alias}\\b`, 'i');
+    if (re.test(text)) {
+      hints.push(`"${alias}" = ${entry.displayName} (User ID: ${entry.userId})`);
+    }
+  }
+  if (!hints.length) return text;
+  return `[Context: ${hints.join('; ')}]\n${text}`;
+}
+
+// ── Told-Off Flag ──────────────────────────────────────────────────────────────
+// If a user explicitly tells the bot off ("not for you", "not talking to you", etc.)
+// the bot hard-codes ignore for that user+channel for 10 minutes.
+const TOLD_OFF_MS = 10 * 60_000;
+// key: `${channelId}:${userId}`, value: expiry epoch ms
+const toldOffUntil = new Map<string, number>();
+
+const TOLD_OFF_PATTERNS = [
+  /\bnot (for|talking to|meant for|directed at) (you|u)\b/i,
+  /\bnot your (business|concern|conversation|convo)\b/i,
+  /\bstay out\b/i,
+  /\bshut (up|it)\b/i,
+  /\bno one (asked|was talking to) you\b/i,
+  /\bstop (interrupting|jumping in)\b/i,
+  /\bback off\b/i,
+];
+
+function checkToldOff(channelId: string, userId: string, content: string): boolean {
+  const isToldOff = TOLD_OFF_PATTERNS.some(re => re.test(content));
+  if (isToldOff) {
+    const key    = `${channelId}:${userId}`;
+    const expiry = Date.now() + TOLD_OFF_MS;
+    toldOffUntil.set(key, expiry);
+    console.log(`[ToldOff] ${userId.slice(-6)} in #${channelId.slice(-6)} → ignore for ${TOLD_OFF_MS/60_000}m`);
+  }
+  return isToldOff;
+}
+
+function isToldOffActive(channelId: string, userId: string): boolean {
+  const key    = `${channelId}:${userId}`;
+  const expiry = toldOffUntil.get(key);
+  if (!expiry) return false;
+  if (Date.now() >= expiry) { toldOffUntil.delete(key); return false; }
+  return true;
+}
+
+// ── Pending Question Tracker ───────────────────────────────────────────────────
+// When the bot asks a question (reply ends with '?'), we record the channel + target
+// user so the next message from that user in that channel is treated as a direct
+// response even without a @mention. Clears after 5 minutes (question expires).
+const PENDING_QUESTION_TTL = 5 * 60_000;
+interface PendingQuestion { targetUserId: string; expiresAt: number; }
+const pendingQuestions = new Map<string, PendingQuestion>(); // key: channelId
+
+function setPendingQuestion(channelId: string, targetUserId: string) {
+  pendingQuestions.set(channelId, { targetUserId, expiresAt: Date.now() + PENDING_QUESTION_TTL });
+  console.log(`[PendingQ] #${channelId.slice(-6)} waiting for answer from ${targetUserId.slice(-6)}`);
+}
+
+/** Returns true (and clears) if this author is answering our pending question. */
+function consumePendingQuestion(channelId: string, authorId: string): boolean {
+  const pq = pendingQuestions.get(channelId);
+  if (!pq) return false;
+  if (Date.now() >= pq.expiresAt) { pendingQuestions.delete(channelId); return false; }
+  if (pq.targetUserId !== authorId) return false;
+  pendingQuestions.delete(channelId);
+  console.log(`[PendingQ] #${channelId.slice(-6)} answered by ${authorId.slice(-6)}`);
+  return true;
+}
+
 // ── ID resolution ─────────────────────────────────────────────────────────────
 const idNameCache = new Map<string, string>();
 function cacheId(id: string, name: string) { if (id && name) idNameCache.set(id, name); }
@@ -904,13 +994,16 @@ Output ONLY valid JSON. No markdown, no preamble, no trailing text. Schema is st
       activeDurationMins: parsed.activeDurationMins  || ACTIVE_DEFAULT_MINS,
       passiveEvery:       parsed.passiveEvery        || PASSIVE_DEFAULT_EVERY,
     };
-  } catch (e) {
-    console.warn('[Brain] error:', (e as any).message?.slice(0, 120));
+  } catch (e: any) {
+    // NEVER fire an error message to chat — log raw string and silently ignore.
+    // If the AI returned a truncated/invalid JSON, spamming the channel is worse than silence.
+    console.warn('[Brain] JSON parse error — defaulting to ignore:', e?.message?.slice(0, 120));
+    console.debug('[Brain] raw output was logged above (check Groq request log)');
     return {
-      internal_thought: 'error fallback',
-      action:           mentioned ? 'speak' : 'ignore',
-      reply:            mentioned ? 'brain lagged' : '',
-      reason:           'error fallback',
+      internal_thought: 'json parse error — silent fallback',
+      action:           'ignore',
+      reply:            '',
+      reason:           'json parse error — silent fallback',
     };
   }
 }
@@ -960,6 +1053,8 @@ async function profileMember(guildId: string, userId: string, username: string, 
       vibes: p.vibes || '', sentiment: p.sentiment || 'neutral',
       nicknames: p.nicknames || [], profiledAt: new Date().toISOString(),
     });
+    // Refresh alias registry with newly detected nicknames
+    for (const nick of (p.nicknames || [])) registerAlias(nick, userId, username);
     console.log(`[Profiler] ${username} → "${p.personality}"`);
   } catch {}
 }
@@ -1169,6 +1264,20 @@ async function handleMessage(msg: Message) {
 
     cacheId(msg.author.id, sender);
 
+    // ── Told-off gate: hard-code ignore if user recently told bot to back off ──
+    if (checkToldOff(channelId, msg.author.id, msgClean) || isToldOffActive(channelId, msg.author.id)) {
+      if (!mentioned) {
+        console.log(`[ToldOff] blocking brain for ${sender} in #${channelId.slice(-6)}`);
+        // Still push to STM so context is accurate
+        // (push happens below — return happens after STM push)
+      }
+    }
+
+    // ── Pending question: treat as mentioned if we asked them a question ───────
+    const answeringOurQuestion = !mentioned && consumePendingQuestion(channelId, msg.author.id);
+    const effectiveMentioned   = mentioned || answeringOurQuestion;
+    if (answeringOurQuestion) console.log(`[PendingQ] auto-relevance: ${sender} answering our question`);
+
     if (isDM) await upsertUserProfile(msg.author.id, { dmChannelId: channelId, lastDM: Date.now(), displayName: sender });
     else       await upsertUserProfile(msg.author.id, { lastSeenChannelId: channelId, lastSeenGuildId: guildId, displayName: sender });
 
@@ -1194,9 +1303,12 @@ async function handleMessage(msg: Message) {
       replyTo:  replyRef,
     });
 
+    // ── Told-off hard gate (post-STM-push) ────────────────────────────
+    if (isToldOffActive(channelId, msg.author.id) && !effectiveMentioned) return;
+
     // ── Mood gate ──────────────────────────────────────────────────────
     const { fire, mood, autoActiveReason } = await shouldFireBrain(
-      channelId, guildId, msgClean, msg.author.id, mentioned, isDM
+      channelId, guildId, msgClean, msg.author.id, effectiveMentioned, isDM
     );
 
     if (!fire) return;
@@ -1206,7 +1318,10 @@ async function handleMessage(msg: Message) {
     // shouldFireBrain already checked RPM, so we only need velocity here
     // Note: active-mode messages don't go through shouldFireBrain's passive path,
     // but we still want to be careful — check velocity for active mode too unless mentioned
-    if (!mentioned && isHighVelocity(channelId, mentioned)) return;
+    if (!effectiveMentioned && isHighVelocity(channelId, effectiveMentioned)) return;
+
+    // ── Alias-enriched message for brain ──────────────────────────────
+    const msgForBrain = injectAliasHints(msgClean);
 
     // ── Debounce: every new qualifying message resets the timer ────────
     // This is the "batch collection" mechanic: the brain fires only after
@@ -1215,10 +1330,10 @@ async function handleMessage(msg: Message) {
     if (debounceTimers.has(channelId)) clearTimeout(debounceTimers.get(channelId)!);
 
     // Store the most recent trigger so the debounce closure always has fresh context
-    pendingTriggers.set(channelId, { msg, sender, msgClean, mentioned, isDM, guildId, autoActiveReason, mood });
+    pendingTriggers.set(channelId, { msg, sender, msgClean: msgForBrain, mentioned: effectiveMentioned, isDM, guildId, autoActiveReason, mood });
 
-    // Mentions still get a fast lane — short debounce so direct replies feel snappy
-    const debounceMs = mentioned ? 400 : DEBOUNCE_MS;
+    // Mentions + pending-question answers get a fast lane — short debounce so direct replies feel snappy
+    const debounceMs = effectiveMentioned ? 400 : DEBOUNCE_MS;
 
     const timer = setTimeout(async () => {
       debounceTimers.delete(channelId);
@@ -1293,6 +1408,11 @@ async function handleMessage(msg: Message) {
             try {
               await trigMsg.reply({ content: text, allowedMentions: { repliedUser: false } });
               stmPush(trigChannelId, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
+              // If we asked a question, track it so the next reply from this user
+              // is treated as relevant even without a @mention
+              if (text.trimEnd().endsWith('?')) {
+                setPendingQuestion(trigChannelId, trigMsg.author.id);
+              }
               if (trigIsGuild) {
                 if (decision.bondDelta) await updateBond(trigGuildId, trigMsg.author.id, decision.bondDelta);
                 if (decision.newFact)   await writeFact(trigGuildId, decision.newFact, 'facts');
@@ -1382,6 +1502,13 @@ export async function startBot(token: string) {
           if (m.user.bot) continue;
           cacheId(uid, m.displayName);
           await upsertMember(g.id, uid, { displayName: m.displayName, username: m.user.username });
+          // Seed alias registry from existing Firebase profiles
+          try {
+            const prof = await getMember(g.id, uid);
+            for (const nick of (prof.nicknames || [])) {
+              registerAlias(nick, uid, m.displayName);
+            }
+          } catch {}
         }
         console.log(`[Boot] synced ${members.size} members for "${g.name}"`);
       }
