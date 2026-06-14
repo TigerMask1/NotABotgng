@@ -904,7 +904,7 @@ async function handleMessage(msg: Message) {
         if (decision.action === 'speak') {
           if (!decision.reply?.trim()) {
             console.log('[Brain] speak→empty reply, skipping');
-            break_out: break;
+            return;
           }
           const text     = decision.reply.trim().slice(0, 200);
           const typingMs = Math.min(300 + text.length * 20, 2800);
