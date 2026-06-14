@@ -12,7 +12,7 @@ const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 // Strategy: keep system prompt SHORT and STATIC → gets cached → near-free
 //           only pay tokens for the dynamic tail (transcript + trigger)
 
-const MODEL = 'llama-3.3-70b';   // Cerebras flagship
+const MODEL = 'gpt-oss-120b';   // Cerebras flagship
 const DAILY_TOKEN_BUDGET = 1_000_000;
 const SOFT = 0.85;
 
