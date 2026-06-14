@@ -1,45 +1,3 @@
-/**
- * NOTABOT v13 — "Clean Slate"
- *
- * What actually changed and why:
- *
- * BRAIN → llama-3.3-70b-versatile
- *   Room-reading is theory-of-mind. Figuring out "is this conversation even
- *   about me?" requires understanding subtext, reply chains, social context.
- *   8b fails at this regardless of how you prompt it. 70b does it reliably.
- *   Background jobs (profiler, compress, proactive) stay on 8b — they're
- *   pattern extraction, not social reasoning.
- *
- * REPLY CHAINS → explicit THREAD header in prompt
- *   v12 buried reply context as "↳ replying to X: '...'" in the transcript.
- *   The model often missed it. Now when a message is a reply, the original
- *   message is lifted OUT of the transcript and shown as its own block:
- *     THREAD — {sender} is replying to:
- *     {original_author}: "{original_message}"
- *   The model instantly knows who's talking to whom.
- *
- * JSON SCHEMA → 3 fields: {action, reply, reaction}
- *   v12 had 12 fields in one brain call. The model split attention between
- *   form-filling and social reasoning. Now brain does ONE job: decide what
- *   to do right now. Memory, bond, facts are async side-effects that fire
- *   after the reply — they never block or confuse the brain call.
- *
- * TOKEN BUDGET → hard 5500 TPM cap
- *   Brain call ≈ 800 tokens (600 in + 120 out + overhead).
- *   That's ~6 safe brain calls per minute. Background jobs are capped at
- *   ~250 tokens each and can only run when the brain has headroom.
- *   A bgLock prevents background jobs from stacking up.
- *
- * PROMPT → ~200 words, no algorithms
- *   70b doesn't need a 7-step reading algorithm. It needs clear identity,
- *   texting rules, and the right context structure. The model does the
- *   social reasoning itself if you give it the right inputs.
- *
- * EVERYTHING PRESERVED: mood system, speak states, STM (trimmed to 12 msgs),
- * Firebase memory, bond tracking, debounce, velocity gate, monopoly detection,
- * session break separators, profiler, compress, proactive, admin commands.
- */
-
 import {
   Client, GatewayIntentBits, Message, Partials,
   Events, TextChannel,
@@ -49,39 +7,78 @@ import { db } from './firebase.ts';
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
-// ═══════════════════════════════════════════════════════════════════
-// MODELS
-// ═══════════════════════════════════════════════════════════════════
-
-// Brain MUST be 70b — room reading is theory-of-mind, 8b fails at it
+// ── MODELS ───────────────────────────────────────────────────────
 const BRAIN = 'llama-3.3-70b-versatile';
-// Background jobs (profiler, compress, proactive) only need pattern extraction
 const FAST  = 'llama-3.1-8b-instant';
 
-// ═══════════════════════════════════════════════════════════════════
-// TOKEN BUDGET  ← the core constraint for 6000 TPM
-//
-// Brain call  ≈ 800 tokens  → ~6 safe calls / min at 5500 cap
-// Background  ≈ 250 tokens  → low priority, only fires when headroom exists
-//
-// We use 5500, not 6000, to leave buffer for token estimation variance.
-// ═══════════════════════════════════════════════════════════════════
+// ── RATE LIMITS — Groq free tier per model (verified June 2026) ───
+interface ModelLimits { rpm: number; rpd: number; tpm: number; tpd: number; }
 
-const TPM_CAP   = 5500;
+const LIMITS: Record<string, ModelLimits> = {
+  [BRAIN]: { rpm: 30, rpd: 1_000, tpm: 12_000, tpd: 100_000 },
+  [FAST]:  { rpm: 30, rpd: 1_000, tpm: 15_000, tpd: 200_000 },
+};
+
 const EST_BRAIN = 800;
 const EST_BG    = 250;
+const SOFT      = 0.85;
 
-const tpm = { used: 0, since: Date.now() };
+interface Bucket { count: number; tokens: number; since: number; }
 
-function tpmReset()            { if (Date.now() - tpm.since > 60_000) { tpm.used = 0; tpm.since = Date.now(); } }
-function tpmAllow(est: number) { tpmReset(); return tpm.used + est < TPM_CAP; }
-function tpmConsume(n: number) { tpmReset(); tpm.used += n; }
-function tpmLeft()             { tpmReset(); return Math.max(0, TPM_CAP - tpm.used); }
+class Budget {
+  private minute = new Map<string, Bucket>();
+  private day    = new Map<string, Bucket>();
 
-// ═══════════════════════════════════════════════════════════════════
-// GROQ MANAGER
-// ═══════════════════════════════════════════════════════════════════
+  private win(map: Map<string, Bucket>, model: string, ms: number): Bucket {
+    const now = Date.now();
+    let b = map.get(model);
+    if (!b || now - b.since >= ms) { b = { count: 0, tokens: 0, since: now }; map.set(model, b); }
+    return b;
+  }
 
+  allow(model: string, estTokens: number): boolean {
+    const lim = LIMITS[model];
+    if (!lim) return true;
+    const m = this.win(this.minute, model, 60_000);
+    const d = this.win(this.day,    model, 86_400_000);
+    return m.count            < lim.rpm * SOFT
+        && m.tokens + estTokens < lim.tpm * SOFT
+        && d.count            < lim.rpd * SOFT
+        && d.tokens + estTokens < lim.tpd * SOFT;
+  }
+
+  consume(model: string, tokens: number) {
+    const m = this.win(this.minute, model, 60_000);
+    const d = this.win(this.day,    model, 86_400_000);
+    m.count++; m.tokens += tokens;
+    d.count++; d.tokens += tokens;
+  }
+
+  exhaustToday(model: string) {
+    const lim = LIMITS[model];
+    if (!lim) return;
+    const d = this.win(this.day, model, 86_400_000);
+    d.count  = lim.rpd;
+    d.tokens = lim.tpd;
+  }
+
+  left(model: string) {
+    const lim = LIMITS[model];
+    if (!lim) return null;
+    const m = this.win(this.minute, model, 60_000);
+    const d = this.win(this.day,    model, 86_400_000);
+    return {
+      rpm: Math.max(0, lim.rpm - m.count),
+      tpm: Math.max(0, lim.tpm - m.tokens),
+      rpd: Math.max(0, lim.rpd - d.count),
+      tpd: Math.max(0, lim.tpd - d.tokens),
+    };
+  }
+}
+
+const budget = new Budget();
+
+// ── GROQ MANAGER ─────────────────────────────────────────────────
 class GroqManager {
   private clients   = new Map<string, Groq>();
   private cooldowns = new Map<string, number>();
@@ -133,14 +130,25 @@ class GroqManager {
         });
         this.usage.set(k, (this.usage.get(k) || 0) + 1);
         const tok = r.usage?.total_tokens || maxTok;
-        tpmConsume(tok);
-        console.log(`[Groq/${model.includes('70b') ? '70b' : '8b'}] ${tok}tok | TPM left: ${tpmLeft()}`);
+        budget.consume(model, tok);
+        const left = budget.left(model);
+        console.log(`[Groq/${model.includes('70b') ? '70b' : '8b'}] ${tok}tok | rpm:${left?.rpm} rpd:${left?.rpd} tpm:${left?.tpm} tpd:${left?.tpd}`);
         return r.choices[0]?.message?.content || '';
       } catch (e: any) {
         if (e.status === 429) {
-          const sec = parseFloat(e.message?.match(/in ([\d.]+)s/)?.[1] || '45') + 3;
+          const msg      = e.message || '';
+          const secMatch = msg.match(/in ([\d.]+)s/);
+          const isDaily  = /day|RPD|TPD/i.test(msg) || !secMatch;
+
+          if (isDaily) {
+            budget.exhaustToday(model);
+            console.warn(`[Groq] ...${k.slice(-4)} ${model} daily quota exhausted — backing off`);
+            break;
+          }
+
+          const sec = parseFloat(secMatch![1]) + 1;
           this.cooldowns.set(k, Date.now() + sec * 1000);
-          console.warn(`[Groq] ...${k.slice(-4)} cooldown ${sec.toFixed(0)}s`);
+          console.warn(`[Groq] ...${k.slice(-4)} cooldown ${sec.toFixed(1)}s`);
         } else {
           console.error(`[Groq] attempt ${i + 1}: ${e.message?.slice(0, 80)}`);
         }
@@ -161,23 +169,23 @@ class GroqManager {
 
 const groq = new GroqManager();
 
-// ═══════════════════════════════════════════════════════════════════
-// CONSTANTS
-// ═══════════════════════════════════════════════════════════════════
-
-const DEBOUNCE_MS        = 4000;   // wait for lull before firing brain
-const STM_MAX            = 12;     // messages kept in short-term memory
-const GAP_MAJOR_MS       = 25 * 60_000;   // ≥25m gap → new session marker
-const GAP_MINOR_MS       =  5 * 60_000;   // ≥5m gap → brief pause marker
-const PASSIVE_EVERY      = 5;             // brain fires every N msgs in passive
-const PASSIVE_EVERY_BUSY = 8;             // same but during high-velocity bursts
-const ACTIVE_MINS        = 8;             // default active mode duration
+// ── CONSTANTS ────────────────────────────────────────────────────
+const DEBOUNCE_MS        = 4000;
+const STM_MAX            = 12;
+const GAP_MAJOR_MS       = 25 * 60_000;
+const GAP_MINOR_MS       =  5 * 60_000;
+const PASSIVE_EVERY      = 5;
+const PASSIVE_EVERY_BUSY = 8;
+const ACTIVE_MINS        = 8;
 const VELOCITY_WINDOW_MS = 10_000;
-const VELOCITY_THRESH    = 5;             // >5 msgs in 10s = high velocity
-const MONOPOLY_N         = 4;             // last N msgs all from one person → active
+const VELOCITY_THRESH    = 5;
+const MONOPOLY_N         = 4;
 const PROFILER_INTERVAL  = 20 * 60_000;
 const COMPRESS_INTERVAL  = 90 * 60_000;
 const PROACTIVE_INTERVAL = 35 * 60_000;
+const MIN_BRAIN_GAP_MS   = 2200;
+
+let lastBrainCallAt = 0;
 
 let BOT_NAME  = 'NotABot';
 let BOT_ID    = '';
@@ -194,15 +202,11 @@ function resolveMentions(text: string): string {
 }
 
 function cleanContent(raw: string): string {
-  // Strip the bot's own mention from the message, then resolve all other @s
   const stripped = BOT_ID ? raw.replace(new RegExp(`<@!?${BOT_ID}>`, 'g'), '') : raw;
   return resolveMentions(stripped).trim();
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// SHORT-TERM MEMORY
-// ═══════════════════════════════════════════════════════════════════
-
+// ── SHORT-TERM MEMORY ────────────────────────────────────────────
 interface STMsg {
   ts:       number;
   authorId: string;
@@ -226,7 +230,6 @@ function stmFormat(msgs: STMsg[]): string {
   const now   = Date.now();
   const lines: string[] = [];
   for (let i = 0; i < msgs.length; i++) {
-    // Time-gap separators so the model knows when sessions changed
     if (i > 0) {
       const gap = msgs[i].ts - msgs[i - 1].ts;
       if (gap >= GAP_MAJOR_MS) {
@@ -254,17 +257,13 @@ function seedSTM(channelId: string, msgs: Message[]) {
   })));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// MOOD STATE  (active / passive — in-memory, no Firebase overhead)
-// ═══════════════════════════════════════════════════════════════════
-
+// ── MOOD STATE ───────────────────────────────────────────────────
 interface Mood { mode: 'active' | 'passive'; until?: number; count: number; }
 
 const moods = new Map<string, Mood>();
 
 function getMood(channelId: string): Mood {
   let m = moods.get(channelId) ?? { mode: 'passive', count: 0 };
-  // Auto-expire active mode
   if (m.mode === 'active' && m.until && Date.now() >= m.until) {
     m = { mode: 'passive', count: 0 };
     moods.set(channelId, m);
@@ -283,15 +282,12 @@ function goPassive(channelId: string) {
   console.log(`[Mood] #${channelId.slice(-5)} passive`);
 }
 
-// Returns true if the brain should fire for this message.
-// Also handles auto-active signals (mention, gap, monopoly).
 function moodTick(
   channelId: string,
   authorId:  string,
   mentioned: boolean,
   isDM:      boolean,
 ): boolean {
-  // DM and direct mentions always fire
   if (isDM || mentioned) {
     goActive(channelId, ACTIVE_MINS, isDM ? 'DM' : 'mentioned');
     return true;
@@ -299,7 +295,6 @@ function moodTick(
 
   const msgs = stmGet(channelId);
 
-  // Idle gap → new session → go active
   if (msgs.length > 0) {
     const gap = Date.now() - msgs[msgs.length - 1].ts;
     if (gap > 8 * 60_000) {
@@ -308,16 +303,10 @@ function moodTick(
     }
   }
 
-  // Bot name in message (no @ needed) → go active
-  // (Already handled by mention check above if they @'d, this catches plain "notabot what do u think")
-
-  // Monopoly: last N messages all from the same person, not addressing others
-  // Uses cleaned STM content where mentions are "@Name" strings
   if (msgs.length >= MONOPOLY_N) {
     const recent  = msgs.slice(-MONOPOLY_N);
     const authors = new Set(recent.map(m => m.authorId).filter(id => id !== BOT_ID));
     if (authors.size === 1 && [...authors][0] === authorId) {
-      // Check they're not addressing someone else
       const addressingOthers = recent.some(m => {
         const withoutMe = m.content.replace(new RegExp(`@${BOT_NAME}`, 'gi'), '');
         return withoutMe.includes('@');
@@ -329,14 +318,12 @@ function moodTick(
     }
   }
 
-  // Passive mode counter
   const m = getMood(channelId);
   if (m.mode === 'active') return true;
 
   m.count++;
   moods.set(channelId, m);
 
-  // Velocity: if channel is in a fast back-and-forth, back off more
   const cutoff  = Date.now() - VELOCITY_WINDOW_MS;
   const vel     = stmGet(channelId).filter(x => x.ts >= cutoff && x.authorId !== BOT_ID).length;
   const every   = vel > VELOCITY_THRESH ? PASSIVE_EVERY_BUSY : PASSIVE_EVERY;
@@ -346,10 +333,7 @@ function moodTick(
   return fire;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// SPEAK STATE  (paused / waiting / active)
-// ═══════════════════════════════════════════════════════════════════
-
+// ── SPEAK STATE ──────────────────────────────────────────────────
 interface SpeakState {
   mode:      'active' | 'paused' | 'waiting';
   resumeAt?: number;
@@ -395,10 +379,7 @@ function saveSpeakState(channelId: string, guildId: string, s: SpeakState) {
     .set({ speakState: s }, { merge: true }).catch(() => {});
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// FIREBASE / MEMORY
-// ═══════════════════════════════════════════════════════════════════
-
+// ── FIREBASE / MEMORY ────────────────────────────────────────────
 interface ServerMemory { facts: string[]; jokes: string[]; }
 
 const memCache = new Map<string, { d: ServerMemory; ts: number }>();
@@ -425,8 +406,6 @@ async function addFact(guildId: string, fact: string, bucket: 'facts' | 'jokes' 
     .set({ [bucket]: m[bucket] }, { merge: true }).catch(() => {});
   console.log(`[Mem:${bucket}] "${fact.slice(0, 60)}"`);
 }
-
-// ── Member data ───────────────────────────────────────────────────
 
 interface MemberData {
   displayName?: string;
@@ -469,20 +448,7 @@ async function getAllMembers(guildId: string): Promise<MemberData[]> {
   } catch { return []; }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// BRAIN  — 70b, 3-field JSON, clean prompt
-//
-// The core design principle: give the model the RIGHT context structure,
-// then trust it to reason. Don't give it a 7-step algorithm to follow —
-// that's fighting the model.
-//
-// What "right context structure" means here:
-//   - Reply chain as an explicit THREAD block (not a footnote)
-//   - Transcript with session breaks so it knows what's "now" vs "earlier"
-//   - Tiny memory context (3 facts max) so it doesn't bloat the token count
-//   - Single mood/speak line so it knows if it's in focus or background
-// ═══════════════════════════════════════════════════════════════════
-
+// ── BRAIN ────────────────────────────────────────────────────────
 interface BrainDecision {
   action:   'speak' | 'react' | 'ignore';
   reply:    string;
@@ -495,7 +461,7 @@ async function brain(opts: {
   bond:       number;
   message:    string;
   transcript: string;
-  thread?:    string;      // full original message if this is a reply
+  thread?:    string;
   memCtx:     string;
   mentioned:  boolean;
   isDM:       boolean;
@@ -529,17 +495,12 @@ output ONLY valid JSON, nothing else:
     ? `active mode (${Math.round(((opts.mood.until || 0) - Date.now()) / 60_000)}m left)`
     : `passive`;
 
-  // Build user message — structure matters more than length here
   const parts: string[] = [`mood: ${moodLine} | speak: ${opts.speakState.mode}`];
 
   if (opts.memCtx) {
     parts.push(`\nSERVER CONTEXT:\n${opts.memCtx}`);
   }
 
-  // ── THREAD BLOCK — the key fix for reply-chain blindness ──────────
-  // When someone replies to another message, the model needs to see the
-  // original in full — not as a footnote buried in the transcript.
-  // This block makes the thread explicit and impossible to miss.
   if (opts.thread) {
     parts.push(`\nTHREAD — ${opts.sender} is replying to:\n${opts.thread}`);
   }
@@ -567,7 +528,6 @@ output ONLY valid JSON, nothing else:
     const reply    = typeof parsed.reply === 'string' ? parsed.reply.trim().replace(/^["']|["']$/g, '') : '';
     const reaction = sanitizeEmoji(parsed.reaction);
 
-    // Safety net: if mentioned and brain says ignore, send something minimal
     if (opts.mentioned && action === 'ignore') {
       return { action: 'speak', reply: 'hm?', reaction: '' };
     }
@@ -589,9 +549,6 @@ function sanitizeEmoji(raw: any): string {
   return RE.test(e) ? e : '';
 }
 
-// ── Async side-effects — never block the reply ────────────────────
-// Memory writes, bond updates, fact extraction all happen after the
-// message is sent. The brain call is not responsible for these.
 function fireSideEffects(opts: {
   guildId:    string;
   userId:     string;
@@ -600,7 +557,6 @@ function fireSideEffects(opts: {
   newFact?:   string;
 }) {
   if (opts.guildId === 'dm') return;
-  // Small positive bond bump when we speak, negative if ignored (over time)
   if (opts.action === 'speak') {
     updateBond(opts.guildId, opts.userId, 1).catch(() => {});
   }
@@ -609,30 +565,21 @@ function fireSideEffects(opts: {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// BACKGROUND JOBS
-//
-// All on FAST (8b). Pattern extraction doesn't need social reasoning.
-// bgLock: only one background job runs at a time, with 30s between
-// them. This prevents background jobs from spiking TPM during busy
-// message handling windows.
-// ═══════════════════════════════════════════════════════════════════
-
+// ── BACKGROUND JOBS ──────────────────────────────────────────────
 let bgLock      = false;
 let lastProfile = 0;
 let lastCompress = 0;
 let lastProactive = 0;
 
 async function withBgBudget<T>(fn: () => Promise<T>): Promise<T | null> {
-  if (bgLock || !tpmAllow(EST_BG)) {
-    console.log(`[BG] skipped — bgLock=${bgLock} tpmLeft=${tpmLeft()}`);
+  if (bgLock || !budget.allow(FAST, EST_BG)) {
+    console.log(`[BG] skipped — bgLock=${bgLock} fast=${JSON.stringify(budget.left(FAST))}`);
     return null;
   }
   bgLock = true;
   try {
     return await fn();
   } finally {
-    // 30s cooldown between background jobs so they never stack up
     setTimeout(() => { bgLock = false; }, 30_000);
   }
 }
@@ -644,7 +591,7 @@ async function runProfiler(client: Client) {
   await withBgBudget(async () => {
     for (const guild of client.guilds.cache.values()) {
       for (const ch of guild.channels.cache.filter(c => c.isTextBased()).values()) {
-        if (!tpmAllow(EST_BG)) break;
+        if (!budget.allow(FAST, EST_BG)) break;
         try {
           const fetched = await (ch as any).messages.fetch({ limit: 15 });
           const msgs    = ([...fetched.values()] as Message[]).reverse();
@@ -663,7 +610,7 @@ async function runProfiler(client: Client) {
           }
 
           for (const [uid, lines] of byAuthor) {
-            if (!tpmAllow(EST_BG)) break;
+            if (!budget.allow(FAST, EST_BG)) break;
             const name = idCache.get(uid) || uid;
             try {
               const raw = await groq.call(FAST, [
@@ -677,7 +624,7 @@ async function runProfiler(client: Client) {
         } catch {}
       }
     }
-    console.log(`[Profiler] done | tpm left: ${tpmLeft()}`);
+    console.log(`[Profiler] done | fast=${JSON.stringify(budget.left(FAST))}`);
   });
 }
 
@@ -704,7 +651,7 @@ async function runCompress(guildId: string, channelId: string) {
 
 async function runProactive(client: Client) {
   if (Date.now() - lastProactive < PROACTIVE_INTERVAL) return;
-  if (!tpmAllow(EST_BG)) return;
+  if (!budget.allow(FAST, EST_BG)) return;
   lastProactive = Date.now();
 
   await withBgBudget(async () => {
@@ -714,7 +661,6 @@ async function runProactive(client: Client) {
     for (const [channelId, msgs] of stmStore.entries()) {
       if (!msgs.length) continue;
       const idle = now - msgs[msgs.length - 1].ts;
-      // Only consider channels idle 10m-2h
       if (idle < 10 * 60_000 || idle > 2 * 60 * 60_000) continue;
       candidates.push({
         id:   channelId,
@@ -724,7 +670,6 @@ async function runProactive(client: Client) {
 
     if (!candidates.length) return;
 
-    // Pick a random candidate from up to 5 options
     const pick = candidates[Math.floor(Math.random() * Math.min(candidates.length, 5))];
     const ch   = client.channels.cache.get(pick.id) as TextChannel | undefined;
     if (!ch?.isTextBased()) return;
@@ -747,21 +692,7 @@ async function runProactive(client: Client) {
   });
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// MAIN MESSAGE HANDLER
-//
-// Flow:
-// 1. Push to STM immediately (every message, before any gates)
-// 2. Mood gate (moodTick) — decides if this message should trigger brain
-// 3. Token budget gate — ensure we have headroom
-// 4. Debounce — wait for conversation lull (4s) before firing brain
-//    Burst of messages → STM fills → brain fires once on the last one
-//    Mention → fast lane (350ms debounce)
-// 5. Resolve reply chain → THREAD header
-// 6. Brain call → decision
-// 7. Act on decision + fire side-effects async
-// ═══════════════════════════════════════════════════════════════════
-
+// ── MAIN MESSAGE HANDLER ─────────────────────────────────────────
 const debounceTimers  = new Map<string, NodeJS.Timeout>();
 const pendingTriggers = new Map<string, {
   msg:       Message;
@@ -782,7 +713,6 @@ async function handleMessage(msg: Message) {
 
     cacheId(msg.author.id, sender);
 
-    // Async member sync — don't await, never block message flow
     if (!isDM) {
       upsertMember(guildId, msg.author.id, {
         displayName: sender,
@@ -790,9 +720,6 @@ async function handleMessage(msg: Message) {
       }).catch(() => {});
     }
 
-    // ── 1. Push to STM immediately ─────────────────────────────────
-    // Every message in the burst lands here before the brain fires,
-    // so the transcript is always complete when we finally read the room.
     stmPush(channelId, {
       ts:       msg.createdTimestamp,
       authorId: msg.author.id,
@@ -800,17 +727,20 @@ async function handleMessage(msg: Message) {
       content:  content.slice(0, 100),
     });
 
-    // ── 2. Mood gate ───────────────────────────────────────────────
     if (!moodTick(channelId, msg.author.id, mentioned, isDM)) return;
 
-    // ── 3. Token budget gate ───────────────────────────────────────
-    if (!tpmAllow(EST_BRAIN)) {
-      console.log(`[Budget] ${tpmLeft()} TPM left — skipping${mentioned ? ' (mention!)' : ''}`);
-      // For mentions, try anyway — they matter even if we're tight
+    // ── rate budget gate — real RPM/RPD/TPM/TPD on the brain model ──
+    if (!budget.allow(BRAIN, EST_BRAIN)) {
+      console.log(`[Budget] ${BRAIN} tight — ${JSON.stringify(budget.left(BRAIN))}${mentioned ? ' (mention!)' : ''}`);
       if (!mentioned) return;
     }
 
-    // ── 4. Debounce — collect the burst, fire on silence ──────────
+    // ── global pacing — keep brain calls under Groq's 30 RPM total ──
+    if (!mentioned && Date.now() - lastBrainCallAt < MIN_BRAIN_GAP_MS) {
+      console.log('[Pace] skip — too soon since last brain call');
+      return;
+    }
+
     pendingTriggers.set(channelId, { msg, mentioned, isDM, guildId });
     if (debounceTimers.has(channelId)) clearTimeout(debounceTimers.get(channelId)!);
 
@@ -829,7 +759,6 @@ async function handleMessage(msg: Message) {
       const tIsGuild = !tDM && !!tMsg.guildId;
 
       try {
-        // Speak state check
         const speakState = await getSpeakState(tChannel, tGuild);
         if (
           speakState.mode === 'paused' &&
@@ -841,15 +770,11 @@ async function handleMessage(msg: Message) {
           return;
         }
 
-        // Seed STM if not already seeded
         if (!stmStore.has(tChannel)) {
           const fetched = await tMsg.channel.messages.fetch({ limit: STM_MAX });
           seedSTM(tChannel, ([...fetched.values()] as Message[]).reverse());
         }
 
-        // ── 5. Resolve reply chain → THREAD block ─────────────────
-        // This is the room-reading fix: the model sees the full original
-        // message as its own block, not a truncated footnote.
         let threadCtx: string | undefined;
         if (tMsg.reference?.messageId) {
           try {
@@ -862,7 +787,6 @@ async function handleMessage(msg: Message) {
           } catch {}
         }
 
-        // Minimal memory context — 3 facts max to keep token count low
         const [memberData, memory] = await Promise.all([
           tIsGuild ? getMember(tGuild, tMsg.author.id) : Promise.resolve({} as MemberData),
           tIsGuild ? getMemory(tGuild)                 : Promise.resolve({ facts: [], jokes: [] } as ServerMemory),
@@ -877,7 +801,7 @@ async function handleMessage(msg: Message) {
 
         const mood = getMood(tChannel);
 
-        // ── 6. Brain call ──────────────────────────────────────────
+        lastBrainCallAt = Date.now();
         const decision = await brain({
           guildId:    tGuild,
           sender:     tSender,
@@ -894,18 +818,11 @@ async function handleMessage(msg: Message) {
 
         console.log(`[Brain] ${tSender}${tDM ? ' DM' : ''}: ${decision.action}${decision.reply ? ` — "${decision.reply.slice(0, 50)}"` : decision.reaction ? ` — ${decision.reaction}` : ''}`);
 
-        // ── 7. Act on decision ─────────────────────────────────────
-
-        // Reaction can accompany any action
         if (decision.reaction) {
           tMsg.react(decision.reaction).catch(() => {});
         }
 
-        if (decision.action === 'speak') {
-          if (!decision.reply?.trim()) {
-            console.log('[Brain] speak→empty reply, skipping');
-            return;
-          }
+        if (decision.action === 'speak' && decision.reply?.trim()) {
           const text     = decision.reply.trim().slice(0, 200);
           const typingMs = Math.min(300 + text.length * 20, 2800);
 
@@ -915,19 +832,18 @@ async function handleMessage(msg: Message) {
           await tMsg.reply({ content: text, allowedMentions: { repliedUser: false } });
           stmPush(tChannel, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
 
-          // Async side-effects — never await these
           fireSideEffects({ guildId: tGuild, userId: tMsg.author.id, action: 'speak' });
           if (speakState.mode !== 'active') {
             setSpeakState(tChannel, tGuild, { mode: 'active', reason: 'spoke' }).catch(() => {});
           }
 
+        } else if (decision.action === 'speak') {
+          console.log('[Brain] speak→empty reply, skipping');
+
         } else if (decision.action === 'react') {
-          // Reaction already fired above — log it
           console.log(`[React] ${decision.reaction || '(none)'}`);
         }
-        // 'ignore' → do nothing (reaction may have already fired)
 
-        // Trigger background jobs opportunistically (staggered, budgeted)
         if (tIsGuild) {
           runCompress(tGuild, tChannel).catch(() => {});
         }
@@ -938,10 +854,7 @@ async function handleMessage(msg: Message) {
   } catch (e) { console.error('[Handler outer]', e); }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// STARTUP
-// ═══════════════════════════════════════════════════════════════════
-
+// ── STARTUP ──────────────────────────────────────────────────────
 export async function startBot(token: string) {
   if (botClient) return;
 
@@ -963,10 +876,10 @@ export async function startBot(token: string) {
 
     console.log(`
 ╔═══════════════════════════════════════════════╗
-║  ✓ ${BOT_NAME} v13 — Clean Slate
-║  BRAIN : ${BRAIN}
-║  FAST  : ${FAST}
-║  TPM   : ${TPM_CAP} cap (~${Math.floor(TPM_CAP / EST_BRAIN)} brain calls/min)
+║  ✓ ${BOT_NAME} v13.1 — Real Limits
+║  BRAIN : ${BRAIN} (30 rpm / 1k rpd / 12k tpm / 100k tpd)
+║  FAST  : ${FAST} (30 rpm / 1k rpd / 15k tpm / 200k tpd)
+║  Pace  : min ${MIN_BRAIN_GAP_MS}ms between brain calls
 ║  STM   : ${STM_MAX} msgs | Debounce: ${DEBOUNCE_MS}ms
 ║  Passive: every ${PASSIVE_EVERY} msgs (${PASSIVE_EVERY_BUSY} when busy)
 ║  Active : ${ACTIVE_MINS}m default | Monopoly: ${MONOPOLY_N} msgs
@@ -974,7 +887,6 @@ export async function startBot(token: string) {
 
     botClient!.user!.setPresence({ status: 'online', activities: [{ name: 'the chat', type: 3 }] });
 
-    // Sync all guild members into cache + Firebase
     for (const g of botClient!.guilds.cache.values()) {
       const members = await g.members.fetch().catch(() => null);
       if (members) {
@@ -990,9 +902,6 @@ export async function startBot(token: string) {
       }
     }
 
-    // Staggered background loops
-    // Profiler runs every 20m, proactive every 35m with jitter
-    // They share bgLock so they never compete with each other or the brain
     setInterval(async () => {
       if (!botClient) return;
       runProfiler(botClient).catch(() => {});
@@ -1026,7 +935,6 @@ export async function startBot(token: string) {
     await upsertMember(m.guild.id, m.id, { displayName: m.displayName });
   });
 
-  // ── Admin commands ─────────────────────────────────────────────
   botClient.on(Events.MessageCreate, async (msg) => {
     if (
       !msg.member?.permissions.has('Administrator') &&
@@ -1037,7 +945,6 @@ export async function startBot(token: string) {
     const guildId = msg.guildId!;
     const chId    = msg.channelId;
 
-    // Speak state
     if (c === '!wake') {
       await setSpeakState(chId, guildId, { mode: 'active', reason: 'admin' });
       msg.reply('im up');
@@ -1054,7 +961,6 @@ export async function startBot(token: string) {
       msg.reply(`paused ${mins}m`);
     }
 
-    // Mood
     if (c.startsWith('!active')) {
       const mins = parseInt(c.split(' ')[1] || '') || ACTIVE_MINS;
       goActive(chId, mins, 'admin');
@@ -1065,7 +971,6 @@ export async function startBot(token: string) {
       msg.reply('passive mode');
     }
 
-    // Status
     if (c === '!status') {
       const mood    = getMood(chId);
       const speak   = await getSpeakState(chId, guildId);
@@ -1075,13 +980,13 @@ export async function startBot(token: string) {
       await msg.reply([
         `mood: ${moodStr}`,
         `speak: ${speak.mode}${speak.resumeAt ? ` until ${new Date(speak.resumeAt).toLocaleTimeString()}` : ''}`,
-        `tpm: ${tpmLeft()}/${TPM_CAP} left this minute`,
+        `brain (${BRAIN}): ${JSON.stringify(budget.left(BRAIN))}`,
+        `fast  (${FAST}): ${JSON.stringify(budget.left(FAST))}`,
         `groq: ${groq.status()}`,
         `bgLock: ${bgLock}`,
       ].join('\n'));
     }
 
-    // Memory
     if (c === '!memory') {
       const m = await getMemory(guildId);
       await msg.reply(
@@ -1094,20 +999,17 @@ export async function startBot(token: string) {
       msg.reply('noted');
     }
 
-    // STM debug
     if (c === '!stm') {
       const out = stmFormat(stmGet(chId));
       await msg.reply(`\`\`\`\n${out.slice(0, 1900)}\n\`\`\``);
     }
 
-    // Force proactive cycle
     if (c === '!proactive') {
       await msg.reply('running...');
       await runProactive(botClient!).catch(() => {});
       await msg.reply('done');
     }
 
-    // Member personality
     if (c.startsWith('!who ')) {
       const uid = msg.mentions.users.first()?.id || c.split(' ')[1]?.trim();
       if (!uid) { msg.reply('usage: !who @user'); return; }
