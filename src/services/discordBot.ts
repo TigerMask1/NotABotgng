@@ -12,7 +12,8 @@ const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 // Strategy: keep system prompt SHORT and STATIC → gets cached → near-free
 //           only pay tokens for the dynamic tail (transcript + trigger)
 
-const MODEL = 'gpt-oss-120b';   // Cerebras flagship
+const BRAIN_MODEL = 'llama-3.3-70b';  // main responses
+const FAST_MODEL  = 'llama3.1-8b';    // background jobs (profiler, compress, proactive)
 const DAILY_TOKEN_BUDGET = 1_000_000;
 const SOFT = 0.85;
 
@@ -22,7 +23,7 @@ const SOFT = 0.85;
 // Response      ≈ 60–120 tokens
 // Effective cost per call (after caching) ≈ 350–500 tokens
 const EST_TOKENS_PER_CALL = 450;
-const EST_BG_TOKENS = 200;
+const EST_BG_TOKENS = 150; // 8b is cheaper
 
 // ── CEREBRAS MANAGER ─────────────────────────────────────────────
 // Multi-key rotation: round-robin, with 429 cooldown per key
@@ -92,6 +93,7 @@ class CerebrasManager {
     messages: { role: string; content: string }[],
     temp     = 0.85,
     maxTok   = 150,
+    model    = BRAIN_MODEL,
   ): Promise<string> {
     this.resetIfNewDay();
 
@@ -107,7 +109,7 @@ class CerebrasManager {
             'Authorization': `Bearer ${key}`,
           },
           body: JSON.stringify({
-            model:       MODEL,
+            model,
             messages,
             temperature: temp,
             max_tokens:  maxTok,
@@ -514,7 +516,9 @@ async function brain(opts: {
       150,
     );
 
-    const parsed   = JSON.parse(raw.replace(/```json|```/g, '').trim());
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('no JSON found in response');
+    const parsed   = JSON.parse(jsonMatch[0]);
     const action   = (['speak', 'react', 'ignore'] as const).includes(parsed.action)
       ? parsed.action as BrainDecision['action']
       : 'ignore';
@@ -605,13 +609,17 @@ async function runProfiler(client: Client) {
 
           for (const [uid, lines] of byAuthor) {
             if (!cerebras.canCall(EST_BG_TOKENS)) break;
+            const existing = await getMember(guild.id, uid);
+            if (existing.personality) continue; // already profiled — skip, free
             const name = idCache.get(uid) || uid;
             try {
               const raw = await cerebras.call([
                 { role: 'system', content: 'one-line personality read from discord messages. output ONLY: {"p":"..."}' },
                 { role: 'user',   content: `${name}: ${lines.slice(0, 8).join(' | ')}` },
-              ], 0.4, 50);
-              const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
+              ], 0.4, 50, FAST_MODEL);
+              const jsonMatch = raw.match(/\{[\s\S]*\}/);
+              if (!jsonMatch) continue;
+              const parsed = JSON.parse(jsonMatch[0]);
               if (parsed.p) await upsertMember(guild.id, uid, { personality: parsed.p });
             } catch {}
           }
@@ -635,8 +643,10 @@ async function runCompress(guildId: string, channelId: string) {
       const raw = await cerebras.call([
         { role: 'system', content: 'extract memorable facts and inside jokes. ONLY valid JSON: {"facts":["x"],"jokes":["x"]}' },
         { role: 'user',   content: text },
-      ], 0.4, 120);
-      const p = JSON.parse(raw.replace(/```json|```/g, '').trim());
+      ], 0.4, 120, FAST_MODEL);
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) return;
+      const p = JSON.parse(jsonMatch[0]);
       for (const f of (p.facts || []).slice(0, 4)) await addFact(guildId, f, 'facts');
       for (const j of (p.jokes || []).slice(0, 2)) await addFact(guildId, j, 'jokes');
       console.log(`[Compress] +${p.facts?.length || 0} facts +${p.jokes?.length || 0} jokes`);
@@ -673,8 +683,10 @@ async function runProactive(client: Client) {
       const raw = await cerebras.call([
         { role: 'system', content: `you are ${BOT_NAME}, gen z discord person. send ONE short casual message to break silence, or skip. lowercase. ONLY valid JSON.` },
         { role: 'user',   content: `channel: ${pick.hint}\nJSON: {"skip":false,"msg":"..."}` },
-      ], 0.9, 80);
-      const p = JSON.parse(raw.replace(/```json|```/g, '').trim());
+      ], 0.9, 80, FAST_MODEL);
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) return;
+      const p = JSON.parse(jsonMatch[0]);
       if (p.skip || !p.msg?.trim()) return;
 
       const text = p.msg.trim().slice(0, 150);
@@ -885,12 +897,14 @@ export async function startBot(token: string) {
     console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ║  ✓ ${BOT_NAME} — Cerebras Edition
-║  MODEL  : ${MODEL}
+║  BRAIN  : ${BRAIN_MODEL}
+║  FAST   : ${FAST_MODEL} (bg jobs only)
 ║  LIMITS : 30 RPM | 14,400 RPD | 1M tokens/day | 8192 ctx
 ║  CACHE  : system prompt cached after 1st call (≈350 tok)
 ║  KEYS   : ${cerebras.status().split('|')[0].trim()}
 ║  STM    : ${STM_MAX} msgs | Debounce: ${DEBOUNCE_MS}ms
 ║  Passive: every ${PASSIVE_EVERY}/${PASSIVE_EVERY_BUSY} msgs | Active: ${ACTIVE_MINS}m
+║  Profiler: first run in 1hr, skips existing profiles
 ╚═══════════════════════════════════════════════════════════╝\n`);
 
     botClient!.user!.setPresence({ status: 'online', activities: [{ name: 'the chat', type: 3 }] });
@@ -910,10 +924,15 @@ export async function startBot(token: string) {
       }
     }
 
-    setInterval(() => {
-      if (!botClient) return;
-      runProfiler(botClient).catch(() => {});
-    }, PROFILER_INTERVAL);
+    // Delay first profiler run — avoids burning tokens immediately on boot.
+    // After 1hr, runs every PROFILER_INTERVAL. Skips members with existing profiles.
+    setTimeout(() => {
+      if (botClient) runProfiler(botClient).catch(() => {});
+      setInterval(() => {
+        if (!botClient) return;
+        runProfiler(botClient).catch(() => {});
+      }, PROFILER_INTERVAL);
+    }, 60 * 60_000);
 
     const scheduleProactive = () => {
       setTimeout(async () => {
