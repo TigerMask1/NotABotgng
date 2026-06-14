@@ -503,6 +503,7 @@ async function brain(opts: {
   parts.push(
     `\nTRIGGER — ${opts.sender} (${bondLabel}, bond ${opts.bond}/100):\n"${opts.message}"`,
     `at you: ${opts.mentioned ? 'YES' : 'NO'}`,
+    `\n(IMPORTANT: Reply ONLY with the raw JSON object. No markdown, no pre-text.)`
   );
   if (opts.isDM) parts.push('(DM — just you two)');
 
