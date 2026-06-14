@@ -113,7 +113,6 @@ class CerebrasManager {
             messages,
             temperature: temp,
             max_tokens:  maxTok,
-            response_format: { type: "json_object" }
           }),
         });
 
@@ -518,6 +517,7 @@ async function brain(opts: {
       150,
     );
 
+    console.log(`[Brain] raw response: ${raw.slice(0, 200)}`);
     const jsonMatch = raw.match(/\{[\s\S]*\}/);
     if (!jsonMatch) throw new Error('no JSON found in response');
     const parsed   = JSON.parse(jsonMatch[0]);
