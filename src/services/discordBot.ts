@@ -113,6 +113,7 @@ class CerebrasManager {
             messages,
             temperature: temp,
             max_tokens:  maxTok,
+            response_format: { type: "json_object" }
           }),
         });
 
