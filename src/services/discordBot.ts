@@ -12,7 +12,7 @@ const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 // Strategy: keep system prompt SHORT and STATIC → gets cached → near-free
 //           only pay tokens for the dynamic tail (transcript + trigger)
 
-const BRAIN_MODEL = 'llama-3.3-70b';  // main responses
+const BRAIN_MODEL = 'gpt-oss-120b';  // main responses
 const FAST_MODEL  = 'llama3.1-8b';    // background jobs (profiler, compress, proactive)
 const DAILY_TOKEN_BUDGET = 1_000_000;
 const SOFT = 0.85;
