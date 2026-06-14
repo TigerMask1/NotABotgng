@@ -22,7 +22,7 @@ const SOFT = 0.85;
 // Dynamic tail  ≈ 250–400 tokens (transcript + trigger)
 // Response      ≈ 60–120 tokens
 // Effective cost per call (after caching) ≈ 350–500 tokens
-const EST_TOKENS_PER_CALL = 450;
+const EST_TOKENS_PER_CALL = 800;  // gpt-oss-120b reasoning model uses ~600-800 tok/call in practice
 const EST_BG_TOKENS = 150; // 8b is cheaper
 
 // ── CEREBRAS MANAGER ─────────────────────────────────────────────
@@ -129,15 +129,21 @@ class CerebrasManager {
           throw new Error(`Cerebras ${res.status}: ${err.slice(0, 100)}`);
         }
 
-        const data     = await res.json() as any;
-        const text     = data.choices?.[0]?.message?.content ?? '';
-        const tokUsed  = data.usage?.total_tokens ?? maxTok;
+        const data        = await res.json() as any;
+        const choice      = data.choices?.[0];
+        const text        = choice?.message?.content ?? '';
+        const finishReason = choice?.finish_reason ?? 'unknown';
+        const tokUsed     = data.usage?.total_tokens ?? maxTok;
 
         this.dailyUsed += tokUsed;
         this.minuteCalls.push(Date.now());
 
         const left = Math.round((DAILY_TOKEN_BUDGET * SOFT - this.dailyUsed) / 1000);
-        console.log(`[Cerebras] ${tokUsed}tok | daily budget left ≈${left}k | rpm ${this.minuteCalls.length}/25`);
+        console.log(`[Cerebras] ${tokUsed}tok | finish:${finishReason} | daily left ≈${left}k | rpm ${this.minuteCalls.length}/25`);
+
+        if (!text && finishReason === 'length') {
+          console.warn(`[Cerebras] empty content + finish:length — gpt-oss-120b used all tokens on reasoning. increase max_tokens.`);
+        }
 
         return text;
 
@@ -514,7 +520,7 @@ async function brain(opts: {
         { role: 'user',   content: parts.join('\n') },
       ],
       0.88,
-      150,
+      1024,  // gpt-oss-120b is a reasoning model — burns tokens internally before output; 150 was too low
     );
 
     console.log(`[Brain] raw response: ${raw.slice(0, 200)}`);
