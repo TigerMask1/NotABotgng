@@ -29,7 +29,9 @@ const EST_BG_TOKENS = 150; // 8b is cheaper
 // Multi-key rotation: round-robin, with 429 cooldown per key
 // Daily budget tracked globally (all keys share 1M limit IF same account)
 // If keys are different accounts → each has its own 1M, we just round-robin
-
+botClient.on('messageCreate', (msg) => {
+  console.log(`[GATEWAY DEBUG] Event fired! DM: ${msg.channel.isDMBased()}, Content: "${msg.content}"`);
+});
 class CerebrasManager {
   private keys:      string[];
   private cooldowns: Map<string, number> = new Map();
