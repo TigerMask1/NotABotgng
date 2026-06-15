@@ -190,7 +190,7 @@ const PASSIVE_EVERY_BUSY = 8;
 const ACTIVE_MINS        = 8;
 const VELOCITY_WINDOW_MS = 10_000;
 const VELOCITY_THRESH    = 5;
-const MONOPOLY_N         = 4;
+const MONOPOLY_N         = 6;
 const PROFILER_INTERVAL  = 20 * 60_000;
 const COMPRESS_INTERVAL  = 90 * 60_000;
 const PROACTIVE_INTERVAL = 35 * 60_000;
@@ -200,6 +200,73 @@ let lastBrainCallAt = 0;
 let BOT_NAME  = 'ChaosBot';
 let BOT_ID    = '';
 let botClient: Client | null = null;
+
+// ── FOCUS STATE ──────────────────────────────────────────────────
+// Bot is "in" one channel at a time like a real person.
+// It can drift to another channel but does so lazily.
+interface FocusState {
+  channelId: string;
+  since:     number;
+}
+let focus: FocusState | null = null;
+const FOCUS_DRIFT_MS    = 12 * 60_000;  // naturally drifts after 12m of nothing in focus channel
+const FOCUS_SHIFT_COST  = 45_000;       // won't context-switch more than once per 45s
+
+let lastFocusShift = 0;
+
+// unread counts per channel — bot notices these but may not act on them
+const unreadCounts = new Map<string, number>();
+
+function tickUnread(channelId: string) {
+  unreadCounts.set(channelId, (unreadCounts.get(channelId) ?? 0) + 1);
+}
+
+// Returns whether the bot is currently "reading" this channel.
+// If not focused here, it may shift — or not.
+function checkFocus(channelId: string, mentioned: boolean): boolean {
+  const now = Date.now();
+
+  // Already focused here
+  if (focus?.channelId === channelId) {
+    focus.since = now; // keep alive
+    return true;
+  }
+
+  // No focus yet — go here
+  if (!focus) {
+    focus = { channelId, since: now };
+    unreadCounts.delete(channelId);
+    return true;
+  }
+
+  // Focus is elsewhere — check if it has naturally expired
+  const focusExpired = now - focus.since > FOCUS_DRIFT_MS;
+
+  if (focusExpired) {
+    // Focus drifted, free to shift
+    const unread = unreadCounts.get(channelId) ?? 0;
+    console.log(`[Focus] drift from #${focus.channelId.slice(-5)} → #${channelId.slice(-5)} (${unread} unread)`);
+    focus = { channelId, since: now };
+    unreadCounts.delete(channelId);
+    lastFocusShift = now;
+    return true;
+  }
+
+  // Focus is alive elsewhere — only shift if mentioned AND cooldown passed
+  if (mentioned && now - lastFocusShift > FOCUS_SHIFT_COST) {
+    const unread = unreadCounts.get(channelId) ?? 0;
+    console.log(`[Focus] ping pulled from #${focus.channelId.slice(-5)} → #${channelId.slice(-5)} (${unread} unread)`);
+    focus = { channelId, since: now };
+    unreadCounts.delete(channelId);
+    lastFocusShift = now;
+    return true;
+  }
+
+  // Bot is busy elsewhere — log unread and stay
+  tickUnread(channelId);
+  console.log(`[Focus] #${channelId.slice(-5)} — bot in #${focus.channelId.slice(-5)}, unread now ${unreadCounts.get(channelId)}`);
+  return false;
+}
 
 // ── ID resolution ─────────────────────────────────────────────────
 const idCache = new Map<string, string>();
@@ -493,6 +560,7 @@ async function brain(opts: {
   isDM:       boolean;
   mood:       Mood;
   speakState: SpeakState;
+  inExchange: boolean;
 }): Promise<BrainDecision> {
 
   const bondLabel = opts.bond > 70 ? 'close' : opts.bond > 40 ? 'neutral' : 'distant';
@@ -506,12 +574,17 @@ async function brain(opts: {
   if (opts.memCtx) parts.push(`\nCONTEXT:\n${opts.memCtx.slice(0, MAX_MEM_CHARS)}`);
   if (opts.thread) parts.push(`\nREPLY TO:\n${opts.thread}`);
   parts.push(`\nCHAT:\n${opts.transcript}`);
+
+  const flags: string[] = [];
+  if (opts.mentioned)  flags.push('pinged you directly');
+  if (opts.inExchange) flags.push('mid back-and-forth with this person');
+  if (opts.isDM)       flags.push('DM — just you two');
+
   parts.push(
     `\nTRIGGER — ${opts.sender} (${bondLabel}, bond ${opts.bond}/100):\n"${opts.message}"`,
-    `at you: ${opts.mentioned ? 'YES' : 'NO'}`,
+    flags.length ? `context: ${flags.join(', ')}` : 'context: no direct ping',
     `\n(IMPORTANT: Reply ONLY with the raw JSON object. No markdown, no pre-text.)`
   );
-  if (opts.isDM) parts.push('(DM — just you two)');
 
   try {
     const raw = await cerebras.call(
@@ -534,11 +607,6 @@ async function brain(opts: {
       ? parsed.reply.trim().replace(/^["']|["']$/g, '')
       : '';
     const reaction = sanitizeEmoji(parsed.reaction);
-
-    // DM fallback — always respond if mentioned or DM
-    if ((opts.mentioned || opts.isDM) && action === 'ignore') {
-      return { action: 'speak', reply: 'hm?', reaction: '' };
-    }
 
     return { action, reply, reaction };
 
@@ -745,6 +813,12 @@ async function handleMessage(msg: Message) {
       content:  content.slice(0, 100),
     });
 
+    // DMs bypass focus — always in your DMs
+    if (!isDM) {
+      tickUnread(channelId);
+      if (!checkFocus(channelId, mentioned)) return;
+    }
+
     // DMs bypass mood tick entirely — always process
     if (!isDM && !moodTick(channelId, msg.author.id, mentioned, isDM)) return;
 
@@ -831,6 +905,12 @@ async function handleMessage(msg: Message) {
           ? { mode: 'active' as const, reason: 'dm' }
           : await getSpeakState(tChannel, tGuild);
 
+        // Detect if we're mid back-and-forth with this person
+        const recentMsgs    = stmGet(tChannel).slice(-6);
+        const botReplied    = recentMsgs.some(m => m.authorId === BOT_ID);
+        const senderRecent  = recentMsgs.filter(m => m.authorId === tMsg.author.id).length;
+        const inExchange    = botReplied && senderRecent >= 2;
+
         lastBrainCallAt = Date.now();
         const decision  = await brain({
           sender:     tSender,
@@ -843,6 +923,7 @@ async function handleMessage(msg: Message) {
           isDM:       tDM,
           mood,
           speakState,
+          inExchange,
         });
 
         console.log(`[Brain] ${tSender}${tDM ? ' DM' : ''}: ${decision.action}${decision.reply ? ` — "${decision.reply.slice(0, 50)}"` : decision.reaction ? ` — ${decision.reaction}` : ''}`);
