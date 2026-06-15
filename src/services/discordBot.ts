@@ -197,6 +197,7 @@ function sessionBufferPush(channelId: string, line: string) {
 
 // ── CONSTANTS ────────────────────────────────────────────────────
 const DEBOUNCE_MS        = 4000;
+const DM_DEBOUNCE_MS     = 1200;
 const STM_MAX            = 12;
 const GAP_MAJOR_MS       = 25 * 60_000;
 const GAP_MINOR_MS       =  5 * 60_000;
@@ -210,6 +211,7 @@ const PROFILER_INTERVAL  = 20 * 60_000;
 const COMPRESS_INTERVAL  = 90 * 60_000;
 const PROACTIVE_INTERVAL = 35 * 60_000;
 const MIN_BRAIN_GAP_MS   = 2200;
+const PAUSE_MAX_MINS     = 30;
 
 let lastBrainCallAt = 0;
 let BOT_NAME  = 'NotABot';
@@ -357,6 +359,22 @@ interface Mood { mode: 'active' | 'passive'; until?: number; count: number; }
 
 const moods = new Map<string, Mood>();
 
+// ── ACTIVITY CLOCK (self-pacing) ──────────────────────────────────
+// Tracks how long the bot has been "active" in a channel and how many
+// times it has replied during that stretch. This is fed to the model
+// as a plain-text "clock" so it has a sense of elapsed time and can
+// judge for itself when it's been talking too much.
+interface ActivityClock { activeSince: number; replies: number; }
+const activityClocks = new Map<string, ActivityClock>();
+
+function clockLine(channelId: string, mood: Mood): string {
+  if (mood.mode !== 'active') return '';
+  const c = activityClocks.get(channelId);
+  if (!c) return '';
+  const mins = Math.max(0, Math.round((Date.now() - c.activeSince) / 60_000));
+  return `active ${mins}m, ${c.replies} repl${c.replies === 1 ? 'y' : 'ies'} this stretch`;
+}
+
 function getMood(channelId: string): Mood {
   let m = moods.get(channelId) ?? { mode: 'passive', count: 0 };
   if (m.mode === 'active' && m.until && Date.now() >= m.until) {
@@ -368,6 +386,11 @@ function getMood(channelId: string): Mood {
 }
 
 function goActive(channelId: string, mins = ACTIVE_MINS, reason = '') {
+  const prev = moods.get(channelId);
+  if (!prev || prev.mode !== 'active') {
+    // fresh active streak — reset the clock
+    activityClocks.set(channelId, { activeSince: Date.now(), replies: 0 });
+  }
   moods.set(channelId, { mode: 'active', until: Date.now() + mins * 60_000, count: 0 });
   console.log(`[Mood] #${channelId.slice(-5)} active ${mins}m${reason ? ` — ${reason}` : ''}`);
 }
@@ -546,6 +569,8 @@ in transcripts, [me] = you (your own past messages).
 if the message is directed at you, it may have pronouns: "ur", "you", "your" directed at you = about you. "my", "I", "me" from sender = about them.
 conversation ending: if context says ending_convo, reply once casually or ignore — never keep pulling them back.
 
+self-pacing: CLOCK (if present) shows how long you've been active and how many times you've replied this stretch. if you've already replied a couple times, the other person's last reply was short/closing ("thanks", "lol", "ok", "yea", "same"), or the exchange just feels done — set "pause" to how many minutes to go quiet (1-30). while paused only a direct ping wakes you up. don't pause after a single reply just because — only when it's actually winding down. 0 = no pause.
+
 texting rules (break these = instant bot detection):
 - always lowercase. caps only for ACTUAL emphasis.
 - most replies ≤ 12 words. "lol", "fr", "nah", one emoji — all valid full answers.
@@ -562,12 +587,13 @@ when to ignore:
 - high-velocity back and forth you're not part of → ignore
 
 output ONLY valid JSON, nothing else:
-{"action":"speak|react|ignore","reply":"your message or empty","reaction":"single emoji or empty"}`;
+{"action":"speak|react|ignore","reply":"your message or empty","reaction":"single emoji or empty","pause":0}`;
 
 interface BrainDecision {
   action:   'speak' | 'react' | 'ignore';
   reply:    string;
   reaction: string;
+  pause:    number; // minutes to go quiet after this turn; 0 = none
 }
 
 async function brain(opts: {
@@ -578,6 +604,7 @@ async function brain(opts: {
   thread?:         string;
   memCtx:          string;
   sessionSummary?: string;
+  clock?:          string;
   mentioned:       boolean;
   isDM:            boolean;
   mood:            Mood;
@@ -603,6 +630,7 @@ async function brain(opts: {
 
   if (opts.memCtx)          parts.push(`\nCONTEXT:\n${opts.memCtx.slice(0, MAX_MEM_CHARS)}`);
   if (opts.sessionSummary)  parts.push(`\nSESSION (earlier today):\n${opts.sessionSummary.slice(0, MAX_SUMMARY_CHARS)}`);
+  if (opts.clock)           parts.push(`\nCLOCK: ${opts.clock}`);
   if (opts.thread)          parts.push(`\nREPLY TO:\n${opts.thread}`);
   parts.push(`\nCHAT:\n${opts.transcript}`);
 
@@ -640,14 +668,17 @@ async function brain(opts: {
       ? parsed.reply.trim().replace(/^["']|["']$/g, '')
       : '';
     const reaction = sanitizeEmoji(parsed.reaction);
+    const pause    = typeof parsed.pause === 'number' && parsed.pause > 0
+      ? Math.min(Math.round(parsed.pause), PAUSE_MAX_MINS)
+      : 0;
 
-    return { action, reply, reaction };
+    return { action, reply, reaction, pause };
 
   } catch (e: any) {
     console.warn('[Brain] parse error:', e.message?.slice(0, 80));
     return (opts.mentioned || opts.isDM)
-      ? { action: 'speak', reply: 'brain blipped', reaction: '' }
-      : { action: 'ignore', reply: '', reaction: '' };
+      ? { action: 'speak', reply: 'brain blipped', reaction: '', pause: 0 }
+      : { action: 'ignore', reply: '', reaction: '', pause: 0 };
   }
 }
 
@@ -835,41 +866,142 @@ async function runProactive(client: Client) {
   });
 }
 
-// ── MAIN MESSAGE HANDLER ─────────────────────────────────────────
+// ── DIRECT MESSAGES (isolated pipeline) ───────────────────────────
+// DMs are handled completely separately from guild channels — no
+// focus, no mood/monopoly logic, no speak-state, no session
+// compression. Every DM is "active" by definition. Messages are
+// debounced per-channel so a quick burst of DMs lands as one trigger.
+const dmDebounce = new Map<string, NodeJS.Timeout>();
+const dmPending  = new Map<string, Message>();
+
+async function handleDirectMessage(msg: Message) {
+  const channelId = msg.channelId;
+  const sender    = msg.author.username;
+  const content   = cleanContent(msg.content);
+
+  cacheId(msg.author.id, sender);
+  console.log(`[DM] in #${channelId.slice(-5)} ${sender}: "${content.slice(0, 80)}"`);
+
+  // Seed history on the very first message we see in this DM channel,
+  // BEFORE pushing the current message (so seedSTM's "empty store" check
+  // actually has something to seed).
+  if (!stmStore.has(channelId)) {
+    try {
+      const fetched = await msg.channel.messages.fetch({ limit: STM_MAX });
+      seedSTM(channelId, ([...fetched.values()] as Message[]).reverse());
+    } catch (e) { console.warn('[DM] history fetch failed:', (e as Error).message); }
+  }
+
+  stmPush(channelId, {
+    ts:       msg.createdTimestamp,
+    authorId: msg.author.id,
+    author:   sender,
+    content:  content.length > 100 ? content.slice(0, 97) + '…' : content,
+  });
+
+  dmPending.set(channelId, msg);
+  if (dmDebounce.has(channelId)) clearTimeout(dmDebounce.get(channelId)!);
+
+  dmDebounce.set(channelId, setTimeout(() => {
+    dmDebounce.delete(channelId);
+    const trigger = dmPending.get(channelId);
+    dmPending.delete(channelId);
+    if (trigger) respondToDM(trigger).catch(e => console.error('[DM] respond error:', e));
+  }, DM_DEBOUNCE_MS));
+}
+
+async function respondToDM(msg: Message) {
+  const channelId = msg.channelId;
+  const sender     = msg.author.username;
+  const content    = cleanContent(msg.content);
+
+  let threadCtx: string | undefined;
+  if (msg.reference?.messageId) {
+    try {
+      const ref       = await msg.channel.messages.fetch(msg.reference.messageId);
+      const refAuthor = ref.author.id === BOT_ID ? BOT_NAME : ref.author.username;
+      threadCtx = `${refAuthor}: "${cleanContent(ref.content).slice(0, 150)}"`;
+    } catch {}
+  }
+
+  const recentMsgs   = stmGet(channelId).slice(-8);
+  const botReplied   = recentMsgs.some(m => m.authorId === BOT_ID);
+  const senderRecent = recentMsgs.filter(m => m.authorId === msg.author.id).length;
+  const inExchange   = botReplied && senderRecent >= 2;
+
+  const END_PHRASES = /\b(bye|cya|gotta go|gtg|see ya|later|peace|good night|gn|logging off|ttyl|im out|i\s*m\s*out)\b/i;
+  const endingConvo = END_PHRASES.test(content);
+
+  lastBrainCallAt = Date.now();
+  const decision = await brain({
+    sender,
+    bond:         50,
+    message:      content,
+    transcript:   stmFormat(stmGet(channelId)),
+    thread:       threadCtx,
+    memCtx:       '',
+    mentioned:    true,
+    isDM:         true,
+    mood:         { mode: 'active', count: 0 },
+    speakState:   { mode: 'active', reason: 'dm' },
+    inExchange,
+    channelName:  'DM',
+    everyonePing: false,
+    endingConvo,
+  });
+
+  console.log(`[DM] ${sender} → ${decision.action}${decision.reply ? ` — "${decision.reply.slice(0, 50)}"` : decision.reaction ? ` — ${decision.reaction}` : ''}`);
+
+  if (decision.reaction) msg.react(decision.reaction).catch(() => {});
+
+  if (decision.action === 'speak' && decision.reply?.trim()) {
+    const text     = decision.reply.trim().slice(0, 200);
+    const typingMs = Math.min(300 + text.length * 20, 2800);
+
+    try { await msg.channel.sendTyping(); } catch {}
+    await sleep(typingMs);
+
+    await msg.reply({ content: text, allowedMentions: { repliedUser: false } });
+    stmPush(channelId, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
+  }
+  // note: DMs ignore decision.pause entirely — every DM is a direct line,
+  // there's no "monopoly" or ambient-chatter problem to self-pace away from.
+}
+
+// ── MAIN MESSAGE HANDLER (guild channels) ─────────────────────────
 const debounceTimers  = new Map<string, NodeJS.Timeout>();
 const pendingTriggers = new Map<string, {
   msg:          Message;
   mentioned:    boolean;
-  isDM:         boolean;
   guildId:      string;
   everyonePing: boolean;
 }>();
 
 async function handleMessage(msg: Message) {
-  // DMs arrive as partials — content is empty until fetched. This is why DMs silently fail.
+  // Partials — content is empty until fetched.
   if (msg.partial) {
     try { msg = await msg.fetch(); } catch { return; }
   }
   if (msg.author.bot || !msg.content?.trim()) return;
 
-  try {
-    const isDM      = msg.channel.isDMBased();
-    const guildId   = isDM ? 'dm' : msg.guildId!;
-    const channelId = msg.channelId;
+  // DMs get their own fully isolated pipeline.
+  if (msg.channel.isDMBased()) {
+    return handleDirectMessage(msg);
+  }
 
-    // FIX: DMs — BOT_ID may be empty at startup; treat DM as always-mentioned
-    const mentioned = isDM ? true : (BOT_ID ? msg.mentions.has(BOT_ID) : false);
+  try {
+    const guildId   = msg.guildId!;
+    const channelId = msg.channelId;
+    const mentioned = BOT_ID ? msg.mentions.has(BOT_ID) : false;
     const sender    = msg.member?.displayName || msg.author.username;
     const content   = cleanContent(msg.content);
 
     cacheId(msg.author.id, sender);
 
-    if (!isDM) {
-      upsertMember(guildId, msg.author.id, {
-        displayName: sender,
-        username:    msg.author.username,
-      }).catch(() => {});
-    }
+    upsertMember(guildId, msg.author.id, {
+      displayName: sender,
+      username:    msg.author.username,
+    }).catch(() => {});
 
     stmPush(channelId, {
       ts:       msg.createdTimestamp,
@@ -878,41 +1010,40 @@ async function handleMessage(msg: Message) {
       content:  content.length > 100 ? content.slice(0, 97) + '…' : content,
     });
 
-    // DMs bypass focus — always in your DMs
-    if (!isDM) {
-      tickUnread(channelId);
-      if (!checkFocus(channelId, mentioned)) return;
-    }
+    tickUnread(channelId);
+    if (!checkFocus(channelId, mentioned)) return;
 
-    // DMs bypass mood tick entirely — always process
-    if (!isDM && !moodTick(channelId, msg.author.id, mentioned, isDM)) return;
+    if (!moodTick(channelId, msg.author.id, mentioned, false)) return;
 
     // Rate budget gate
     if (!cerebras.canCall(EST_TOKENS_PER_CALL)) {
       console.log(`[Budget] Cerebras tight${mentioned ? ' (mention!)' : ''}`);
-      if (!mentioned && !isDM) return;
-      // For mentions/DMs: still attempt — the call itself will queue/retry
+      if (!mentioned) return;
+      // For mentions: still attempt — the call itself will queue/retry
     }
 
     // Global pacing
-    if (!mentioned && !isDM && Date.now() - lastBrainCallAt < MIN_BRAIN_GAP_MS) {
+    if (!mentioned && Date.now() - lastBrainCallAt < MIN_BRAIN_GAP_MS) {
       console.log('[Pace] skip — too soon since last brain call');
       return;
     }
 
     // Accumulate mention across burst — if msg 1 pinged us and msg 2 didn't,
     // we still know we were originally pinged.
-    const prevTrigger = pendingTriggers.get(channelId);
+    const prevTrigger        = pendingTriggers.get(channelId);
     const effectiveMentioned = mentioned || (prevTrigger?.mentioned ?? false);
 
     // @everyone/@here: flag it for context, not a full mention
-    const everyonePing = !isDM && (msg.mentions.everyone ?? false);
+    const everyonePing = msg.mentions.everyone ?? false;
 
-    pendingTriggers.set(channelId, { msg, mentioned: effectiveMentioned, isDM, guildId, everyonePing: everyonePing || (prevTrigger?.everyonePing ?? false) });
+    pendingTriggers.set(channelId, {
+      msg, mentioned: effectiveMentioned, guildId,
+      everyonePing: everyonePing || (prevTrigger?.everyonePing ?? false),
+    });
     if (debounceTimers.has(channelId)) clearTimeout(debounceTimers.get(channelId)!);
 
-    // Mentions/DMs get a snappy response; passive triggers wait for burst to settle
-    const debounceMs = (mentioned || isDM) ? 350 : DEBOUNCE_MS;
+    // Mentions get a snappy response; passive triggers wait for burst to settle
+    const debounceMs = mentioned ? 350 : DEBOUNCE_MS;
 
     debounceTimers.set(channelId, setTimeout(async () => {
       debounceTimers.delete(channelId);
@@ -920,26 +1051,23 @@ async function handleMessage(msg: Message) {
       pendingTriggers.delete(channelId);
       if (!trigger) return;
 
-      const { msg: tMsg, mentioned: tMentioned, isDM: tDM, guildId: tGuild, everyonePing: tEveryonePing } = trigger;
+      const { msg: tMsg, mentioned: tMentioned, guildId: tGuild, everyonePing: tEveryonePing } = trigger;
       const tChannel     = tMsg.channelId;
       const tSender      = tMsg.member?.displayName || tMsg.author.username;
       const tContent     = cleanContent(tMsg.content);
-      const tIsGuild     = !tDM && !!tMsg.guildId;
-      const tChannelName = tDM ? 'DM' : ((tMsg.channel as any).name ?? 'unknown');
+      const tChannelName = (tMsg.channel as any).name ?? 'unknown';
 
       try {
-        // Check speak state — DMs always bypass
-        if (!tDM) {
-          const speakState = await getSpeakState(tChannel, tGuild);
-          if (
-            speakState.mode === 'paused' &&
-            speakState.resumeAt &&
-            Date.now() < speakState.resumeAt &&
-            !tMentioned
-          ) {
-            console.log(`[Speak] paused — skip`);
-            return;
-          }
+        // Check speak state — this is also where an AI self-pause (below) lands.
+        const speakState = await getSpeakState(tChannel, tGuild);
+        if (
+          speakState.mode === 'paused' &&
+          speakState.resumeAt &&
+          Date.now() < speakState.resumeAt &&
+          !tMentioned
+        ) {
+          console.log(`[Speak] paused — skip`);
+          return;
         }
 
         // Seed STM if empty
@@ -963,8 +1091,8 @@ async function handleMessage(msg: Message) {
         }
 
         const [memberData, memory] = await Promise.all([
-          tIsGuild ? getMember(tGuild, tMsg.author.id) : Promise.resolve({} as MemberData),
-          tIsGuild ? getMemory(tGuild) : Promise.resolve({ facts: [], jokes: [] } as ServerMemory),
+          getMember(tGuild, tMsg.author.id),
+          getMemory(tGuild),
         ]);
 
         const bond    = typeof memberData.bond === 'number' ? memberData.bond : 50;
@@ -974,10 +1102,7 @@ async function handleMessage(msg: Message) {
         if (memberData.personality)     memLines.push(`${tSender}: ${memberData.personality}`);
         const memCtx = memLines.join('\n');
 
-        const mood       = getMood(tChannel);
-        const speakState = tDM
-          ? { mode: 'active' as const, reason: 'dm' }
-          : await getSpeakState(tChannel, tGuild);
+        const mood = getMood(tChannel);
 
         // Detect if we're mid back-and-forth with this person
         const recentMsgs    = stmGet(tChannel).slice(-8);  // wider window
@@ -993,6 +1118,9 @@ async function handleMessage(msg: Message) {
         // Session summary from mid-term buffer
         const sessionSummary = sessionSummaries.get(tChannel);
 
+        // Active-streak clock — lets the model see how long/how much it's talked
+        const clock = clockLine(tChannel, mood);
+
         lastBrainCallAt = Date.now();
         const decision  = await brain({
           sender:         tSender,
@@ -1002,8 +1130,9 @@ async function handleMessage(msg: Message) {
           thread:         threadCtx,
           memCtx,
           sessionSummary,
+          clock,
           mentioned:      tMentioned,
-          isDM:           tDM,
+          isDM:           false,
           mood,
           speakState,
           inExchange,
@@ -1012,7 +1141,7 @@ async function handleMessage(msg: Message) {
           endingConvo,
         });
 
-        console.log(`[Brain] ${tSender}${tDM ? ' DM' : ''}: ${decision.action}${decision.reply ? ` — "${decision.reply.slice(0, 50)}"` : decision.reaction ? ` — ${decision.reaction}` : ''}`);
+        console.log(`[Brain] ${tSender}: ${decision.action}${decision.reply ? ` — "${decision.reply.slice(0, 50)}"` : decision.reaction ? ` — ${decision.reaction}` : ''}`);
 
         if (decision.reaction) {
           tMsg.react(decision.reaction).catch(() => {});
@@ -1028,13 +1157,16 @@ async function handleMessage(msg: Message) {
           await tMsg.reply({ content: text, allowedMentions: { repliedUser: false } });
           stmPush(tChannel, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
 
+          const clk = activityClocks.get(tChannel);
+          if (clk) clk.replies++;
+
           fireSideEffects({ guildId: tGuild, userId: tMsg.author.id, action: 'speak' });
 
           // If person was ending the convo, go passive after this reply — don't linger
-          if (!tDM && endingConvo) {
+          if (endingConvo) {
             console.log(`[Mood] ${tSender} ending convo → passive`);
             goPassive(tChannel);
-          } else if (!tDM && speakState.mode !== 'active') {
+          } else if (speakState.mode !== 'active') {
             setSpeakState(tChannel, tGuild, { mode: 'active', reason: 'spoke' }).catch(() => {});
           }
 
@@ -1042,9 +1174,19 @@ async function handleMessage(msg: Message) {
           console.log('[Brain] speak→empty reply, skipping');
         }
 
-        if (tIsGuild) {
-          runCompress(tGuild, tChannel).catch(() => {});
+        // AI-decided self-pace: go quiet for a bit. Only a direct ping
+        // (handled by the speakState check above) breaks it early.
+        if (decision.pause > 0) {
+          await setSpeakState(tChannel, tGuild, {
+            mode:     'paused',
+            resumeAt: Date.now() + decision.pause * 60_000,
+            reason:   'self-paced',
+          });
+          goPassive(tChannel);
+          console.log(`[Pause] #${tChannel.slice(-5)} — self-paced ${decision.pause}m`);
         }
+
+        runCompress(tGuild, tChannel).catch(() => {});
 
       } catch (e) { console.error('[Handler debounce]', e); }
     }, debounceMs));
@@ -1061,11 +1203,14 @@ export async function startBot(token: string) {
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
       GatewayIntentBits.DirectMessages,
+      GatewayIntentBits.DirectMessageReactions,
+      GatewayIntentBits.DirectMessageTyping,
       GatewayIntentBits.MessageContent,
       GatewayIntentBits.GuildMembers,
     ],
     partials: [Partials.Message, Partials.Channel, Partials.User],
-    // Partials.User needed for DM events to fire reliably
+    // Partials.Channel is required for DM messageCreate events to fire at all.
+    // Partials.User needed for DM events to fire reliably.
   });
 
   botClient.on(Events.ClientReady, async () => {
@@ -1081,8 +1226,9 @@ export async function startBot(token: string) {
 ║  LIMITS : 30 RPM | 14,400 RPD | 1M tokens/day | 8192 ctx
 ║  CACHE  : system prompt cached after 1st call (≈350 tok)
 ║  KEYS   : ${cerebras.status().split('|')[0].trim()}
-║  STM    : ${STM_MAX} msgs | Debounce: ${DEBOUNCE_MS}ms
+║  STM    : ${STM_MAX} msgs | Debounce: ${DEBOUNCE_MS}ms | DM: ${DM_DEBOUNCE_MS}ms
 ║  Passive: every ${PASSIVE_EVERY}/${PASSIVE_EVERY_BUSY} msgs | Active: ${ACTIVE_MINS}m
+║  Pause  : AI sets its own quiet window (0-${PAUSE_MAX_MINS}m) via decision JSON
 ║  Profiler: first run in 1hr, skips existing profiles
 ╚═══════════════════════════════════════════════════════════╝\n`);
 
@@ -1199,12 +1345,14 @@ export async function startBot(token: string) {
       const moodStr = mood.mode === 'active' && mood.until
         ? `active (${Math.round((mood.until - Date.now()) / 60_000)}m left)`
         : `passive (count: ${mood.count})`;
+      const clk = clockLine(chId, mood);
       await msg.reply([
         `mood: ${moodStr}`,
+        clk ? `clock: ${clk}` : '',
         `speak: ${speak.mode}${speak.resumeAt ? ` until ${new Date(speak.resumeAt).toLocaleTimeString()}` : ''}`,
         `cerebras: ${cerebras.status()}`,
         `bgLock: ${bgLock}`,
-      ].join('\n'));
+      ].filter(Boolean).join('\n'));
     }
     if (c === '!memory') {
       const m = await getMemory(guildId);
