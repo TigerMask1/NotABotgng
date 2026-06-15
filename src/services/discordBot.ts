@@ -218,6 +218,11 @@ const PROACTIVE_OPEN_LOOP_CHANCE = 0.45;
 const GLOBAL_SOCIAL_MEMORY_CHANCE = 0.35;
 const MIN_BRAIN_GAP_MS   = 2200;
 const PAUSE_MAX_MINS     = 30;
+const SOCIAL_SIGNAL_MAX   = 45;
+const FOLLOW_UP_MAX       = 35;
+const SERVER_IMPRESSION_MAX = 25;
+const FOLLOW_UP_COOLDOWN_MS = 18 * 60 * 60_000;
+const SUMMON_COOLDOWN_MS  = 6 * 60 * 60_000;
 
 let lastBrainCallAt = 0;
 let BOT_NAME  = 'NotABot';
@@ -418,6 +423,7 @@ type SocialMoodKind = 'sleepy' | 'gremlin' | 'friendly' | 'sarcastic' | 'confuse
 interface SocialMood { kind: SocialMoodKind; until: number; }
 const socialMoods = new Map<string, SocialMood>();
 const behaviorNoteCooldowns = new Map<string, number>();
+const summonCooldowns = new Map<string, number>();
 
 function getSocialMood(channelId: string): SocialMood | null {
   const m = socialMoods.get(channelId);
@@ -599,16 +605,21 @@ function saveSpeakState(channelId: string, guildId: string, s: SpeakState) {
 }
 
 // ── FIREBASE / MEMORY ────────────────────────────────────────────
-interface OwnedMemory { ownerId?: string; ownerName: string; kind: 'trait' | 'joke' | 'opinion' | 'habit' | 'topic' | 'openLoop' | 'relationship' | 'botBit'; text: string; updatedAt: string; }
-interface ServerMemory { facts: string[]; jokes: string[]; patterns: string[]; arcs: string[]; openLoops: string[]; obsessions: string[]; owned?: OwnedMemory[]; }
-type ServerMemoryTextBucket = Exclude<keyof ServerMemory, 'owned'>;
+type MemoryScope = 'server' | 'global';
+type MemorySource = 'message' | 'compress' | 'event' | 'proactive' | 'manual';
+interface OwnedMemory { ownerId?: string; ownerName: string; kind: 'trait' | 'joke' | 'opinion' | 'habit' | 'topic' | 'openLoop' | 'relationship' | 'botBit'; text: string; scope: MemoryScope; source: MemorySource; updatedAt: string; expiresAt?: string; }
+interface SocialSignal { userId?: string; userName: string; label: string; text: string; source: MemorySource; updatedAt: string; expiresAt?: string; }
+interface FollowUp { id: string; ownerId?: string; ownerName: string; topic: string; channelId?: string; requestedAt: string; lastAskedAt?: string; resolvedAt?: string; source: MemorySource; }
+interface ServerImpression { text: string; source: MemorySource; updatedAt: string; expiresAt?: string; }
+interface ServerMemory { facts: string[]; jokes: string[]; patterns: string[]; arcs: string[]; openLoops: string[]; obsessions: string[]; owned?: OwnedMemory[]; socialSignals?: SocialSignal[]; followUps?: FollowUp[]; serverImpressions?: ServerImpression[]; }
+type ServerMemoryTextBucket = 'facts' | 'jokes' | 'patterns' | 'arcs' | 'openLoops' | 'obsessions';
 interface SocialMemory { patterns: string[]; arcs: string[]; jokes: string[]; relationships: string[]; reputation: string[]; openLoops: string[]; obsessions: string[]; }
 
 const memCache = new Map<string, { d: ServerMemory; ts: number }>();
 const socialMemCache = new Map<string, { d: SocialMemory; ts: number }>();
 
 function emptyServerMemory(): ServerMemory {
-  return { facts: [], jokes: [], patterns: [], arcs: [], openLoops: [], obsessions: [], owned: [] };
+  return { facts: [], jokes: [], patterns: [], arcs: [], openLoops: [], obsessions: [], owned: [], socialSignals: [], followUps: [], serverImpressions: [] };
 }
 
 function emptySocialMemory(): SocialMemory {
@@ -628,30 +639,51 @@ async function getMemory(guildId: string): Promise<ServerMemory> {
       openLoops: snap.data()?.openLoops ?? [],
       obsessions: snap.data()?.obsessions ?? [],
       owned: (snap.data()?.owned ?? []).filter((x: any) => x?.ownerName && x?.text),
+      socialSignals: (snap.data()?.socialSignals ?? []).filter((x: any) => x?.userName && x?.text),
+      followUps: (snap.data()?.followUps ?? []).filter((x: any) => x?.ownerName && x?.topic),
+      serverImpressions: (snap.data()?.serverImpressions ?? []).filter((x: any) => x?.text),
     };
     memCache.set(guildId, { d, ts: Date.now() });
     return d;
   } catch { return emptyServerMemory(); }
 }
 
+function isSensitiveSocialText(text: string): boolean {
+  return /\b(dm|private|address|phone|email|password|token|secret|mod|ban|kick|server invite|real name|location|ip|dox|therapy|medical|diagnosis)\b/i.test(text);
+}
+
+function normalizeMemoryText(text: string): string {
+  return text.toLowerCase().replace(/<@!?\d+>/g, '@user').replace(/\s+/g, ' ').trim();
+}
+
+function compactSocialText(text: string, max = 120): string {
+  return text.replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
 async function addOwnedMemory(guildId: string, item: Partial<OwnedMemory>) {
   if (guildId === 'dm') return;
-  const text = item.text?.trim();
-  const ownerName = item.ownerName?.trim();
+  const text = compactSocialText(item.text || '');
+  const ownerName = compactSocialText(item.ownerName || '', 40);
   if (!text || !ownerName || text.length < 5) return;
-  if (/\b(dm|private|address|phone|email|password|token|secret|mod|ban|kick)\b/i.test(text)) return;
-
+  if (isSensitiveSocialText(text)) return;
   const m = await getMemory(guildId);
   const owned = [...(m.owned ?? [])];
-  const norm = `${ownerName}:${item.kind ?? 'topic'}:${text}`.toLowerCase();
-  if (owned.some(x => `${x.ownerName}:${x.kind}:${x.text}`.toLowerCase() === norm)) return;
-  owned.push({
-    ownerId: item.ownerId,
-    ownerName,
-    kind: item.kind ?? 'topic',
-    text,
-    updatedAt: new Date().toISOString(),
-  });
+  const norm = `${item.ownerId || ownerName}:${item.kind ?? 'topic'}:${normalizeMemoryText(text)}`;
+  const existing = owned.findIndex(x => `${x.ownerId || x.ownerName}:${x.kind}:${normalizeMemoryText(x.text)}` === norm);
+  if (existing >= 0) {
+    owned[existing] = { ...owned[existing], updatedAt: new Date().toISOString() };
+  } else {
+    owned.push({
+      ownerId: item.ownerId,
+      ownerName,
+      kind: item.kind ?? 'topic',
+      text,
+      scope: item.scope ?? 'server',
+      source: item.source ?? 'message',
+      updatedAt: new Date().toISOString(),
+      expiresAt: item.expiresAt,
+    });
+  }
   while (owned.length > 45) owned.shift();
   memCache.delete(guildId);
   await db.collection('servers').doc(guildId).collection('memory').doc('global')
@@ -660,7 +692,68 @@ async function addOwnedMemory(guildId: string, item: Partial<OwnedMemory>) {
 }
 
 function addOwnedMemoryLoose(guildId: string, ownerName: string, text: string, kind: OwnedMemory['kind'], ownerId?: string) {
-  addOwnedMemory(guildId, { ownerId, ownerName, kind, text }).catch(() => {});
+  addOwnedMemory(guildId, { ownerId, ownerName, kind, text, source: 'message', scope: 'server' }).catch(() => {});
+}
+
+async function addSocialSignal(guildId: string, signal: Partial<SocialSignal>) {
+  if (guildId === 'dm') return;
+  const text = compactSocialText(signal.text || '');
+  const userName = compactSocialText(signal.userName || '', 40);
+  const label = compactSocialText(signal.label || '', 30);
+  if (!text || !userName || !label || isSensitiveSocialText(text)) return;
+  const m = await getMemory(guildId);
+  const socialSignals = [...(m.socialSignals ?? [])];
+  const norm = `${signal.userId || userName}:${label}:${normalizeMemoryText(text)}`;
+  const existing = socialSignals.findIndex(x => `${x.userId || x.userName}:${x.label}:${normalizeMemoryText(x.text)}` === norm);
+  if (existing >= 0) socialSignals[existing] = { ...socialSignals[existing], updatedAt: new Date().toISOString() };
+  else socialSignals.push({ userId: signal.userId, userName, label, text, source: signal.source ?? 'event', updatedAt: new Date().toISOString(), expiresAt: signal.expiresAt });
+  while (socialSignals.length > SOCIAL_SIGNAL_MAX) socialSignals.shift();
+  memCache.delete(guildId);
+  await db.collection('servers').doc(guildId).collection('memory').doc('global')
+    .set({ socialSignals }, { merge: true }).catch(() => {});
+}
+
+async function addServerImpression(guildId: string, text: string, source: MemorySource = 'event') {
+  if (guildId === 'dm') return;
+  const clean = compactSocialText(text);
+  if (!clean || clean.length < 8 || isSensitiveSocialText(clean)) return;
+  const m = await getMemory(guildId);
+  const serverImpressions = [...(m.serverImpressions ?? [])];
+  if (!serverImpressions.some(x => normalizeMemoryText(x.text) === normalizeMemoryText(clean))) {
+    serverImpressions.push({ text: clean, source, updatedAt: new Date().toISOString() });
+  }
+  while (serverImpressions.length > SERVER_IMPRESSION_MAX) serverImpressions.shift();
+  memCache.delete(guildId);
+  await db.collection('servers').doc(guildId).collection('memory').doc('global')
+    .set({ serverImpressions }, { merge: true }).catch(() => {});
+}
+
+async function addFollowUp(guildId: string, item: Partial<FollowUp>) {
+  if (guildId === 'dm') return;
+  const ownerName = compactSocialText(item.ownerName || '', 40);
+  const topic = compactSocialText(item.topic || '');
+  if (!ownerName || !topic || topic.length < 5 || isSensitiveSocialText(topic)) return;
+  const m = await getMemory(guildId);
+  const followUps = [...(m.followUps ?? [])];
+  const id = item.id || `${item.ownerId || ownerName}:${normalizeMemoryText(topic)}`.slice(0, 120);
+  const existing = followUps.findIndex(x => x.id === id);
+  const next: FollowUp = {
+    id,
+    ownerId: item.ownerId,
+    ownerName,
+    topic,
+    channelId: item.channelId,
+    requestedAt: item.requestedAt || new Date().toISOString(),
+    lastAskedAt: item.lastAskedAt,
+    resolvedAt: item.resolvedAt,
+    source: item.source ?? 'proactive',
+  };
+  if (existing >= 0) followUps[existing] = { ...followUps[existing], ...next };
+  else followUps.push(next);
+  while (followUps.length > FOLLOW_UP_MAX) followUps.shift();
+  memCache.delete(guildId);
+  await db.collection('servers').doc(guildId).collection('memory').doc('global')
+    .set({ followUps }, { merge: true }).catch(() => {});
 }
 
 async function addFact(guildId: string, fact: string, bucket: ServerMemoryTextBucket = 'facts') {
@@ -752,6 +845,9 @@ async function noteMemberSeen(guildId: string, userId: string, displayName: stri
   if (guildId === 'dm') return;
   const existing = await getMember(guildId, userId);
   const seenCount = (existing.seenCount ?? 0) + 1;
+  const absentDays = existing.lastSeenAt
+    ? Math.floor((Date.now() - Date.parse(existing.lastSeenAt)) / 86_400_000)
+    : 0;
   const hour = new Date().getHours();
   const usualHour = typeof existing.usualHour === 'number'
     ? Math.round((existing.usualHour * Math.min(seenCount - 1, 20) + hour) / Math.min(seenCount, 21))
@@ -764,6 +860,15 @@ async function noteMemberSeen(guildId: string, userId: string, displayName: stri
     seenCount,
     usualHour,
   });
+  if (absentDays >= 14) {
+    await addSocialSignal(guildId, {
+      userId,
+      userName: displayName,
+      label: 'returner',
+      text: `returned after ${absentDays}d away`,
+      source: 'event',
+    });
+  }
 }
 
 async function updateBond(guildId: string, userId: string, delta: number) {
@@ -780,14 +885,50 @@ function socialMemoryLines(userMem: SocialMemory, botMem?: SocialMemory): string
   if (userMem.patterns.length)      lines.push(`patterns: ${userMem.patterns.slice(-2).join(' | ')}`);
   if (userMem.arcs.length)          lines.push(`story arcs: ${userMem.arcs.slice(-2).join(' | ')}`);
   if (userMem.jokes.length)         lines.push(`old jokes: ${userMem.jokes.slice(-2).join(' | ')}`);
-  if (userMem.obsessions.length)    lines.push(`running bits: ${userMem.obsessions.slice(-2).join(' | ')}`);
-  if (botMem?.obsessions.length)    lines.push(`notabot bits: ${botMem.obsessions.slice(-2).join(' | ')}`);
-  if (botMem?.reputation.length)    lines.push(`notabot reputation: ${botMem.reputation.slice(-2).join(' | ')}`);
+  if (userMem.obsessions.length)    lines.push(`${userMem.obsessions.slice(-2).map(x => `sender owns habit: ${x}`).join('\n')}`);
+  if (botMem?.obsessions.length)    lines.push(`${botMem.obsessions.slice(-2).map(x => `[me] owns habit: ${x}`).join('\n')}`);
+  if (botMem?.reputation.length)    lines.push(`[me] reputation: ${botMem.reputation.slice(-2).join(' | ')}`);
   return lines.join('\n');
 }
 
+function socialSignalLines(memory: ServerMemory, currentUserId?: string, currentName?: string): string {
+  const signals = (memory.socialSignals ?? []).slice(-24);
+  if (!signals.length) return '';
+  const score = (x: SocialSignal) =>
+    (x.userId && x.userId === currentUserId ? 5 : 0) +
+    (currentName && x.userName.toLowerCase() === currentName.toLowerCase() ? 3 : 0);
+  return signals
+    .filter(x => !x.expiresAt || Date.parse(x.expiresAt) > Date.now())
+    .sort((a, b) => score(b) - score(a))
+    .slice(0, 6)
+    .map(x => `${x.userName}: ${x.label} (${x.text})`)
+    .join('\n');
+}
+
+function followUpLines(memory: ServerMemory, currentUserId?: string, channelId?: string): string {
+  const followUps = (memory.followUps ?? [])
+    .filter(x => !x.resolvedAt)
+    .filter(x => !currentUserId || !x.ownerId || x.ownerId === currentUserId || x.channelId === channelId)
+    .slice(-8);
+  if (!followUps.length) return '';
+  return followUps
+    .slice(0, 4)
+    .map(x => `${x.ownerName} pending: ${x.topic}`)
+    .join('\n');
+}
+
+function serverImpressionLines(memory: ServerMemory): string {
+  return (memory.serverImpressions ?? [])
+    .filter(x => !x.expiresAt || Date.parse(x.expiresAt) > Date.now())
+    .slice(-4)
+    .map(x => `server vibe: ${x.text}`)
+    .join('\n');
+}
+
 function ownedMemoryLines(memory: ServerMemory, currentUserId?: string, currentName?: string): string {
-  const owned = (memory.owned ?? []).slice(-24);
+  const owned = (memory.owned ?? [])
+    .filter(x => !x.expiresAt || Date.parse(x.expiresAt) > Date.now())
+    .slice(-24);
   if (!owned.length) return '';
 
   const botNames = new Set([BOT_ID, BOT_NAME.toLowerCase(), 'notabot', '[me]']);
@@ -808,6 +949,16 @@ function ownedMemoryLines(memory: ServerMemory, currentUserId?: string, currentN
       return `${owner} owns ${x.kind}: ${x.text}`;
     })
     .join('\n');
+}
+
+function peopleContextLines(memory: ServerMemory, currentUserId: string, currentName: string, member: MemberData, channelId: string): string {
+  return [
+    personContext(currentName, member),
+    socialSignalLines(memory, currentUserId, currentName),
+    ownedMemoryLines(memory, currentUserId, currentName),
+    followUpLines(memory, currentUserId, channelId),
+    serverImpressionLines(memory),
+  ].filter(Boolean).join('\n');
 }
 
 function pronounHintLine(sender: string, msg: string): string {
@@ -848,6 +999,54 @@ function maybeExtractOwnedMemory(guildId: string, msg: STMsg) {
     .replace(/\s+/g, ' ')
     .slice(0, 120);
   addOwnedMemoryLoose(guildId, ownerName, cleaned, kind, ownerId);
+}
+
+function closureLike(text: string): boolean {
+  return /\b(done|finished|resolved|fixed|passed|failed|cancelled|canceled|over|ended|submitted|got it|worked out|did it|nvm|never mind)\b/i.test(text);
+}
+
+async function resolveMatchingFollowUps(guildId: string, msg: STMsg) {
+  if (guildId === 'dm' || !closureLike(msg.content)) return;
+  const m = await getMemory(guildId);
+  const followUps = [...(m.followUps ?? [])];
+  let changed = false;
+  for (const f of followUps) {
+    if (f.resolvedAt) continue;
+    if (f.ownerId && f.ownerId !== msg.authorId) continue;
+    const words = normalizeMemoryText(f.topic).split(' ').filter(w => w.length > 3);
+    if (words.some(w => normalizeMemoryText(msg.content).includes(w))) {
+      f.resolvedAt = new Date().toISOString();
+      changed = true;
+    }
+  }
+  if (!changed) return;
+  memCache.delete(guildId);
+  await db.collection('servers').doc(guildId).collection('memory').doc('global')
+    .set({ followUps }, { merge: true }).catch(() => {});
+}
+
+function followUpTopicFromBotReply(reply: string, trigger: string): string | null {
+  if (!reply.includes('?')) return null;
+  const combined = `${reply} ${trigger}`;
+  if (!/\b(update|resolved|finish|finished|done|happen|went|exam|project|arc|investigation|did|still)\b/i.test(combined)) return null;
+  return compactSocialText(trigger || reply, 90);
+}
+
+function maybeSocialSummon(memory: ServerMemory, content: string): string {
+  const lower = content.toLowerCase();
+  const candidates = (memory.owned ?? [])
+    .filter(x => x.ownerId && x.ownerId !== BOT_ID)
+    .filter(x => ['topic', 'openLoop', 'opinion', 'habit'].includes(x.kind))
+    .filter(x => normalizeMemoryText(x.text).split(' ').some(w => w.length > 4 && lower.includes(w)))
+    .slice(-3);
+  const pick = candidates[candidates.length - 1];
+  if (!pick || !pick.ownerName) return '';
+  const key = `${pick.ownerId}:${pick.kind}:${normalizeMemoryText(pick.text).slice(0, 40)}`;
+  const now = Date.now();
+  const last = summonCooldowns.get(key) ?? 0;
+  if (now - last < SUMMON_COOLDOWN_MS) return '';
+  summonCooldowns.set(key, now);
+  return `possible summon: ${pick.ownerName} is associated with ${pick.kind}: ${pick.text}. name them only if genuinely useful; ping only if directly asked or clearly earned.`;
 }
 
 function personContext(name: string, member: MemberData): string {
@@ -933,6 +1132,7 @@ async function brain(opts: {
   memCtx:          string;
   socialCtx?:      string;
   peopleCtx?:      string;
+  summonCtx?:      string;
   pronounHint?:    string;
   sessionSummary?: string;
   clock?:          string;
@@ -964,6 +1164,7 @@ async function brain(opts: {
   if (opts.memCtx)          parts.push(`\nCONTEXT:\n${opts.memCtx.slice(0, MAX_MEM_CHARS)}`);
   if (opts.socialCtx)       parts.push(`\nSOCIAL MEMORY (filtered impressions only):\n${opts.socialCtx.slice(0, MAX_MEM_CHARS)}\nRULES: ${SOCIAL_MEMORY_RULES}`);
   if (opts.peopleCtx)       parts.push(`\nPEOPLE / OWNERSHIP:\n${opts.peopleCtx.slice(0, MAX_PEOPLE_CTX_CHARS)}`);
+  if (opts.summonCtx)       parts.push(`\nSOCIAL SUMMON:\n${opts.summonCtx.slice(0, 220)}`);
   if (opts.sessionSummary)  parts.push(`\nSESSION (earlier today):\n${opts.sessionSummary.slice(0, MAX_SUMMARY_CHARS)}`);
   if (opts.clock)           parts.push(`\nCLOCK: ${opts.clock}`);
   if (opts.pronounHint)     parts.push(`\nPRONOUN MAP: ${opts.pronounHint}`);
@@ -1157,7 +1358,7 @@ async function runCompress(guildId: string, channelId: string) {
     const stmText = msgs.map(m => `${m.author}: ${m.content}`).join('\n').slice(0, 1200);
     try {
       const raw = await cerebras.call([
-        { role: 'system', content: 'extract only memorable, non-sensitive discord memory. bias toward people, owner-tagged traits, patterns, unresolved stories, funny failures, recurring jokes, and harmless running bits. no exact private quotes. ONLY valid JSON: {"facts":["x"],"jokes":["x"],"patterns":["x"],"arcs":["x"],"openLoops":["x"],"obsessions":["x"],"owned":[{"owner":"name or NotABot","kind":"trait|joke|opinion|habit|topic|openLoop|relationship|botBit","text":"x"}],"relationships":[{"user":"name","note":"x"}],"reputation":["x"]}' },
+        { role: 'system', content: 'extract only memorable, non-sensitive discord social memory. bias toward people, owner-tagged traits, unresolved stories, social labels, server vibe. no exact private quotes. ONLY valid JSON: {"facts":["x"],"jokes":["x"],"patterns":["x"],"arcs":["x"],"openLoops":["x"],"obsessions":["x"],"owned":[{"owner":"name or NotABot","kind":"trait|joke|opinion|habit|topic|openLoop|relationship|botBit","text":"x"}],"socialSignals":[{"user":"name","label":"night owl|chaos starter|topic regular|returner|regular pair","text":"x"}],"followUps":[{"user":"name","topic":"x"}],"resolved":["topic words"],"serverImpressions":["x"],"relationships":[{"user":"name","note":"x"}],"reputation":["x"]}' },
         { role: 'user',   content: stmText },
       ], 0.45, 180, FAST_MODEL);
       const jsonMatch = raw.match(/\{[\s\S]*\}/);
@@ -1197,7 +1398,51 @@ async function runCompress(guildId: string, channelId: string) {
             ? kind as OwnedMemory['kind']
             : 'topic',
           text: String(x.text),
+          scope: 'server',
+          source: 'compress',
         });
+      }
+      for (const s of (p.socialSignals || []).slice(0, 4)) {
+        if (!s?.user || !s?.label || !s?.text) continue;
+        const uid = [...idCache.entries()].find(([, name]) => name.toLowerCase() === String(s.user).toLowerCase())?.[0];
+        await addSocialSignal(guildId, {
+          userId: uid,
+          userName: String(s.user),
+          label: String(s.label),
+          text: String(s.text),
+          source: 'compress',
+        });
+      }
+      for (const f of (p.followUps || []).slice(0, 3)) {
+        if (!f?.user || !f?.topic) continue;
+        const uid = [...idCache.entries()].find(([, name]) => name.toLowerCase() === String(f.user).toLowerCase())?.[0];
+        await addFollowUp(guildId, {
+          ownerId: uid,
+          ownerName: String(f.user),
+          topic: String(f.topic),
+          channelId,
+          source: 'compress',
+        });
+      }
+      for (const v of (p.serverImpressions || []).slice(0, 2)) await addServerImpression(guildId, String(v), 'compress');
+      if ((p.resolved || []).length) {
+        const memory = await getMemory(guildId);
+        const followUps = [...(memory.followUps ?? [])];
+        let changed = false;
+        for (const word of (p.resolved || []).slice(0, 4)) {
+          const norm = normalizeMemoryText(String(word));
+          for (const f of followUps) {
+            if (!f.resolvedAt && normalizeMemoryText(f.topic).includes(norm)) {
+              f.resolvedAt = new Date().toISOString();
+              changed = true;
+            }
+          }
+        }
+        if (changed) {
+          memCache.delete(guildId);
+          await db.collection('servers').doc(guildId).collection('memory').doc('global')
+            .set({ followUps }, { merge: true }).catch(() => {});
+        }
       }
       for (const r of (p.relationships || []).slice(0, 3)) {
         if (!r?.user || !r?.note) continue;
@@ -1275,21 +1520,30 @@ async function runProactive(client: Client) {
         getSocialMemory(),
       ]);
       const hints = [
+        serverImpressionLines(localMem),
+        socialSignalLines(localMem),
+        ownedMemoryLines(localMem),
+        followUpLines(localMem, undefined, pick.id),
         localMem.jokes.length ? `local jokes: ${localMem.jokes.slice(-2).join(' | ')}` : '',
         localMem.openLoops.length ? `open loops: ${localMem.openLoops.slice(-3).join(' | ')}` : '',
         localMem.arcs.length ? `unfinished arcs: ${localMem.arcs.slice(-2).join(' | ')}` : '',
         localMem.patterns.length ? `patterns: ${localMem.patterns.slice(-2).join(' | ')}` : '',
-        localMem.obsessions.length ? `running bits: ${localMem.obsessions.slice(-2).join(' | ')}` : '',
         botSocial.jokes.length ? `older jokes: ${botSocial.jokes.slice(-2).join(' | ')}` : '',
         botSocial.openLoops.length ? `older open loops: ${botSocial.openLoops.slice(-2).join(' | ')}` : '',
         botSocial.arcs.length ? `older arcs: ${botSocial.arcs.slice(-2).join(' | ')}` : '',
         botSocial.obsessions.length ? `notabot obsessions: ${botSocial.obsessions.slice(-2).join(' | ')}` : '',
         botSocial.reputation.length ? `known for: ${botSocial.reputation.slice(-2).join(' | ')}` : '',
       ].filter(Boolean).join('\n').slice(0, MAX_MEM_CHARS);
+      const pendingFollowUp = (localMem.followUps ?? [])
+        .filter(f => !f.resolvedAt && (!f.channelId || f.channelId === pick.id))
+        .filter(f => !f.lastAskedAt || Date.now() - Date.parse(f.lastAskedAt) > FOLLOW_UP_COOLDOWN_MS)
+        .slice(-1)[0];
       const mode = Math.random() < PROACTIVE_ODD_CHANCE
         ? 'very rare harmless weird observation'
-        : (localMem.openLoops.length && Math.random() < PROACTIVE_OPEN_LOOP_CHANCE)
-          ? 'revive an open loop or unfinished story'
+        : (pendingFollowUp && Math.random() < PROACTIVE_OPEN_LOOP_CHANCE)
+          ? `ask for a casual update on unresolved thing: ${pendingFollowUp.ownerName} / ${pendingFollowUp.topic}. do not ping unless truly earned`
+          : ((localMem.openLoops.length || (localMem.owned ?? []).some(x => x.kind === 'openLoop')) && Math.random() < PROACTIVE_OPEN_LOOP_CHANCE)
+          ? 'revive an open loop or unfinished story without being investigative'
           : ['ask a dumb debate question', 'make a tiny poll', 'share an unsolicited thought', 'quietly observe server culture', 'continue a running bit'][Math.floor(Math.random() * 5)];
       const raw = await cerebras.call([
         { role: 'system', content: `you are ${BOT_NAME}, a server regular. send ONE short casual message to break silence, or skip. do not be needy. callbacks must be vague and non-private. polls can be one-line "quick poll: ...". lowercase. ONLY valid JSON.` },
@@ -1305,6 +1559,10 @@ async function runProactive(client: Client) {
       await sleep(Math.min(400 + text.length * 20, 2500));
       await ch.send(text);
       stmPush(pick.id, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
+      if (guildId && pendingFollowUp && text.includes('?')) {
+        pendingFollowUp.lastAskedAt = new Date().toISOString();
+        await addFollowUp(guildId, pendingFollowUp);
+      }
       console.log(`[Proactive] #${pick.id.slice(-5)}: "${text.slice(0, 50)}"`);
     } catch {}
   });
@@ -1381,7 +1639,18 @@ async function respondToDM(msg: Message) {
     getSocialMemory(msg.author.id),
     Math.random() < GLOBAL_SOCIAL_MEMORY_CHANCE ? getSocialMemory() : Promise.resolve(emptySocialMemory()),
   ]);
-  const peopleCtx = ownedMemoryLines(emptyServerMemory(), msg.author.id, sender);
+
+  // Build a lightweight owned-memory proxy from global social memory so DMs
+  // still surface what this person owns (habits, open loops, opinions) even
+  // without a server guildId to pull from.
+  const dmOwnedProxy: OwnedMemory[] = [
+    ...userSocial.obsessions.map(t => ({ ownerName: sender, ownerId: msg.author.id, kind: 'habit' as const, text: t, scope: 'global' as MemoryScope, source: 'message' as MemorySource, updatedAt: '' })),
+    ...userSocial.openLoops.map(t => ({ ownerName: sender, ownerId: msg.author.id, kind: 'openLoop' as const, text: t, scope: 'global' as MemoryScope, source: 'message' as MemorySource, updatedAt: '' })),
+    ...userSocial.arcs.map(t => ({ ownerName: sender, ownerId: msg.author.id, kind: 'topic' as const, text: t, scope: 'global' as MemoryScope, source: 'message' as MemorySource, updatedAt: '' })),
+    ...botSocial.obsessions.map(t => ({ ownerName: BOT_NAME, ownerId: BOT_ID, kind: 'botBit' as const, text: t, scope: 'global' as MemoryScope, source: 'message' as MemorySource, updatedAt: '' })),
+  ];
+  const dmMemProxy: ServerMemory = { ...emptyServerMemory(), owned: dmOwnedProxy };
+  const peopleCtx = ownedMemoryLines(dmMemProxy, msg.author.id, sender);
   const pronounHint = pronounHintLine(sender, content);
 
   lastBrainCallAt = Date.now();
@@ -1420,6 +1689,12 @@ async function respondToDM(msg: Message) {
 
     await msg.reply({ content: text, allowedMentions: { repliedUser: false } });
     stmPush(channelId, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
+
+    // Track open loops bot asks about in DMs via global social memory (no guildId)
+    const followTopic = followUpTopicFromBotReply(text, content);
+    if (followTopic) {
+      addSocialMemory('openLoops', followTopic, msg.author.id).catch(() => {});
+    }
   }
   // note: DMs ignore decision.pause entirely — every DM is a direct line,
   // there's no "monopoly" or ambient-chatter problem to self-pace away from.
@@ -1457,6 +1732,11 @@ async function handleMessage(msg: Message) {
     cacheId(msg.author.id, sender);
     notePlaceSeen(guildId, msg.guild?.name, channelId, channelName).catch(() => {});
 
+    if (mentioned && await answerToolQuestion(msg, content, guildId, sender)) {
+      noteMemberSeen(guildId, msg.author.id, sender, msg.author.username).catch(() => {});
+      return;
+    }
+
     noteMemberSeen(guildId, msg.author.id, sender, msg.author.username).catch(() => {});
 
     stmPush(channelId, {
@@ -1471,9 +1751,55 @@ async function handleMessage(msg: Message) {
       author: sender,
       content,
     });
-
-    if (mentioned && await answerToolQuestion(msg, content, guildId, sender)) return;
-
+    resolveMatchingFollowUps(guildId, {
+      ts: msg.createdTimestamp,
+      authorId: msg.author.id,
+      author: sender,
+      content,
+    }).catch(() => {});
+    if (new Date().getHours() <= 4) {
+      addSocialSignal(guildId, {
+        userId: msg.author.id,
+        userName: sender,
+        label: 'night owl',
+        text: 'shows up at cursed hours',
+        source: 'message',
+      }).catch(() => {});
+    }
+    const recentNonBot = stmGet(channelId).slice(-8).filter(m => m.authorId !== BOT_ID);
+    if (recentNonBot.length >= 6) {
+      addSocialSignal(guildId, {
+        userId: msg.author.id,
+        userName: sender,
+        label: 'chaos starter',
+        text: 'appears when chat is moving fast',
+        source: 'message',
+        expiresAt: new Date(Date.now() + 30 * 86_400_000).toISOString(),
+      }).catch(() => {});
+    }
+    // topic regular: if this user has ≥3 messages in recent STM sharing a keyword cluster,
+    // store a lightweight signal so the brain knows they're a recurring voice on that topic.
+    (() => {
+      const userRecent = stmGet(channelId).slice(-20).filter(m => m.authorId === msg.author.id);
+      if (userRecent.length < 3) return;
+      const TOPIC_WORDS = /\b(game|code|exam|physics|math|anime|music|art|film|book|server|project|build|study|crypto|ai|meme|politics|sport|school|college|work|gym)\b/gi;
+      const topicCounts = new Map<string, number>();
+      for (const m of userRecent) {
+        const matches = m.content.match(TOPIC_WORDS) ?? [];
+        for (const w of matches) topicCounts.set(w.toLowerCase(), (topicCounts.get(w.toLowerCase()) ?? 0) + 1);
+      }
+      const topTopic = [...topicCounts.entries()].sort((a, b) => b[1] - a[1])[0];
+      if (topTopic && topTopic[1] >= 2) {
+        addSocialSignal(guildId, {
+          userId: msg.author.id,
+          userName: sender,
+          label: 'topic regular',
+          text: `keeps bringing up ${topTopic[0]}`,
+          source: 'message',
+          expiresAt: new Date(Date.now() + 60 * 86_400_000).toISOString(),
+        }).catch(() => {});
+      }
+    })();
     maybeNoteBehaviorPattern(msg.author.id, channelId);
     tickUnread(channelId);
     if (!checkFocus(channelId, mentioned)) return;
@@ -1570,17 +1896,15 @@ async function handleMessage(msg: Message) {
         const bond    = typeof memberData.bond === 'number' ? memberData.bond : 50;
         maybeNoteRelationshipPattern(tMsg.author.id, memberData, bond);
         const memLines: string[] = [];
-        const personCtx = personContext(tSender, memberData);
-        if (personCtx)                  memLines.push(personCtx);
         if (memory.openLoops.length)    memLines.push(`open loops: ${memory.openLoops.slice(-3).join(' | ')}`);
         if (memory.jokes.length)        memLines.push(`server lore: ${memory.jokes.slice(-2).join(' | ')}`);
         if (memory.patterns.length)     memLines.push(`patterns: ${memory.patterns.slice(-2).join(' | ')}`);
         if (memory.arcs.length)         memLines.push(`arcs: ${memory.arcs.slice(-2).join(' | ')}`);
-        if (memory.obsessions.length)   memLines.push(`running bits: ${memory.obsessions.slice(-2).join(' | ')}`);
         if (memory.facts.length)        memLines.push(`facts: ${memory.facts.slice(-2).join(' | ')}`);
         const memCtx = memLines.join('\n');
         const socialCtx = socialMemoryLines(userSocial, botSocial);
-        const peopleCtx = ownedMemoryLines(memory, tMsg.author.id, tSender);
+        const peopleCtx = peopleContextLines(memory, tMsg.author.id, tSender, memberData, tChannel);
+        const summonCtx = maybeSocialSummon(memory, tContent);
         const pronounHint = pronounHintLine(tSender, tContent);
 
         const mood = getMood(tChannel);
@@ -1613,6 +1937,7 @@ async function handleMessage(msg: Message) {
           memCtx,
           socialCtx,
           peopleCtx,
+          summonCtx,
           sessionSummary,
           clock,
           pronounHint,
@@ -1643,6 +1968,19 @@ async function handleMessage(msg: Message) {
 
           await tMsg.reply({ content: text, allowedMentions: { repliedUser: false } });
           stmPush(tChannel, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
+
+          const followTopic = followUpTopicFromBotReply(text, tContent);
+          if (followTopic) {
+            addFollowUp(tGuild, {
+              ownerId: tMsg.author.id,
+              ownerName: tSender,
+              topic: followTopic,
+              channelId: tChannel,
+              requestedAt: new Date().toISOString(),
+              lastAskedAt: new Date().toISOString(),
+              source: 'message',
+            }).catch(() => {});
+          }
 
           const clk = activityClocks.get(tChannel);
           if (clk) clk.replies++;
@@ -1695,8 +2033,9 @@ export async function startBot(token: string) {
       GatewayIntentBits.MessageContent,
       GatewayIntentBits.GuildMembers,
       GatewayIntentBits.GuildPresences,
+      GatewayIntentBits.GuildMessageReactions,
     ],
-    partials: [Partials.Message, Partials.Channel, Partials.User],
+    partials: [Partials.Message, Partials.Channel, Partials.User, Partials.Reaction],
     // Partials.Channel is required for DM messageCreate events to fire at all.
     // Partials.User needed for DM events to fire reliably.
   });
@@ -1800,10 +2139,73 @@ export async function startBot(token: string) {
     });
   });
 
-  botClient.on(Events.GuildMemberUpdate, async (_, m) => {
+  botClient.on(Events.GuildMemberUpdate, async (oldM, m) => {
     if (m.user.bot) return;
     cacheId(m.id, m.displayName);
     await upsertMember(m.guild.id, m.id, { displayName: m.displayName });
+    if (oldM.displayName && oldM.displayName !== m.displayName) {
+      await addSocialSignal(m.guild.id, {
+        userId: m.id,
+        userName: m.displayName,
+        label: 'name change',
+        text: `used to show up as ${oldM.displayName}`,
+        source: 'event',
+      });
+    }
+    if (oldM.avatar !== m.avatar) {
+      await addSocialSignal(m.guild.id, {
+        userId: m.id,
+        userName: m.displayName,
+        label: 'avatar change',
+        text: 'changed avatar recently',
+        source: 'event',
+        expiresAt: new Date(Date.now() + 14 * 86_400_000).toISOString(),
+      });
+    }
+    if (!oldM.premiumSince && m.premiumSince) {
+      await addServerImpression(m.guild.id, `${m.displayName} boosted recently`, 'event');
+    }
+  });
+
+  botClient.on(Events.PresenceUpdate, async (oldP, p) => {
+    const member = p.member;
+    if (!member || member.user.bot || !p.guild) return;
+    if (oldP?.status === 'offline' && p.status && p.status !== 'offline') {
+      await addSocialSignal(p.guild.id, {
+        userId: member.id,
+        userName: member.displayName,
+        label: 'returner',
+        text: 'came online after being away',
+        source: 'event',
+        expiresAt: new Date(Date.now() + 3 * 86_400_000).toISOString(),
+      });
+    }
+  });
+
+  botClient.on(Events.MessageReactionAdd, async (reaction, user) => {
+    if (user.bot) return;
+    try {
+      if (reaction.partial) reaction = await reaction.fetch();
+      const msg = reaction.message;
+      const guildId = msg.guildId;
+      if (!guildId) return;
+      const name = idCache.get(user.id) || user.username;
+      await addSocialSignal(guildId, {
+        userId: user.id,
+        userName: name,
+        label: 'reactor',
+        text: `uses ${reaction.emoji.name || 'emoji'} reactions`,
+        source: 'event',
+        expiresAt: new Date(Date.now() + 30 * 86_400_000).toISOString(),
+      });
+    } catch {}
+  });
+
+  botClient.on(Events.ThreadCreate, async (thread: any) => {
+    const guildId = thread.guildId;
+    if (!guildId) return;
+    cacheChannelName(thread.id, thread.name);
+    await addServerImpression(guildId, 'people start side threads here', 'event');
   });
 
   // ── ADMIN COMMANDS ──────────────────────────────────────────────
@@ -1861,7 +2263,10 @@ export async function startBot(token: string) {
       await msg.reply(
         `facts (${m.facts.length}): ${m.facts.slice(-5).join(' | ') || 'none'}\n` +
         `jokes (${m.jokes.length}): ${m.jokes.slice(-3).join(' | ') || 'none'}\n` +
-        `owned (${m.owned?.length ?? 0}): ${(m.owned ?? []).slice(-5).map(x => `${x.ownerName}/${x.kind}: ${x.text}`).join(' | ') || 'none'}`
+        `owned (${m.owned?.length ?? 0}): ${(m.owned ?? []).slice(-5).map(x => `${x.ownerName}/${x.kind}: ${x.text}`).join(' | ') || 'none'}\n` +
+        `signals (${m.socialSignals?.length ?? 0}): ${(m.socialSignals ?? []).slice(-4).map(x => `${x.userName}/${x.label}`).join(' | ') || 'none'}\n` +
+        `followups (${m.followUps?.filter(x => !x.resolvedAt).length ?? 0}): ${(m.followUps ?? []).filter(x => !x.resolvedAt).slice(-3).map(x => `${x.ownerName}: ${x.topic}`).join(' | ') || 'none'}\n` +
+        `impressions (${m.serverImpressions?.length ?? 0}): ${(m.serverImpressions ?? []).filter(x => !x.expiresAt || Date.parse(x.expiresAt) > Date.now()).slice(-3).map(x => x.text).join(' | ') || 'none'}`
       );
     }
     if (c.startsWith('!remember ')) {
@@ -1887,6 +2292,38 @@ export async function startBot(token: string) {
     }
     if (c === '!budget') {
       await msg.reply(cerebras.status());
+    }
+    // ── social memory prune commands ──────────────────────────────
+    // !forgetsocial <word>  — drop any owned/signal/followUp containing that word
+    // !forgetowned          — wipe all owned memory for this server
+    // !forgetloops          — mark all pending follow-ups resolved
+    if (c.startsWith('!forgetsocial ')) {
+      const word = c.slice(14).trim().toLowerCase();
+      if (!word) { msg.reply('usage: !forgetsocial <word>'); return; }
+      const m = await getMemory(guildId);
+      const owned = (m.owned ?? []).filter(x => !normalizeMemoryText(x.text).includes(word) && !x.ownerName.toLowerCase().includes(word));
+      const socialSignals = (m.socialSignals ?? []).filter(x => !normalizeMemoryText(x.text).includes(word) && !x.label.toLowerCase().includes(word));
+      const followUps = (m.followUps ?? []).filter(x => !normalizeMemoryText(x.topic).includes(word) && !x.ownerName.toLowerCase().includes(word));
+      const serverImpressions = (m.serverImpressions ?? []).filter(x => !normalizeMemoryText(x.text).includes(word));
+      memCache.delete(guildId);
+      await db.collection('servers').doc(guildId).collection('memory').doc('global')
+        .set({ owned, socialSignals, followUps, serverImpressions }, { merge: true }).catch(() => {});
+      const removed = ((m.owned?.length ?? 0) - owned.length) + ((m.socialSignals?.length ?? 0) - socialSignals.length) + ((m.followUps?.length ?? 0) - followUps.length) + ((m.serverImpressions?.length ?? 0) - serverImpressions.length);
+      await msg.reply(`pruned ${removed} record(s) containing "${word}"`);
+    }
+    if (c === '!forgetowned') {
+      memCache.delete(guildId);
+      await db.collection('servers').doc(guildId).collection('memory').doc('global')
+        .set({ owned: [] }, { merge: true }).catch(() => {});
+      await msg.reply('owned memory cleared');
+    }
+    if (c === '!forgetloops') {
+      const m = await getMemory(guildId);
+      const followUps = (m.followUps ?? []).map(f => ({ ...f, resolvedAt: f.resolvedAt ?? new Date().toISOString() }));
+      memCache.delete(guildId);
+      await db.collection('servers').doc(guildId).collection('memory').doc('global')
+        .set({ followUps }, { merge: true }).catch(() => {});
+      await msg.reply('all pending follow-ups marked resolved');
     }
     if (c === 'tiki waka wiki') {
       const dm = await msg.author.createDM().catch(() => null);
