@@ -13,7 +13,7 @@ const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 //           only pay tokens for the dynamic tail (transcript + trigger)
 
 const BRAIN_MODEL = 'gpt-oss-120b';  // main responses
-const FAST_MODEL  = 'llama3.1-8b';    // background jobs (profiler, compress, proactive)
+const FAST_MODEL  = 'zai-glm-4.7';    // background jobs (profiler, compress, proactive)
 const DAILY_TOKEN_BUDGET = 1_000_000;
 const SOFT = 0.85;
 
@@ -197,7 +197,7 @@ const PROACTIVE_INTERVAL = 35 * 60_000;
 const MIN_BRAIN_GAP_MS   = 2200;
 
 let lastBrainCallAt = 0;
-let BOT_NAME  = 'ChaosBot';
+let BOT_NAME  = 'NotABot';
 let BOT_ID    = '';
 let botClient: Client | null = null;
 
