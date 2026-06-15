@@ -180,6 +180,7 @@ const cerebras = new CerebrasManager();
 const MAX_TRANSCRIPT_CHARS = 1800;  // ≈ 450 tokens
 const MAX_MEM_CHARS        = 400;   // ≈ 100 tokens
 const MAX_SUMMARY_CHARS    = 300;   // ≈ 75 tokens — compressed session context
+const MAX_PEOPLE_CTX_CHARS = 650;   // owner-tagged facts beat extra transcript
 
 // ── SESSION BUFFER (mid-term memory) ─────────────────────────────
 // Holds up to 60 msgs per channel. STM (12) = what the bot sees raw.
@@ -343,6 +344,16 @@ function cleanContent(raw: string): string {
   // Keep @NotABot visible in content — model needs to see it was addressed.
   // resolveMentions already converts <@BOT_ID> → @NotABot, others → @Name.
   return resolveMentions(raw).trim();
+}
+
+function humanDuration(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 90) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 90) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
 }
 
 // ── SHORT-TERM MEMORY ────────────────────────────────────────────
@@ -588,14 +599,16 @@ function saveSpeakState(channelId: string, guildId: string, s: SpeakState) {
 }
 
 // ── FIREBASE / MEMORY ────────────────────────────────────────────
-interface ServerMemory { facts: string[]; jokes: string[]; patterns: string[]; arcs: string[]; openLoops: string[]; obsessions: string[]; }
+interface OwnedMemory { ownerId?: string; ownerName: string; kind: 'trait' | 'joke' | 'opinion' | 'habit' | 'topic' | 'openLoop' | 'relationship' | 'botBit'; text: string; updatedAt: string; }
+interface ServerMemory { facts: string[]; jokes: string[]; patterns: string[]; arcs: string[]; openLoops: string[]; obsessions: string[]; owned?: OwnedMemory[]; }
+type ServerMemoryTextBucket = Exclude<keyof ServerMemory, 'owned'>;
 interface SocialMemory { patterns: string[]; arcs: string[]; jokes: string[]; relationships: string[]; reputation: string[]; openLoops: string[]; obsessions: string[]; }
 
 const memCache = new Map<string, { d: ServerMemory; ts: number }>();
 const socialMemCache = new Map<string, { d: SocialMemory; ts: number }>();
 
 function emptyServerMemory(): ServerMemory {
-  return { facts: [], jokes: [], patterns: [], arcs: [], openLoops: [], obsessions: [] };
+  return { facts: [], jokes: [], patterns: [], arcs: [], openLoops: [], obsessions: [], owned: [] };
 }
 
 function emptySocialMemory(): SocialMemory {
@@ -614,13 +627,43 @@ async function getMemory(guildId: string): Promise<ServerMemory> {
       arcs: snap.data()?.arcs ?? [],
       openLoops: snap.data()?.openLoops ?? [],
       obsessions: snap.data()?.obsessions ?? [],
+      owned: (snap.data()?.owned ?? []).filter((x: any) => x?.ownerName && x?.text),
     };
     memCache.set(guildId, { d, ts: Date.now() });
     return d;
   } catch { return emptyServerMemory(); }
 }
 
-async function addFact(guildId: string, fact: string, bucket: keyof ServerMemory = 'facts') {
+async function addOwnedMemory(guildId: string, item: Partial<OwnedMemory>) {
+  if (guildId === 'dm') return;
+  const text = item.text?.trim();
+  const ownerName = item.ownerName?.trim();
+  if (!text || !ownerName || text.length < 5) return;
+  if (/\b(dm|private|address|phone|email|password|token|secret|mod|ban|kick)\b/i.test(text)) return;
+
+  const m = await getMemory(guildId);
+  const owned = [...(m.owned ?? [])];
+  const norm = `${ownerName}:${item.kind ?? 'topic'}:${text}`.toLowerCase();
+  if (owned.some(x => `${x.ownerName}:${x.kind}:${x.text}`.toLowerCase() === norm)) return;
+  owned.push({
+    ownerId: item.ownerId,
+    ownerName,
+    kind: item.kind ?? 'topic',
+    text,
+    updatedAt: new Date().toISOString(),
+  });
+  while (owned.length > 45) owned.shift();
+  memCache.delete(guildId);
+  await db.collection('servers').doc(guildId).collection('memory').doc('global')
+    .set({ owned }, { merge: true }).catch(() => {});
+  console.log(`[OwnedMem:${ownerName}] ${text.slice(0, 60)}`);
+}
+
+function addOwnedMemoryLoose(guildId: string, ownerName: string, text: string, kind: OwnedMemory['kind'], ownerId?: string) {
+  addOwnedMemory(guildId, { ownerId, ownerName, kind, text }).catch(() => {});
+}
+
+async function addFact(guildId: string, fact: string, bucket: ServerMemoryTextBucket = 'facts') {
   if (!fact?.trim() || guildId === 'dm') return;
   const m = await getMemory(guildId);
   if (m[bucket].some(f => f.toLowerCase() === fact.toLowerCase())) return;
@@ -743,6 +786,70 @@ function socialMemoryLines(userMem: SocialMemory, botMem?: SocialMemory): string
   return lines.join('\n');
 }
 
+function ownedMemoryLines(memory: ServerMemory, currentUserId?: string, currentName?: string): string {
+  const owned = (memory.owned ?? []).slice(-24);
+  if (!owned.length) return '';
+
+  const botNames = new Set([BOT_ID, BOT_NAME.toLowerCase(), 'notabot', '[me]']);
+  const score = (x: OwnedMemory) => {
+    const mine = x.ownerId && x.ownerId === currentUserId ? 5 : 0;
+    const bot = (x.ownerId && x.ownerId === BOT_ID) || botNames.has(x.ownerName.toLowerCase()) ? 4 : 0;
+    const name = currentName && x.ownerName.toLowerCase() === currentName.toLowerCase() ? 3 : 0;
+    return mine + bot + name;
+  };
+
+  return owned
+    .sort((a, b) => score(b) - score(a))
+    .slice(0, 8)
+    .map(x => {
+      const owner = (x.ownerId === BOT_ID || x.ownerName.toLowerCase() === BOT_NAME.toLowerCase())
+        ? '[me]'
+        : x.ownerName;
+      return `${owner} owns ${x.kind}: ${x.text}`;
+    })
+    .join('\n');
+}
+
+function pronounHintLine(sender: string, msg: string): string {
+  const directedAtBot = new RegExp(`\\b(you|u|ur|your|yours|youre|you're)\\b|@${BOT_NAME}\\b`, 'i').test(msg);
+  const selfRef = /\b(i|im|i'm|me|my|mine)\b/i.test(msg);
+  const bits: string[] = [];
+  if (directedAtBot) bits.push(`sender's you/ur = [me] (${BOT_NAME})`);
+  if (selfRef) bits.push(`sender's i/me/my = ${sender}`);
+  return bits.length ? bits.join(' | ') : '';
+}
+
+function maybeExtractOwnedMemory(guildId: string, msg: STMsg) {
+  if (guildId === 'dm') return;
+  const text = msg.content.trim();
+  if (!text || text.length > 180) return;
+
+  const lower = text.toLowerCase();
+  const botMentioned = lower.includes(`@${BOT_NAME.toLowerCase()}`) || /\b(you|u|ur|your|youre|you're)\b/i.test(text);
+  const selfRef = /\b(i|im|i'm|me|my|mine)\b/i.test(text);
+  let ownerId = selfRef ? msg.authorId : undefined;
+  let ownerName = selfRef ? msg.author : '';
+
+  if (botMentioned && /\b(you|u|ur|your|youre|you're)\b/i.test(text)) {
+    ownerId = BOT_ID;
+    ownerName = BOT_NAME;
+  }
+  if (!ownerName) return;
+
+  let kind: OwnedMemory['kind'] | undefined;
+  if (/\b(still|again|always|keeps?|loop|arc|obsessed|addicted|can't stop|cant stop)\b/i.test(text)) kind = 'habit';
+  if (/\b(like|love|hate|think|opinion|favorite|favourite)\b/i.test(text)) kind = kind ?? 'opinion';
+  if (/\b(joke|bit|meme|running bit)\b/i.test(text)) kind = kind ?? 'joke';
+  if (/\b(unresolved|unfinished|ongoing|update|what happened|did .* happen|exam|project|investigation|arc)\b/i.test(text)) kind = kind ?? 'openLoop';
+  if (!kind) return;
+
+  const cleaned = text
+    .replace(new RegExp(`@${BOT_NAME}`, 'ig'), 'you')
+    .replace(/\s+/g, ' ')
+    .slice(0, 120);
+  addOwnedMemoryLoose(guildId, ownerName, cleaned, kind, ownerId);
+}
+
 function personContext(name: string, member: MemberData): string {
   const lines: string[] = [];
   if (member.personality) lines.push(`${name}: ${member.personality}`);
@@ -825,6 +932,8 @@ async function brain(opts: {
   thread?:         string;
   memCtx:          string;
   socialCtx?:      string;
+  peopleCtx?:      string;
+  pronounHint?:    string;
   sessionSummary?: string;
   clock?:          string;
   vibe?:           SocialMood | null;
@@ -854,8 +963,10 @@ async function brain(opts: {
 
   if (opts.memCtx)          parts.push(`\nCONTEXT:\n${opts.memCtx.slice(0, MAX_MEM_CHARS)}`);
   if (opts.socialCtx)       parts.push(`\nSOCIAL MEMORY (filtered impressions only):\n${opts.socialCtx.slice(0, MAX_MEM_CHARS)}\nRULES: ${SOCIAL_MEMORY_RULES}`);
+  if (opts.peopleCtx)       parts.push(`\nPEOPLE / OWNERSHIP:\n${opts.peopleCtx.slice(0, MAX_PEOPLE_CTX_CHARS)}`);
   if (opts.sessionSummary)  parts.push(`\nSESSION (earlier today):\n${opts.sessionSummary.slice(0, MAX_SUMMARY_CHARS)}`);
   if (opts.clock)           parts.push(`\nCLOCK: ${opts.clock}`);
+  if (opts.pronounHint)     parts.push(`\nPRONOUN MAP: ${opts.pronounHint}`);
   if (opts.thread)          parts.push(`\nREPLY TO:\n${opts.thread}`);
   parts.push(`\nCHAT:\n${opts.transcript}`);
 
@@ -928,6 +1039,43 @@ function fireSideEffects(opts: {
   if (opts.newFact) {
     addFact(opts.guildId, opts.newFact).catch(() => {});
   }
+}
+
+function wantsToolAnswer(content: string): boolean {
+  return /\b(what time|time is it|current time|last seen|seen me before|have u seen me|have you seen me|how long ago|who was online|who'?s online|online rn)\b/i.test(content);
+}
+
+async function answerToolQuestion(msg: Message, content: string, guildId: string, sender: string): Promise<boolean> {
+  if (!wantsToolAnswer(content)) return false;
+  const lower = content.toLowerCase();
+  let answer = '';
+
+  if (/\b(what time|time is it|current time)\b/i.test(lower)) {
+    answer = `${new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}. suspicious hour behavior`;
+  } else if (/\b(last seen|seen me before|have u seen me|have you seen me|how long ago)\b/i.test(lower)) {
+    const target = msg.mentions.users.first();
+    const uid = target?.id || msg.author.id;
+    const m = await getMember(guildId, uid);
+    const name = target ? (idCache.get(uid) || target.username) : sender;
+    if (m.lastSeenAt) {
+      answer = `${name}: last seen ${humanDuration(Date.now() - Date.parse(m.lastSeenAt))}. ${m.seenCount ?? 1} sightings, allegedly`;
+    } else {
+      answer = `${name}: i dont have a clean sighting yet`;
+    }
+  } else if (/\b(who was online|who'?s online|online rn)\b/i.test(lower)) {
+    const members = msg.guild?.members.cache
+      .filter(m => !m.user.bot && m.presence?.status && m.presence.status !== 'offline')
+      .map(m => m.displayName)
+      .slice(0, 8) ?? [];
+    answer = members.length
+      ? `online rn: ${members.join(', ')}. witnesses assembled`
+      : `i cant see anyone online rn`;
+  }
+
+  if (!answer) return false;
+  await msg.reply({ content: answer.slice(0, 200), allowedMentions: { repliedUser: false } });
+  stmPush(msg.channelId, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: answer.slice(0, 100) });
+  return true;
 }
 
 // ── BACKGROUND JOBS ──────────────────────────────────────────────
@@ -1009,7 +1157,7 @@ async function runCompress(guildId: string, channelId: string) {
     const stmText = msgs.map(m => `${m.author}: ${m.content}`).join('\n').slice(0, 1200);
     try {
       const raw = await cerebras.call([
-        { role: 'system', content: 'extract only memorable, non-sensitive discord memory. bias toward people, patterns, unresolved stories, funny failures, recurring jokes, and harmless running bits. no exact private quotes. ONLY valid JSON: {"facts":["x"],"jokes":["x"],"patterns":["x"],"arcs":["x"],"openLoops":["x"],"obsessions":["x"],"relationships":[{"user":"name","note":"x"}],"reputation":["x"]}' },
+        { role: 'system', content: 'extract only memorable, non-sensitive discord memory. bias toward people, owner-tagged traits, patterns, unresolved stories, funny failures, recurring jokes, and harmless running bits. no exact private quotes. ONLY valid JSON: {"facts":["x"],"jokes":["x"],"patterns":["x"],"arcs":["x"],"openLoops":["x"],"obsessions":["x"],"owned":[{"owner":"name or NotABot","kind":"trait|joke|opinion|habit|topic|openLoop|relationship|botBit","text":"x"}],"relationships":[{"user":"name","note":"x"}],"reputation":["x"]}' },
         { role: 'user',   content: stmText },
       ], 0.45, 180, FAST_MODEL);
       const jsonMatch = raw.match(/\{[\s\S]*\}/);
@@ -1035,6 +1183,22 @@ async function runCompress(guildId: string, channelId: string) {
       }
       for (const x of (p.jokes || []).slice(0, 2)) await addSocialMemory('jokes', x);
       for (const x of (p.reputation || []).slice(0, 2)) await addSocialMemory('reputation', x);
+      for (const x of (p.owned || []).slice(0, 5)) {
+        if (!x?.owner || !x?.text) continue;
+        const owner = String(x.owner);
+        const uid = owner.toLowerCase() === BOT_NAME.toLowerCase() || owner.toLowerCase() === 'notabot'
+          ? BOT_ID
+          : [...idCache.entries()].find(([, name]) => name.toLowerCase() === owner.toLowerCase())?.[0];
+        const kind = String(x.kind);
+        await addOwnedMemory(guildId, {
+          ownerId: uid,
+          ownerName: uid === BOT_ID ? BOT_NAME : owner,
+          kind: ['trait', 'joke', 'opinion', 'habit', 'topic', 'openLoop', 'relationship', 'botBit'].includes(kind)
+            ? kind as OwnedMemory['kind']
+            : 'topic',
+          text: String(x.text),
+        });
+      }
       for (const r of (p.relationships || []).slice(0, 3)) {
         if (!r?.user || !r?.note) continue;
         const uid = [...idCache.entries()].find(([, name]) => name.toLowerCase() === String(r.user).toLowerCase())?.[0];
@@ -1217,6 +1381,8 @@ async function respondToDM(msg: Message) {
     getSocialMemory(msg.author.id),
     Math.random() < GLOBAL_SOCIAL_MEMORY_CHANCE ? getSocialMemory() : Promise.resolve(emptySocialMemory()),
   ]);
+  const peopleCtx = ownedMemoryLines(emptyServerMemory(), msg.author.id, sender);
+  const pronounHint = pronounHintLine(sender, content);
 
   lastBrainCallAt = Date.now();
   const decision = await brain({
@@ -1227,6 +1393,8 @@ async function respondToDM(msg: Message) {
     thread:       threadCtx,
     memCtx:       '',
     socialCtx:    socialMemoryLines(userSocial, botSocial),
+    peopleCtx,
+    pronounHint,
     mentioned:    true,
     isDM:         true,
     mood:         { mode: 'active', count: 0 },
@@ -1297,6 +1465,14 @@ async function handleMessage(msg: Message) {
       author:   msg.author.id === BOT_ID ? '[me]' : sender,
       content:  content.length > 100 ? content.slice(0, 97) + '…' : content,
     });
+    maybeExtractOwnedMemory(guildId, {
+      ts: msg.createdTimestamp,
+      authorId: msg.author.id,
+      author: sender,
+      content,
+    });
+
+    if (mentioned && await answerToolQuestion(msg, content, guildId, sender)) return;
 
     maybeNoteBehaviorPattern(msg.author.id, channelId);
     tickUnread(channelId);
@@ -1362,6 +1538,8 @@ async function handleMessage(msg: Message) {
           return;
         }
 
+        if (await answerToolQuestion(tMsg, tContent, tGuild, tSender)) return;
+
         // Seed STM if empty
         if (!stmStore.has(tChannel)) {
           try {
@@ -1402,6 +1580,8 @@ async function handleMessage(msg: Message) {
         if (memory.facts.length)        memLines.push(`facts: ${memory.facts.slice(-2).join(' | ')}`);
         const memCtx = memLines.join('\n');
         const socialCtx = socialMemoryLines(userSocial, botSocial);
+        const peopleCtx = ownedMemoryLines(memory, tMsg.author.id, tSender);
+        const pronounHint = pronounHintLine(tSender, tContent);
 
         const mood = getMood(tChannel);
         const vibe = maybeRollSocialMood(tChannel);
@@ -1432,8 +1612,10 @@ async function handleMessage(msg: Message) {
           thread:         threadCtx,
           memCtx,
           socialCtx,
+          peopleCtx,
           sessionSummary,
           clock,
+          pronounHint,
           vibe,
           mentioned:      tMentioned,
           isDM:           false,
@@ -1512,6 +1694,7 @@ export async function startBot(token: string) {
       GatewayIntentBits.DirectMessageTyping,
       GatewayIntentBits.MessageContent,
       GatewayIntentBits.GuildMembers,
+      GatewayIntentBits.GuildPresences,
     ],
     partials: [Partials.Message, Partials.Channel, Partials.User],
     // Partials.Channel is required for DM messageCreate events to fire at all.
@@ -1677,7 +1860,8 @@ export async function startBot(token: string) {
       const m = await getMemory(guildId);
       await msg.reply(
         `facts (${m.facts.length}): ${m.facts.slice(-5).join(' | ') || 'none'}\n` +
-        `jokes (${m.jokes.length}): ${m.jokes.slice(-3).join(' | ') || 'none'}`
+        `jokes (${m.jokes.length}): ${m.jokes.slice(-3).join(' | ') || 'none'}\n` +
+        `owned (${m.owned?.length ?? 0}): ${(m.owned ?? []).slice(-5).map(x => `${x.ownerName}/${x.kind}: ${x.text}`).join(' | ') || 'none'}`
       );
     }
     if (c.startsWith('!remember ')) {
