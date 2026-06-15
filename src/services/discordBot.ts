@@ -179,6 +179,21 @@ const cerebras = new CerebrasManager();
 
 const MAX_TRANSCRIPT_CHARS = 1800;  // ≈ 450 tokens
 const MAX_MEM_CHARS        = 400;   // ≈ 100 tokens
+const MAX_SUMMARY_CHARS    = 300;   // ≈ 75 tokens — compressed session context
+
+// ── SESSION BUFFER (mid-term memory) ─────────────────────────────
+// Holds up to 60 msgs per channel. STM (12) = what the bot sees raw.
+// Session buffer feeds the compress job to build a running summary.
+const SESSION_BUFFER_MAX  = 60;
+const sessionBuffers       = new Map<string, string[]>();
+const sessionSummaries     = new Map<string, string>();
+
+function sessionBufferPush(channelId: string, line: string) {
+  if (!sessionBuffers.has(channelId)) sessionBuffers.set(channelId, []);
+  const arr = sessionBuffers.get(channelId)!;
+  arr.push(line);
+  if (arr.length > SESSION_BUFFER_MAX) arr.shift();
+}
 
 // ── CONSTANTS ────────────────────────────────────────────────────
 const DEBOUNCE_MS        = 4000;
@@ -279,8 +294,9 @@ function resolveMentions(text: string): string {
 }
 
 function cleanContent(raw: string): string {
-  const stripped = BOT_ID ? raw.replace(new RegExp(`<@!?${BOT_ID}>`, 'g'), '') : raw;
-  return resolveMentions(stripped).trim();
+  // Keep @NotABot visible in content — model needs to see it was addressed.
+  // resolveMentions already converts <@BOT_ID> → @NotABot, others → @Name.
+  return resolveMentions(raw).trim();
 }
 
 // ── SHORT-TERM MEMORY ────────────────────────────────────────────
@@ -298,6 +314,8 @@ function stmPush(channelId: string, m: STMsg) {
   const arr = stmStore.get(channelId)!;
   arr.push(m);
   if (arr.length > STM_MAX) arr.shift();
+  // Also feed session buffer for mid-term summary
+  sessionBufferPush(channelId, `${m.author}: ${m.content}`);
 }
 
 function stmGet(channelId: string): STMsg[] { return stmStore.get(channelId) ?? []; }
@@ -330,7 +348,7 @@ function seedSTM(channelId: string, msgs: Message[]) {
     ts:       m.createdTimestamp,
     authorId: m.author.id,
     author:   m.author.id === BOT_ID ? '[me]' : (m.member?.displayName || m.author.username),
-    content:  cleanContent(m.content).slice(0, 100),
+    content:  (() => { const c = cleanContent(m.content); return c.length > 100 ? c.slice(0, 97) + '…' : c; })(),
   })));
 }
 
@@ -524,6 +542,9 @@ async function updateBond(guildId: string, userId: string, delta: number) {
 // Keep this under ~350 tokens — don't bloat it or caching gets less effective.
 
 const SYSTEM_PROMPT = `you are ${BOT_NAME}. gen z. live in this discord as a person, not an assistant. dry humor, occasionally unhinged. you roast people you're fond of. not obligated to respond to everything — and often don't.
+in transcripts, [me] = you (your own past messages).
+if the message is directed at you, it may have pronouns: "ur", "you", "your" directed at you = about you. "my", "I", "me" from sender = about them.
+conversation ending: if context says ending_convo, reply once casually or ignore — never keep pulling them back.
 
 texting rules (break these = instant bot detection):
 - always lowercase. caps only for ACTUAL emphasis.
@@ -550,35 +571,47 @@ interface BrainDecision {
 }
 
 async function brain(opts: {
-  sender:     string;
-  bond:       number;
-  message:    string;
-  transcript: string;
-  thread?:    string;
-  memCtx:     string;
-  mentioned:  boolean;
-  isDM:       boolean;
-  mood:       Mood;
-  speakState: SpeakState;
-  inExchange: boolean;
+  sender:          string;
+  bond:            number;
+  message:         string;
+  transcript:      string;
+  thread?:         string;
+  memCtx:          string;
+  sessionSummary?: string;
+  mentioned:       boolean;
+  isDM:            boolean;
+  mood:            Mood;
+  speakState:      SpeakState;
+  inExchange:      boolean;
+  channelName:     string;
+  everyonePing:    boolean;
+  endingConvo:     boolean;
 }): Promise<BrainDecision> {
 
   const bondLabel = opts.bond > 70 ? 'close' : opts.bond > 40 ? 'neutral' : 'distant';
+  // Fix NaN: opts.mood.until may be undefined (passive or DM)
   const moodLine  = opts.mood.mode === 'active'
-    ? `active (${Math.round(((opts.mood.until || 0) - Date.now()) / 60_000)}m left)`
-    : `passive`;
+    ? opts.mood.until
+      ? `active (${Math.round((opts.mood.until - Date.now()) / 60_000)}m left)`
+      : 'active'
+    : 'passive';
 
   // Dynamic part — only this burns tokens (system prompt is cached)
-  const parts: string[] = [`mood: ${moodLine} | speak: ${opts.speakState.mode}`];
+  const parts: string[] = [
+    `mood: ${moodLine} | speak: ${opts.speakState.mode} | channel: #${opts.channelName}`,
+  ];
 
-  if (opts.memCtx) parts.push(`\nCONTEXT:\n${opts.memCtx.slice(0, MAX_MEM_CHARS)}`);
-  if (opts.thread) parts.push(`\nREPLY TO:\n${opts.thread}`);
+  if (opts.memCtx)          parts.push(`\nCONTEXT:\n${opts.memCtx.slice(0, MAX_MEM_CHARS)}`);
+  if (opts.sessionSummary)  parts.push(`\nSESSION (earlier today):\n${opts.sessionSummary.slice(0, MAX_SUMMARY_CHARS)}`);
+  if (opts.thread)          parts.push(`\nREPLY TO:\n${opts.thread}`);
   parts.push(`\nCHAT:\n${opts.transcript}`);
 
   const flags: string[] = [];
-  if (opts.mentioned)  flags.push('pinged you directly');
-  if (opts.inExchange) flags.push('mid back-and-forth with this person');
-  if (opts.isDM)       flags.push('DM — just you two');
+  if (opts.mentioned)    flags.push('pinged you directly');
+  if (opts.inExchange)   flags.push('mid back-and-forth with this person');
+  if (opts.isDM)         flags.push('DM — just you two');
+  if (opts.everyonePing) flags.push('@everyone ping — server-wide announcement');
+  if (opts.endingConvo)  flags.push('ending_convo — they seem to be wrapping up');
 
   parts.push(
     `\nTRIGGER — ${opts.sender} (${bondLabel}, bond ${opts.bond}/100):\n"${opts.message}"`,
@@ -713,12 +746,12 @@ async function runCompress(guildId: string, channelId: string) {
   lastCompress = Date.now();
 
   await withBgBudget(async () => {
-    // Trim to avoid blowing context window
-    const text = msgs.map(m => `${m.author}: ${m.content}`).join('\n').slice(0, 1200);
+    // STM (12 msgs) for facts/jokes
+    const stmText = msgs.map(m => `${m.author}: ${m.content}`).join('\n').slice(0, 1200);
     try {
       const raw = await cerebras.call([
         { role: 'system', content: 'extract memorable facts and inside jokes. ONLY valid JSON: {"facts":["x"],"jokes":["x"]}' },
-        { role: 'user',   content: text },
+        { role: 'user',   content: stmText },
       ], 0.4, 120, FAST_MODEL);
       const jsonMatch = raw.match(/\{[\s\S]*\}/);
       if (!jsonMatch) return;
@@ -726,6 +759,25 @@ async function runCompress(guildId: string, channelId: string) {
       for (const f of (p.facts || []).slice(0, 4)) await addFact(guildId, f, 'facts');
       for (const j of (p.jokes || []).slice(0, 2)) await addFact(guildId, j, 'jokes');
       console.log(`[Compress] +${p.facts?.length || 0} facts +${p.jokes?.length || 0} jokes`);
+    } catch {}
+
+    // Session buffer (up to 60 msgs) → running summary for mid-term memory
+    const buf = sessionBuffers.get(channelId);
+    if (!buf || buf.length < 10) return;
+    if (!cerebras.canCall(EST_BG_TOKENS)) return;
+    const bufText = buf.join('\n').slice(-2000); // last ~2000 chars
+    try {
+      const raw2 = await cerebras.call([
+        { role: 'system', content: 'summarize this discord chat in 2-3 sentences: main topics, who said what, mood/vibe. be concise, no fluff. output ONLY: {"s":"..."}' },
+        { role: 'user',   content: bufText },
+      ], 0.3, 80, FAST_MODEL);
+      const m2 = raw2.match(/\{[\s\S]*\}/);
+      if (!m2) return;
+      const p2 = JSON.parse(m2[0]);
+      if (p2.s?.trim()) {
+        sessionSummaries.set(channelId, p2.s.trim().slice(0, MAX_SUMMARY_CHARS));
+        console.log(`[Compress] session summary updated for #${channelId.slice(-5)}`);
+      }
     } catch {}
   });
 }
@@ -752,6 +804,14 @@ async function runProactive(client: Client) {
     if (!candidates.length) return;
 
     const pick = candidates[Math.floor(Math.random() * Math.min(candidates.length, 5))];
+
+    // Don't casually break silence if the last message had a heavy tone
+    const sensitiveWords = /\b(sorry|rip|died?|passed?|grief|depress|sad|hurt|cry|miss(ing)?|loss|trauma|broke up|suicide|cutting|abuse)\b/i;
+    if (sensitiveWords.test(pick.hint)) {
+      console.log(`[Proactive] skipped — sensitive topic detected in last message`);
+      return;
+    }
+
     const ch   = client.channels.cache.get(pick.id) as TextChannel | undefined;
     if (!ch?.isTextBased()) return;
 
@@ -778,13 +838,18 @@ async function runProactive(client: Client) {
 // ── MAIN MESSAGE HANDLER ─────────────────────────────────────────
 const debounceTimers  = new Map<string, NodeJS.Timeout>();
 const pendingTriggers = new Map<string, {
-  msg:       Message;
-  mentioned: boolean;
-  isDM:      boolean;
-  guildId:   string;
+  msg:          Message;
+  mentioned:    boolean;
+  isDM:         boolean;
+  guildId:      string;
+  everyonePing: boolean;
 }>();
 
 async function handleMessage(msg: Message) {
+  // DMs arrive as partials — content is empty until fetched. This is why DMs silently fail.
+  if (msg.partial) {
+    try { msg = await msg.fetch(); } catch { return; }
+  }
   if (msg.author.bot || !msg.content?.trim()) return;
 
   try {
@@ -810,7 +875,7 @@ async function handleMessage(msg: Message) {
       ts:       msg.createdTimestamp,
       authorId: msg.author.id,
       author:   msg.author.id === BOT_ID ? '[me]' : sender,
-      content:  content.slice(0, 100),
+      content:  content.length > 100 ? content.slice(0, 97) + '…' : content,
     });
 
     // DMs bypass focus — always in your DMs
@@ -835,7 +900,15 @@ async function handleMessage(msg: Message) {
       return;
     }
 
-    pendingTriggers.set(channelId, { msg, mentioned, isDM, guildId });
+    // Accumulate mention across burst — if msg 1 pinged us and msg 2 didn't,
+    // we still know we were originally pinged.
+    const prevTrigger = pendingTriggers.get(channelId);
+    const effectiveMentioned = mentioned || (prevTrigger?.mentioned ?? false);
+
+    // @everyone/@here: flag it for context, not a full mention
+    const everyonePing = !isDM && (msg.mentions.everyone ?? false);
+
+    pendingTriggers.set(channelId, { msg, mentioned: effectiveMentioned, isDM, guildId, everyonePing: everyonePing || (prevTrigger?.everyonePing ?? false) });
     if (debounceTimers.has(channelId)) clearTimeout(debounceTimers.get(channelId)!);
 
     // Mentions/DMs get a snappy response; passive triggers wait for burst to settle
@@ -847,11 +920,12 @@ async function handleMessage(msg: Message) {
       pendingTriggers.delete(channelId);
       if (!trigger) return;
 
-      const { msg: tMsg, mentioned: tMentioned, isDM: tDM, guildId: tGuild } = trigger;
-      const tChannel = tMsg.channelId;
-      const tSender  = tMsg.member?.displayName || tMsg.author.username;
-      const tContent = cleanContent(tMsg.content);
-      const tIsGuild = !tDM && !!tMsg.guildId;
+      const { msg: tMsg, mentioned: tMentioned, isDM: tDM, guildId: tGuild, everyonePing: tEveryonePing } = trigger;
+      const tChannel     = tMsg.channelId;
+      const tSender      = tMsg.member?.displayName || tMsg.author.username;
+      const tContent     = cleanContent(tMsg.content);
+      const tIsGuild     = !tDM && !!tMsg.guildId;
+      const tChannelName = tDM ? 'DM' : ((tMsg.channel as any).name ?? 'unknown');
 
       try {
         // Check speak state — DMs always bypass
@@ -906,24 +980,36 @@ async function handleMessage(msg: Message) {
           : await getSpeakState(tChannel, tGuild);
 
         // Detect if we're mid back-and-forth with this person
-        const recentMsgs    = stmGet(tChannel).slice(-6);
+        const recentMsgs    = stmGet(tChannel).slice(-8);  // wider window
         const botReplied    = recentMsgs.some(m => m.authorId === BOT_ID);
         const senderRecent  = recentMsgs.filter(m => m.authorId === tMsg.author.id).length;
         const inExchange    = botReplied && senderRecent >= 2;
 
+        // Detect conversation-ending intent — if they're wrapping up with the bot,
+        // pass the flag so the model can reply once and not drag it out.
+        const END_PHRASES = /\b(bye|cya|gotta go|gtg|see ya|later|peace|good night|gn|logging off|ttyl|im out|i\s*m\s*out)\b/i;
+        const endingConvo = END_PHRASES.test(tContent);
+
+        // Session summary from mid-term buffer
+        const sessionSummary = sessionSummaries.get(tChannel);
+
         lastBrainCallAt = Date.now();
         const decision  = await brain({
-          sender:     tSender,
+          sender:         tSender,
           bond,
-          message:    tContent,
-          transcript: stmFormat(stmGet(tChannel)),
-          thread:     threadCtx,
+          message:        tContent,
+          transcript:     stmFormat(stmGet(tChannel)),
+          thread:         threadCtx,
           memCtx,
-          mentioned:  tMentioned,
-          isDM:       tDM,
+          sessionSummary,
+          mentioned:      tMentioned,
+          isDM:           tDM,
           mood,
           speakState,
           inExchange,
+          channelName:    tChannelName,
+          everyonePing:   tEveryonePing,
+          endingConvo,
         });
 
         console.log(`[Brain] ${tSender}${tDM ? ' DM' : ''}: ${decision.action}${decision.reply ? ` — "${decision.reply.slice(0, 50)}"` : decision.reaction ? ` — ${decision.reaction}` : ''}`);
@@ -944,7 +1030,11 @@ async function handleMessage(msg: Message) {
 
           fireSideEffects({ guildId: tGuild, userId: tMsg.author.id, action: 'speak' });
 
-          if (!tDM && speakState.mode !== 'active') {
+          // If person was ending the convo, go passive after this reply — don't linger
+          if (!tDM && endingConvo) {
+            console.log(`[Mood] ${tSender} ending convo → passive`);
+            goPassive(tChannel);
+          } else if (!tDM && speakState.mode !== 'active') {
             setSpeakState(tChannel, tGuild, { mode: 'active', reason: 'spoke' }).catch(() => {});
           }
 
@@ -1011,6 +1101,24 @@ export async function startBot(token: string) {
         }
         console.log(`[Boot] synced ${members.size} members — "${g.name}"`);
       }
+
+      // Also warm idCache from Firebase — covers past members who've left the server.
+      // This ensures @mentions of ex-members resolve to names instead of "@someone".
+      try {
+        const pastMembersSnap = await db
+          .collection('servers').doc(g.id)
+          .collection('members').get();
+        let warmed = 0;
+        for (const doc of pastMembersSnap.docs) {
+          const d = doc.data() as MemberData;
+          const name = d.displayName || d.username;
+          if (name && !idCache.has(doc.id)) {
+            cacheId(doc.id, name);
+            warmed++;
+          }
+        }
+        if (warmed) console.log(`[Boot] warmed ${warmed} past members from Firebase — "${g.name}"`);
+      } catch {}
     }
 
     // Delay first profiler run — avoids burning tokens immediately on boot.
