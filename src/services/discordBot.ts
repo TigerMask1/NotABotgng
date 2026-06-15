@@ -1390,6 +1390,11 @@ export async function startBot(token: string) {
     if (c === '!budget') {
       await msg.reply(cerebras.status());
     }
+
+    if (c === 'tiki waka wiki') {
+      const dm = await msg.author.createDM().catch(() => null);
+      if (dm) await dm.send('wiki waka tiki').catch(() => {});
+    }
   });
 
   await botClient.login(token);
