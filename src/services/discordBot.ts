@@ -978,6 +978,7 @@ const pendingTriggers = new Map<string, {
 }>();
 
 async function handleMessage(msg: Message) {
+  console.log(`[DEBUG] Event fired! DM? ${msg.channel?.isDMBased()} | Author: ${msg.author?.username} | Content: "${msg.content}"`);
   // Partials — content is empty until fetched.
   if (msg.partial) {
     try { msg = await msg.fetch(); } catch { return; }
