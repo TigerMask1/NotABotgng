@@ -633,7 +633,9 @@ async function respondToDM(msg: Message) {
     const typingMs = Math.min(300 + text.length * 20, 2800);
     try { await msg.channel.sendTyping(); } catch {}
     await sleep(typingMs);
-    await msg.reply({ content: text, allowedMentions: { repliedUser: false } });
+    // Use channel.send() instead of msg.reply() — more reliable for DMs
+    // where the message object might be partial or the reference broken.
+    await msg.channel.send(text);
     stmPush(channelId, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
     console.log(`[DM sent] to ${sender}: "${text.slice(0, 80)}"`);
   }
@@ -832,34 +834,42 @@ export async function startBot(token: string) {
   });
 
   // ── THE ONLY MessageCreate HANDLER ────────────────────────────
-  // Split into DM vs guild at the very top, after partial fetch.
-  // No dual-handler, no racing, no silent drops.
   botClient.on(Events.MessageCreate, async (msg: Message) => {
-    // STEP 1: always fetch partials first — DM messages arrive with empty content
+    // STEP 1: fetch partials — but DM channels can't be fetched via msg.fetch()
+    // in some discord.js v14 builds (DMChannel#recipientId missing on partials).
+    // So we route FIRST, then fetch only for guild messages where it's safe.
     if (msg.partial) {
-      try { msg = await msg.fetch(); }
-      catch (e) { console.error('[MessageCreate] partial fetch failed:', e); return; }
+      // Try to determine if this is a DM before fetching
+      // guildId is always null for DMs even on partials
+      const looksLikeDM = !msg.guildId;
+
+      if (!looksLikeDM) {
+        // Guild message partial — safe to fetch
+        try { msg = await msg.fetch(); }
+        catch (e) { console.error('[MessageCreate] guild partial fetch failed:', e); return; }
+      } else {
+        // DM partial — msg.fetch() internally calls DMChannel.fetch() which is broken.
+        // The gateway sends full content for DM MessageCreate events so this is rare,
+        // but if we hit it, we'll just fall through with whatever data we have.
+        console.warn('[MessageCreate] DM partial detected — proceeding without fetch');
+      }
     }
 
-    // STEP 2: ignore bots (after fetch so author is populated)
+    // STEP 2: ignore bots
     if (!msg.author || msg.author.bot) return;
 
-    // STEP 3: route — guildId is the ground truth
-    // isDMBased() can be unreliable on uncached partial channels
     const isDM = !msg.guildId;
 
     console.log(`[MSG] from:${msg.author.username} guild:${msg.guildId ?? 'DM'} isDM:${isDM} content:"${msg.content?.slice(0, 40)}"`);
 
     if (isDM) {
-      // Extra safety: ensure content is populated after partial fetch
       if (!msg.content?.trim()) {
-        console.log('[DM] empty content after fetch — skipping');
+        console.log('[DM] empty content — skipping');
         return;
       }
       return handleDirectMessage(msg);
     }
 
-    // Guild message
     if (!msg.content?.trim()) return;
     return handleGuildMessage(msg);
   });
@@ -925,6 +935,14 @@ export async function startBot(token: string) {
     cacheId(m.id, m.displayName);
     await upsertMember(m.guild.id, m.id, { displayName: m.displayName });
   });
+
+  // Catch any errors emitted by the Discord.js client itself
+  botClient.on('error', (e) => console.error('[Client error]', e));
+  botClient.on('warn',  (w) => console.warn('[Client warn]', w));
+
+  // Catch async errors thrown inside event listeners that aren't caught
+  process.on('unhandledRejection', (reason) => console.error('[UnhandledRejection]', reason));
+  process.on('uncaughtException',  (err)    => console.error('[UncaughtException]', err));
 
   await botClient.login(token);
 }
