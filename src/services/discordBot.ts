@@ -978,6 +978,11 @@ const pendingTriggers = new Map<string, {
 }>();
 
 async function handleMessage(msg: Message) {
+  // RAW DEBUG — remove after DM issue is confirmed fixed
+  if (msg.channel.isDMBased()) {
+    console.log(`[DM-RAW] from ${msg.author?.username} | partial:${msg.partial} | content:"${msg.content?.slice(0, 50)}"`);
+  }
+
   // Partials — content is empty until fetched.
   if (msg.partial) {
     try { msg = await msg.fetch(); } catch { return; }
