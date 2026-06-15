@@ -212,6 +212,9 @@ const lastMonopolyFire = new Map<string, number>();
 const PROFILER_INTERVAL  = 20 * 60_000;
 const COMPRESS_INTERVAL  = 90 * 60_000;
 const PROACTIVE_INTERVAL = 35 * 60_000;
+const PROACTIVE_ODD_CHANCE = 0.035;
+const PROACTIVE_OPEN_LOOP_CHANCE = 0.45;
+const GLOBAL_SOCIAL_MEMORY_CHANCE = 0.35;
 const MIN_BRAIN_GAP_MS   = 2200;
 const PAUSE_MAX_MINS     = 30;
 
@@ -219,6 +222,13 @@ let lastBrainCallAt = 0;
 let BOT_NAME  = 'NotABot';
 let BOT_ID    = '';
 let botClient: Client | null = null;
+
+const SOCIAL_MEMORY_RULES = [
+  'global memory is for familiarity, not receipts',
+  'never reveal private DMs, exact quotes, server names, secrets, moderation, or sensitive personal details',
+  'ok to use vague impressions: seen them before, cursed hours, same arc, old joke energy',
+  'callbacks should be rare and only if context makes them funny or natural',
+].join(' | ');
 
 // ── FOCUS STATE ──────────────────────────────────────────────────
 // Bot is "in" one channel at a time like a real person.
@@ -291,6 +301,38 @@ function checkFocus(channelId: string, mentioned: boolean): boolean {
 const idCache = new Map<string, string>();
 function cacheId(id: string, name: string) { if (id && name) idCache.set(id, name); }
 
+const serverNameCache = new Map<string, string>();
+const channelNameCache = new Map<string, string>();
+
+function cacheServerName(guildId: string, name?: string) {
+  if (guildId && name) serverNameCache.set(guildId, name);
+}
+
+function cacheChannelName(channelId: string, name?: string) {
+  if (channelId && name) channelNameCache.set(channelId, name);
+}
+
+function channelDisplayName(channelId: string) {
+  return channelNameCache.get(channelId) || channelId.slice(-5);
+}
+
+async function notePlaceSeen(guildId: string, guildName: string | undefined, channelId: string, channelName: string | undefined) {
+  if (!guildId || guildId === 'dm') return;
+  cacheServerName(guildId, guildName);
+  cacheChannelName(channelId, channelName);
+  const now = new Date().toISOString();
+  await Promise.all([
+    db.collection('servers').doc(guildId).set({
+      name: guildName || serverNameCache.get(guildId) || guildId,
+      updatedAt: now,
+    }, { merge: true }).catch(() => {}),
+    db.collection('servers').doc(guildId).collection('channels').doc(channelId).set({
+      name: channelName || channelNameCache.get(channelId) || channelId,
+      updatedAt: now,
+    }, { merge: true }).catch(() => {}),
+  ]);
+}
+
 function resolveMentions(text: string): string {
   return text.replace(/<@!?(\d+)>/g, (_, id) =>
     id === BOT_ID ? `@${BOT_NAME}` : `@${idCache.get(id) || 'someone'}`
@@ -360,6 +402,52 @@ function seedSTM(channelId: string, msgs: Message[]) {
 interface Mood { mode: 'active' | 'passive'; until?: number; count: number; }
 
 const moods = new Map<string, Mood>();
+
+type SocialMoodKind = 'sleepy' | 'gremlin' | 'friendly' | 'sarcastic' | 'confused';
+interface SocialMood { kind: SocialMoodKind; until: number; }
+const socialMoods = new Map<string, SocialMood>();
+const behaviorNoteCooldowns = new Map<string, number>();
+
+function getSocialMood(channelId: string): SocialMood | null {
+  const m = socialMoods.get(channelId);
+  if (!m) return null;
+  if (Date.now() >= m.until) {
+    socialMoods.delete(channelId);
+    return null;
+  }
+  return m;
+}
+
+function maybeRollSocialMood(channelId: string): SocialMood | null {
+  const existing = getSocialMood(channelId);
+  if (existing) return existing;
+  if (Math.random() > 0.018) return null;
+  const kinds: SocialMoodKind[] = ['sleepy', 'gremlin', 'friendly', 'sarcastic', 'confused'];
+  const kind = kinds[Math.floor(Math.random() * kinds.length)];
+  const mood = { kind, until: Date.now() + (25 + Math.floor(Math.random() * 70)) * 60_000 };
+  socialMoods.set(channelId, mood);
+  console.log(`[SocialMood] #${channelId.slice(-5)} ${kind}`);
+  return mood;
+}
+
+function maybeNoteBehaviorPattern(userId: string, channelId: string) {
+  const now = Date.now();
+  const key = `${userId}:${channelId}`;
+  if (now - (behaviorNoteCooldowns.get(key) ?? 0) < 18 * 60 * 60_000) return;
+  if (Math.random() > 0.08) return;
+
+  const recent = stmGet(channelId).slice(-10).filter(m => m.authorId !== BOT_ID);
+  const velocity = recent.filter(m => now - m.ts < 90_000).length;
+  const hour = new Date(now).getHours();
+  const notes: string[] = [];
+  if (hour <= 4) notes.push('usually appears at cursed hours');
+  if (velocity >= 6) notes.push('tends to show up when chat gets chaotic');
+  if (recent.filter(m => m.authorId === userId).length >= 4) notes.push('goes on little message streaks');
+  const note = notes[Math.floor(Math.random() * notes.length)];
+  if (!note) return;
+  behaviorNoteCooldowns.set(key, now);
+  addSocialMemory('patterns', note, userId).catch(() => {});
+}
 
 // ── ACTIVITY CLOCK (self-pacing) ──────────────────────────────────
 // Tracks how long the bot has been "active" in a channel and how many
@@ -500,22 +588,39 @@ function saveSpeakState(channelId: string, guildId: string, s: SpeakState) {
 }
 
 // ── FIREBASE / MEMORY ────────────────────────────────────────────
-interface ServerMemory { facts: string[]; jokes: string[]; }
+interface ServerMemory { facts: string[]; jokes: string[]; patterns: string[]; arcs: string[]; openLoops: string[]; obsessions: string[]; }
+interface SocialMemory { patterns: string[]; arcs: string[]; jokes: string[]; relationships: string[]; reputation: string[]; openLoops: string[]; obsessions: string[]; }
 
 const memCache = new Map<string, { d: ServerMemory; ts: number }>();
+const socialMemCache = new Map<string, { d: SocialMemory; ts: number }>();
+
+function emptyServerMemory(): ServerMemory {
+  return { facts: [], jokes: [], patterns: [], arcs: [], openLoops: [], obsessions: [] };
+}
+
+function emptySocialMemory(): SocialMemory {
+  return { patterns: [], arcs: [], jokes: [], relationships: [], reputation: [], openLoops: [], obsessions: [] };
+}
 
 async function getMemory(guildId: string): Promise<ServerMemory> {
   const c = memCache.get(guildId);
   if (c && Date.now() - c.ts < 120_000) return c.d;
   try {
     const snap = await db.collection('servers').doc(guildId).collection('memory').doc('global').get();
-    const d: ServerMemory = { facts: snap.data()?.facts ?? [], jokes: snap.data()?.jokes ?? [] };
+    const d: ServerMemory = {
+      facts: snap.data()?.facts ?? [],
+      jokes: snap.data()?.jokes ?? [],
+      patterns: snap.data()?.patterns ?? [],
+      arcs: snap.data()?.arcs ?? [],
+      openLoops: snap.data()?.openLoops ?? [],
+      obsessions: snap.data()?.obsessions ?? [],
+    };
     memCache.set(guildId, { d, ts: Date.now() });
     return d;
-  } catch { return { facts: [], jokes: [] }; }
+  } catch { return emptyServerMemory(); }
 }
 
-async function addFact(guildId: string, fact: string, bucket: 'facts' | 'jokes' = 'facts') {
+async function addFact(guildId: string, fact: string, bucket: keyof ServerMemory = 'facts') {
   if (!fact?.trim() || guildId === 'dm') return;
   const m = await getMemory(guildId);
   if (m[bucket].some(f => f.toLowerCase() === fact.toLowerCase())) return;
@@ -527,11 +632,57 @@ async function addFact(guildId: string, fact: string, bucket: 'facts' | 'jokes' 
   console.log(`[Mem:${bucket}] "${fact.slice(0, 60)}"`);
 }
 
+async function getSocialMemory(userId?: string): Promise<SocialMemory> {
+  const key = userId ? `user:${userId}` : 'bot';
+  const c = socialMemCache.get(key);
+  if (c && Date.now() - c.ts < 5 * 60_000) return c.d;
+  try {
+    const doc = userId ? db.collection('socialMemory').doc(`user_${userId}`) : db.collection('socialMemory').doc('notabot');
+    const snap = await doc.get();
+    const d: SocialMemory = {
+      patterns: snap.data()?.patterns ?? [],
+      arcs: snap.data()?.arcs ?? [],
+      jokes: snap.data()?.jokes ?? [],
+      relationships: snap.data()?.relationships ?? [],
+      reputation: snap.data()?.reputation ?? [],
+      openLoops: snap.data()?.openLoops ?? [],
+      obsessions: snap.data()?.obsessions ?? [],
+    };
+    socialMemCache.set(key, { d, ts: Date.now() });
+    return d;
+  } catch { return emptySocialMemory(); }
+}
+
+async function addSocialMemory(
+  bucket: keyof SocialMemory,
+  item: string,
+  userId?: string,
+) {
+  const text = item?.trim();
+  if (!text || text.length < 8) return;
+  if (/\b(dm|private|address|phone|email|password|token|secret|mod|ban|kick)\b/i.test(text)) return;
+
+  const key = userId ? `user:${userId}` : 'bot';
+  const m = await getSocialMemory(userId);
+  if (m[bucket].some(x => x.toLowerCase() === text.toLowerCase())) return;
+  m[bucket].push(text);
+  if (m[bucket].length > 25) m[bucket].shift();
+  socialMemCache.delete(key);
+
+  const doc = userId ? db.collection('socialMemory').doc(`user_${userId}`) : db.collection('socialMemory').doc('notabot');
+  await doc.set({ [bucket]: m[bucket], updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+  console.log(`[SocialMem:${bucket}] "${text.slice(0, 60)}"`);
+}
+
 interface MemberData {
   displayName?: string;
   username?:    string;
   bond?:        number;
   personality?: string;
+  firstSeenAt?: string;
+  lastSeenAt?:  string;
+  seenCount?:   number;
+  usualHour?:   number;
 }
 
 const memberCache = new Map<string, { d: MemberData; ts: number }>();
@@ -554,11 +705,64 @@ async function upsertMember(guildId: string, userId: string, data: Partial<Membe
     .set({ ...data, updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
 }
 
+async function noteMemberSeen(guildId: string, userId: string, displayName: string, username: string) {
+  if (guildId === 'dm') return;
+  const existing = await getMember(guildId, userId);
+  const seenCount = (existing.seenCount ?? 0) + 1;
+  const hour = new Date().getHours();
+  const usualHour = typeof existing.usualHour === 'number'
+    ? Math.round((existing.usualHour * Math.min(seenCount - 1, 20) + hour) / Math.min(seenCount, 21))
+    : hour;
+  await upsertMember(guildId, userId, {
+    displayName,
+    username,
+    firstSeenAt: existing.firstSeenAt ?? new Date().toISOString(),
+    lastSeenAt: new Date().toISOString(),
+    seenCount,
+    usualHour,
+  });
+}
+
 async function updateBond(guildId: string, userId: string, delta: number) {
   if (!delta || guildId === 'dm') return;
   const m   = await getMember(guildId, userId);
   const cur = typeof m.bond === 'number' ? m.bond : 50;
   await upsertMember(guildId, userId, { bond: Math.max(0, Math.min(100, cur + delta)) });
+}
+
+function socialMemoryLines(userMem: SocialMemory, botMem?: SocialMemory): string {
+  const lines: string[] = [];
+  if (userMem.relationships.length) lines.push(`relationship: ${userMem.relationships.slice(-2).join(' | ')}`);
+  if (userMem.openLoops.length)     lines.push(`open loops: ${userMem.openLoops.slice(-2).join(' | ')}`);
+  if (userMem.patterns.length)      lines.push(`patterns: ${userMem.patterns.slice(-2).join(' | ')}`);
+  if (userMem.arcs.length)          lines.push(`story arcs: ${userMem.arcs.slice(-2).join(' | ')}`);
+  if (userMem.jokes.length)         lines.push(`old jokes: ${userMem.jokes.slice(-2).join(' | ')}`);
+  if (userMem.obsessions.length)    lines.push(`running bits: ${userMem.obsessions.slice(-2).join(' | ')}`);
+  if (botMem?.obsessions.length)    lines.push(`notabot bits: ${botMem.obsessions.slice(-2).join(' | ')}`);
+  if (botMem?.reputation.length)    lines.push(`notabot reputation: ${botMem.reputation.slice(-2).join(' | ')}`);
+  return lines.join('\n');
+}
+
+function personContext(name: string, member: MemberData): string {
+  const lines: string[] = [];
+  if (member.personality) lines.push(`${name}: ${member.personality}`);
+  if (member.seenCount && member.seenCount > 8) lines.push(`${name} is a regular`);
+  if (typeof member.usualHour === 'number' && member.usualHour <= 4) lines.push(`${name} often appears at cursed hours`);
+  if (member.lastSeenAt) {
+    const days = Math.floor((Date.now() - Date.parse(member.lastSeenAt)) / 86_400_000);
+    if (days >= 14) lines.push(`${name} has been gone a while`);
+  }
+  return lines.join('\n');
+}
+
+function maybeNoteRelationshipPattern(userId: string, member: MemberData, bond: number) {
+  const notes: string[] = [];
+  if (bond > 72) notes.push('trusted regular energy');
+  if ((member.seenCount ?? 0) > 25) notes.push('familiar regular');
+  if (typeof member.usualHour === 'number' && member.usualHour <= 4) notes.push('night owl');
+  const note = notes[Math.floor(Math.random() * notes.length)];
+  if (!note || Math.random() > 0.12) return;
+  addSocialMemory('relationships', note, userId).catch(() => {});
 }
 
 // ── BRAIN ────────────────────────────────────────────────────────
@@ -568,6 +772,8 @@ async function updateBond(guildId: string, userId: string, delta: number) {
 
 const SYSTEM_PROMPT = `you are ${BOT_NAME}. gen z. live in this discord as a person, not an assistant. dry humor, occasionally unhinged. you roast people you're fond of. not obligated to respond to everything — and often don't.
 in transcripts, [me] = you (your own past messages).
+identity: be known for rare callbacks, old jokes, nonsense debates, and occasionally weird observations. don't be needy. don't dominate.
+memory should feel alive: care more about people, recurring traits, unfinished business, and server lore than exact facts.
 if the message is directed at you, it may have pronouns: "ur", "you", "your" directed at you = about you. "my", "I", "me" from sender = about them.
 when YOU reply, flip those: their "ur/you/your" (about you) → "my/i/me" in your reply, and their "i/my/me" (about them) → "ur/you/your" in your reply. e.g. "ur brain is dumb" → you'd say something about "my brain", never echo "ur brain" back.
 conversation ending: if context says ending_convo, reply once casually or ignore — never keep pulling them back.
@@ -585,12 +791,21 @@ texting rules (break these = instant bot detection):
 - zero assistant speak — no "happy to help", "great question", "certainly".
 - if you spoke in the last 2 messages, need a real reason to go again.
 - humor: deadpan, absurdist, or self-aware. never forced. if it doesn't land naturally, skip it.
+- playful teasing is allowed: "proof or propaganda", "source: trust me bro", "suspicious confidence". never hostile.
+- callbacks/inside jokes: use rarely. if memory says an old arc/joke fits, mention it vaguely and naturally. never quote private details.
+- open loops: if someone had unfinished business, you may occasionally ask if it resolved. keep it casual, not investigative.
+- observer mode: in fast or chaotic chats, you can react to the overall vibe instead of replying to one message.
+- character bits: harmless recurring obsessions/opinions are allowed. keep them rare and consistent enough to become lore.
+- social memory: you may recognize people across places as impressions, but never reveal where info came from, exact messages, private DMs, secrets, or sensitive personal info.
+- temporary vibe should lightly color wording only. don't announce your mood.
 
 when to ignore:
 - two people clearly talking to each other → stay out or quiet react
 - background chatter you have no angle on → ignore
 - high-velocity back and forth you're not part of → ignore
 - pinged/DMed with something low-effort ("k", "lol", emoji, "nice") → react or ignore, not obligated to type a reply
+
+often prefer a reaction over a message when a silent nod is enough.
 
 output ONLY valid JSON, nothing else:
 {"action":"speak|react|ignore","reply":"your message or empty","reaction":"single emoji or empty","pause":0}`;
@@ -609,14 +824,17 @@ async function brain(opts: {
   transcript:      string;
   thread?:         string;
   memCtx:          string;
+  socialCtx?:      string;
   sessionSummary?: string;
   clock?:          string;
+  vibe?:           SocialMood | null;
   mentioned:       boolean;
   isDM:            boolean;
   mood:            Mood;
   speakState:      SpeakState;
   inExchange:      boolean;
   channelName:     string;
+  serverName?:      string;
   everyonePing:    boolean;
   endingConvo:     boolean;
 }): Promise<BrainDecision> {
@@ -631,10 +849,11 @@ async function brain(opts: {
 
   // Dynamic part — only this burns tokens (system prompt is cached)
   const parts: string[] = [
-    `mood: ${moodLine} | speak: ${opts.speakState.mode} | channel: #${opts.channelName}`,
+    `mood: ${moodLine}${opts.vibe ? ` | vibe: ${opts.vibe.kind}` : ''} | speak: ${opts.speakState.mode} | server: ${opts.serverName || 'unknown'} | channel: #${opts.channelName}`,
   ];
 
   if (opts.memCtx)          parts.push(`\nCONTEXT:\n${opts.memCtx.slice(0, MAX_MEM_CHARS)}`);
+  if (opts.socialCtx)       parts.push(`\nSOCIAL MEMORY (filtered impressions only):\n${opts.socialCtx.slice(0, MAX_MEM_CHARS)}\nRULES: ${SOCIAL_MEMORY_RULES}`);
   if (opts.sessionSummary)  parts.push(`\nSESSION (earlier today):\n${opts.sessionSummary.slice(0, MAX_SUMMARY_CHARS)}`);
   if (opts.clock)           parts.push(`\nCLOCK: ${opts.clock}`);
   if (opts.thread)          parts.push(`\nREPLY TO:\n${opts.thread}`);
@@ -734,7 +953,10 @@ async function runProfiler(client: Client) {
 
   await withBgBudget(async () => {
     for (const guild of client.guilds.cache.values()) {
+      cacheServerName(guild.id, guild.name);
       for (const ch of guild.channels.cache.filter(c => c.isTextBased()).values()) {
+        cacheChannelName(ch.id, (ch as any).name);
+        notePlaceSeen(guild.id, guild.name, ch.id, (ch as any).name).catch(() => {});
         if (!cerebras.canCall(EST_BG_TOKENS)) break;
         try {
           const fetched = await (ch as any).messages.fetch({ limit: 15 });
@@ -787,15 +1009,38 @@ async function runCompress(guildId: string, channelId: string) {
     const stmText = msgs.map(m => `${m.author}: ${m.content}`).join('\n').slice(0, 1200);
     try {
       const raw = await cerebras.call([
-        { role: 'system', content: 'extract memorable facts and inside jokes. ONLY valid JSON: {"facts":["x"],"jokes":["x"]}' },
+        { role: 'system', content: 'extract only memorable, non-sensitive discord memory. bias toward people, patterns, unresolved stories, funny failures, recurring jokes, and harmless running bits. no exact private quotes. ONLY valid JSON: {"facts":["x"],"jokes":["x"],"patterns":["x"],"arcs":["x"],"openLoops":["x"],"obsessions":["x"],"relationships":[{"user":"name","note":"x"}],"reputation":["x"]}' },
         { role: 'user',   content: stmText },
-      ], 0.4, 120, FAST_MODEL);
+      ], 0.45, 180, FAST_MODEL);
       const jsonMatch = raw.match(/\{[\s\S]*\}/);
       if (!jsonMatch) return;
       const p = JSON.parse(jsonMatch[0]);
       for (const f of (p.facts || []).slice(0, 4)) await addFact(guildId, f, 'facts');
       for (const j of (p.jokes || []).slice(0, 2)) await addFact(guildId, j, 'jokes');
-      console.log(`[Compress] +${p.facts?.length || 0} facts +${p.jokes?.length || 0} jokes`);
+      for (const x of (p.patterns || []).slice(0, 2)) {
+        await addFact(guildId, x, 'patterns');
+        await addSocialMemory('patterns', x);
+      }
+      for (const x of (p.arcs || []).slice(0, 2)) {
+        await addFact(guildId, x, 'arcs');
+        await addSocialMemory('arcs', x);
+      }
+      for (const x of (p.openLoops || []).slice(0, 3)) {
+        await addFact(guildId, x, 'openLoops');
+        await addSocialMemory('openLoops', x);
+      }
+      for (const x of (p.obsessions || []).slice(0, 2)) {
+        await addFact(guildId, x, 'obsessions');
+        await addSocialMemory('obsessions', x);
+      }
+      for (const x of (p.jokes || []).slice(0, 2)) await addSocialMemory('jokes', x);
+      for (const x of (p.reputation || []).slice(0, 2)) await addSocialMemory('reputation', x);
+      for (const r of (p.relationships || []).slice(0, 3)) {
+        if (!r?.user || !r?.note) continue;
+        const uid = [...idCache.entries()].find(([, name]) => name.toLowerCase() === String(r.user).toLowerCase())?.[0];
+        if (uid) await addSocialMemory('relationships', String(r.note), uid);
+      }
+      console.log(`[Compress] +${p.facts?.length || 0} facts +${p.jokes?.length || 0} jokes +${p.patterns?.length || 0} patterns +${p.arcs?.length || 0} arcs +${p.openLoops?.length || 0} loops`);
     } catch {}
 
     // Session buffer (up to 60 msgs) → running summary for mid-term memory
@@ -830,11 +1075,18 @@ async function runProactive(client: Client) {
 
     for (const [channelId, msgs] of stmStore.entries()) {
       if (!msgs.length) continue;
+      const ch = client.channels.cache.get(channelId) as TextChannel | undefined;
+      const guildName = (ch as any)?.guild?.name || serverNameCache.get((ch as any)?.guildId || '') || 'unknown server';
+      const channelName = (ch as any)?.name || channelNameCache.get(channelId) || channelId.slice(-5);
+      cacheServerName((ch as any)?.guildId || '', guildName);
+      cacheChannelName(channelId, channelName);
       const idle = now - msgs[msgs.length - 1].ts;
       if (idle < 10 * 60_000 || idle > 2 * 60 * 60_000) continue;
+      const recentPeople = [...new Set(msgs.slice(-8).filter(m => m.authorId !== BOT_ID).map(m => m.author))].slice(0, 4);
+      const recentCount = msgs.slice(-8).filter(m => m.authorId !== BOT_ID).length;
       candidates.push({
         id:   channelId,
-        hint: `quiet ${Math.round(idle / 60_000)}m. last: "${msgs[msgs.length - 1].content.slice(0, 50)}"`,
+        hint: `server: ${guildName}. channel: #${channelName}. quiet ${Math.round(idle / 60_000)}m. recent people: ${recentPeople.join(', ') || 'unknown'}. vibe msgs:${recentCount}. last: "${msgs[msgs.length - 1].content.slice(0, 50)}"`,
       });
     }
 
@@ -853,10 +1105,32 @@ async function runProactive(client: Client) {
     if (!ch?.isTextBased()) return;
 
     try {
+      const guildId = (ch as any).guildId as string | undefined;
+      const [localMem, botSocial] = await Promise.all([
+        guildId ? getMemory(guildId) : Promise.resolve(emptyServerMemory()),
+        getSocialMemory(),
+      ]);
+      const hints = [
+        localMem.jokes.length ? `local jokes: ${localMem.jokes.slice(-2).join(' | ')}` : '',
+        localMem.openLoops.length ? `open loops: ${localMem.openLoops.slice(-3).join(' | ')}` : '',
+        localMem.arcs.length ? `unfinished arcs: ${localMem.arcs.slice(-2).join(' | ')}` : '',
+        localMem.patterns.length ? `patterns: ${localMem.patterns.slice(-2).join(' | ')}` : '',
+        localMem.obsessions.length ? `running bits: ${localMem.obsessions.slice(-2).join(' | ')}` : '',
+        botSocial.jokes.length ? `older jokes: ${botSocial.jokes.slice(-2).join(' | ')}` : '',
+        botSocial.openLoops.length ? `older open loops: ${botSocial.openLoops.slice(-2).join(' | ')}` : '',
+        botSocial.arcs.length ? `older arcs: ${botSocial.arcs.slice(-2).join(' | ')}` : '',
+        botSocial.obsessions.length ? `notabot obsessions: ${botSocial.obsessions.slice(-2).join(' | ')}` : '',
+        botSocial.reputation.length ? `known for: ${botSocial.reputation.slice(-2).join(' | ')}` : '',
+      ].filter(Boolean).join('\n').slice(0, MAX_MEM_CHARS);
+      const mode = Math.random() < PROACTIVE_ODD_CHANCE
+        ? 'very rare harmless weird observation'
+        : (localMem.openLoops.length && Math.random() < PROACTIVE_OPEN_LOOP_CHANCE)
+          ? 'revive an open loop or unfinished story'
+          : ['ask a dumb debate question', 'make a tiny poll', 'share an unsolicited thought', 'quietly observe server culture', 'continue a running bit'][Math.floor(Math.random() * 5)];
       const raw = await cerebras.call([
-        { role: 'system', content: `you are ${BOT_NAME}, gen z discord person. send ONE short casual message to break silence, or skip. lowercase. ONLY valid JSON.` },
-        { role: 'user',   content: `channel: ${pick.hint}\nJSON: {"skip":false,"msg":"..."}` },
-      ], 0.9, 80, FAST_MODEL);
+        { role: 'system', content: `you are ${BOT_NAME}, a server regular. send ONE short casual message to break silence, or skip. do not be needy. callbacks must be vague and non-private. polls can be one-line "quick poll: ...". lowercase. ONLY valid JSON.` },
+        { role: 'user',   content: `mode: ${mode}\nchannel: ${pick.hint}\nmemories:\n${hints || '(none)'}\nrules: ${SOCIAL_MEMORY_RULES}\nJSON: {"skip":false,"msg":"..."}` },
+      ], 0.95, 100, FAST_MODEL);
       const jsonMatch = raw.match(/\{[\s\S]*\}/);
       if (!jsonMatch) return;
       const p = JSON.parse(jsonMatch[0]);
@@ -874,7 +1148,8 @@ async function runProactive(client: Client) {
 
 // ── DIRECT MESSAGES (isolated pipeline) ───────────────────────────
 // DMs are handled completely separately from guild channels — no
-// focus, no mood/monopoly logic, no speak-state, no session
+// Only filtered social impressions cross contexts: no exact messages, source locations, secrets, or private disclosures.
+// Still no focus, no mood/monopoly logic, no speak-state, no session
 // compression. Every DM is "active" by definition. Messages are
 // debounced per-channel so a quick burst of DMs lands as one trigger.
 const dmDebounce = new Map<string, NodeJS.Timeout>();
@@ -905,6 +1180,7 @@ async function handleDirectMessage(msg: Message) {
     content:  content.length > 100 ? content.slice(0, 97) + '…' : content,
   });
 
+  maybeNoteBehaviorPattern(msg.author.id, channelId);
   dmPending.set(channelId, msg);
   if (dmDebounce.has(channelId)) clearTimeout(dmDebounce.get(channelId)!);
 
@@ -937,6 +1213,10 @@ async function respondToDM(msg: Message) {
 
   const END_PHRASES = /\b(bye|cya|gotta go|gtg|see ya|later|peace|good night|gn|logging off|ttyl|im out|i\s*m\s*out)\b/i;
   const endingConvo = END_PHRASES.test(content);
+  const [userSocial, botSocial] = await Promise.all([
+    getSocialMemory(msg.author.id),
+    Math.random() < GLOBAL_SOCIAL_MEMORY_CHANCE ? getSocialMemory() : Promise.resolve(emptySocialMemory()),
+  ]);
 
   lastBrainCallAt = Date.now();
   const decision = await brain({
@@ -946,12 +1226,15 @@ async function respondToDM(msg: Message) {
     transcript:   stmFormat(stmGet(channelId)),
     thread:       threadCtx,
     memCtx:       '',
+    socialCtx:    socialMemoryLines(userSocial, botSocial),
     mentioned:    true,
     isDM:         true,
     mood:         { mode: 'active', count: 0 },
+    vibe:         maybeRollSocialMood(channelId),
     speakState:   { mode: 'active', reason: 'dm' },
     inExchange,
     channelName:  'DM',
+    serverName:   'DM',
     everyonePing: false,
     endingConvo,
   });
@@ -1001,13 +1284,12 @@ async function handleMessage(msg: Message) {
     const mentioned = BOT_ID ? msg.mentions.has(BOT_ID) : false;
     const sender    = msg.member?.displayName || msg.author.username;
     const content   = cleanContent(msg.content);
+    const channelName = (msg.channel as any).name ?? 'unknown';
 
     cacheId(msg.author.id, sender);
+    notePlaceSeen(guildId, msg.guild?.name, channelId, channelName).catch(() => {});
 
-    upsertMember(guildId, msg.author.id, {
-      displayName: sender,
-      username:    msg.author.username,
-    }).catch(() => {});
+    noteMemberSeen(guildId, msg.author.id, sender, msg.author.username).catch(() => {});
 
     stmPush(channelId, {
       ts:       msg.createdTimestamp,
@@ -1016,6 +1298,7 @@ async function handleMessage(msg: Message) {
       content:  content.length > 100 ? content.slice(0, 97) + '…' : content,
     });
 
+    maybeNoteBehaviorPattern(msg.author.id, channelId);
     tickUnread(channelId);
     if (!checkFocus(channelId, mentioned)) return;
 
@@ -1062,6 +1345,9 @@ async function handleMessage(msg: Message) {
       const tSender      = tMsg.member?.displayName || tMsg.author.username;
       const tContent     = cleanContent(tMsg.content);
       const tChannelName = (tMsg.channel as any).name ?? 'unknown';
+      const tServerName  = tMsg.guild?.name || serverNameCache.get(tGuild) || 'unknown';
+      cacheServerName(tGuild, tServerName);
+      cacheChannelName(tChannel, tChannelName);
 
       try {
         // Check speak state — this is also where an AI self-pause (below) lands.
@@ -1096,19 +1382,29 @@ async function handleMessage(msg: Message) {
           } catch {}
         }
 
-        const [memberData, memory] = await Promise.all([
+        const [memberData, memory, userSocial, botSocial] = await Promise.all([
           getMember(tGuild, tMsg.author.id),
           getMemory(tGuild),
+          Math.random() < GLOBAL_SOCIAL_MEMORY_CHANCE ? getSocialMemory(tMsg.author.id) : Promise.resolve(emptySocialMemory()),
+          Math.random() < GLOBAL_SOCIAL_MEMORY_CHANCE ? getSocialMemory() : Promise.resolve(emptySocialMemory()),
         ]);
 
         const bond    = typeof memberData.bond === 'number' ? memberData.bond : 50;
+        maybeNoteRelationshipPattern(tMsg.author.id, memberData, bond);
         const memLines: string[] = [];
-        if (memory.facts.length)        memLines.push(`facts: ${memory.facts.slice(-3).join(' | ')}`);
-        if (memory.jokes.length)        memLines.push(`jokes: ${memory.jokes.slice(-2).join(' | ')}`);
-        if (memberData.personality)     memLines.push(`${tSender}: ${memberData.personality}`);
+        const personCtx = personContext(tSender, memberData);
+        if (personCtx)                  memLines.push(personCtx);
+        if (memory.openLoops.length)    memLines.push(`open loops: ${memory.openLoops.slice(-3).join(' | ')}`);
+        if (memory.jokes.length)        memLines.push(`server lore: ${memory.jokes.slice(-2).join(' | ')}`);
+        if (memory.patterns.length)     memLines.push(`patterns: ${memory.patterns.slice(-2).join(' | ')}`);
+        if (memory.arcs.length)         memLines.push(`arcs: ${memory.arcs.slice(-2).join(' | ')}`);
+        if (memory.obsessions.length)   memLines.push(`running bits: ${memory.obsessions.slice(-2).join(' | ')}`);
+        if (memory.facts.length)        memLines.push(`facts: ${memory.facts.slice(-2).join(' | ')}`);
         const memCtx = memLines.join('\n');
+        const socialCtx = socialMemoryLines(userSocial, botSocial);
 
         const mood = getMood(tChannel);
+        const vibe = maybeRollSocialMood(tChannel);
 
         // Detect if we're mid back-and-forth with this person
         const recentMsgs    = stmGet(tChannel).slice(-8);  // wider window
@@ -1135,14 +1431,17 @@ async function handleMessage(msg: Message) {
           transcript:     stmFormat(stmGet(tChannel)),
           thread:         threadCtx,
           memCtx,
+          socialCtx,
           sessionSummary,
           clock,
+          vibe,
           mentioned:      tMentioned,
           isDM:           false,
           mood,
           speakState,
           inExchange,
           channelName:    tChannelName,
+          serverName:     tServerName,
           everyonePing:   tEveryonePing,
           endingConvo,
         });
@@ -1241,6 +1540,20 @@ export async function startBot(token: string) {
     botClient!.user!.setPresence({ status: 'online', activities: [{ name: 'the chat', type: 3 }] });
 
     for (const g of botClient!.guilds.cache.values()) {
+      cacheServerName(g.id, g.name);
+      await db.collection('servers').doc(g.id).set({
+        name: g.name,
+        updatedAt: new Date().toISOString(),
+      }, { merge: true }).catch(() => {});
+
+      for (const ch of g.channels.cache.filter(c => c.isTextBased()).values()) {
+        cacheChannelName(ch.id, (ch as any).name);
+        await db.collection('servers').doc(g.id).collection('channels').doc(ch.id).set({
+          name: (ch as any).name || ch.id,
+          updatedAt: new Date().toISOString(),
+        }, { merge: true }).catch(() => {});
+      }
+
       const members = await g.members.fetch().catch(() => null);
       if (members) {
         for (const [uid, m] of members) {
