@@ -51,73 +51,40 @@ class CerebrasManager {
     for (let i = 0; i < this.keys.length; i++) {
       const k = this.keys[(this.idx + i) % this.keys.length];
       const cd = this.cooldowns.get(k);
-      if (!cd || now > cd) {
-        this.idx = (this.idx + i + 1) % this.keys.length;
-        return k;
-      }
+      if (!cd || now > cd) { this.idx = (this.idx + i + 1) % this.keys.length; return k; }
     }
-    let best = this.keys[0];
-    let bestCd = Infinity;
-    for (const k of this.keys) {
-      const cd = this.cooldowns.get(k) ?? 0;
-      if (cd < bestCd) { bestCd = cd; best = k; }
-    }
+    let best = this.keys[0]; let bestCd = Infinity;
+    for (const k of this.keys) { const cd = this.cooldowns.get(k) ?? 0; if (cd < bestCd) { bestCd = cd; best = k; } }
     return best;
   }
 
-  async call(
-    messages: { role: string; content: string }[],
-    temp     = 0.85,
-    maxTok   = 150,
-    model    = BRAIN_MODEL,
-  ): Promise<string> {
+  async call(messages: { role: string; content: string }[], temp = 0.85, maxTok = 150, model = BRAIN_MODEL): Promise<string> {
     this.resetIfNewDay();
-
     for (let attempt = 0; attempt < this.keys.length * 2; attempt++) {
       const key = this.pickKey();
       if (!key) throw new Error('[Cerebras] no keys available');
-
       try {
         const res = await fetch('https://api.cerebras.ai/v1/chat/completions', {
           method: 'POST',
-          headers: {
-            'Content-Type':  'application/json',
-            'Authorization': `Bearer ${key}`,
-          },
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
           body: JSON.stringify({ model, messages, temperature: temp, max_tokens: maxTok }),
         });
-
         if (res.status === 429) {
-          const body    = await res.json().catch(() => ({})) as any;
+          const body = await res.json().catch(() => ({})) as any;
           const retryMs = (body?.retry_after ?? 5) * 1000;
           this.cooldowns.set(key, Date.now() + retryMs);
-          console.warn(`[Cerebras] ...${key.slice(-4)} 429 — cooldown ${retryMs / 1000}s`);
-          continue;
+          console.warn(`[Cerebras] 429 cooldown ${retryMs / 1000}s`); continue;
         }
-
-        if (!res.ok) {
-          const err = await res.text().catch(() => res.statusText);
-          throw new Error(`Cerebras ${res.status}: ${err.slice(0, 100)}`);
-        }
-
-        const data         = await res.json() as any;
-        const choice       = data.choices?.[0];
-        const text         = choice?.message?.content ?? '';
-        const finishReason = choice?.finish_reason ?? 'unknown';
-        const tokUsed      = data.usage?.total_tokens ?? maxTok;
-
+        if (!res.ok) { const err = await res.text().catch(() => res.statusText); throw new Error(`Cerebras ${res.status}: ${err.slice(0, 100)}`); }
+        const data = await res.json() as any;
+        const choice = data.choices?.[0];
+        const text = choice?.message?.content ?? '';
+        const tokUsed = data.usage?.total_tokens ?? maxTok;
         this.dailyUsed += tokUsed;
         this.minuteCalls.push(Date.now());
-
         const left = Math.round((DAILY_TOKEN_BUDGET * SOFT - this.dailyUsed) / 1000);
-        console.log(`[Cerebras] ${tokUsed}tok | finish:${finishReason} | daily left ≈${left}k | rpm ${this.minuteCalls.length}/25`);
-
-        if (!text && finishReason === 'length') {
-          console.warn(`[Cerebras] empty content + finish:length — increase max_tokens.`);
-        }
-
+        console.log(`[Cerebras] ${tokUsed}tok | finish:${choice?.finish_reason} | left ≈${left}k`);
         return text;
-
       } catch (e: any) {
         if (e.message?.startsWith('Cerebras 429')) continue;
         console.error(`[Cerebras] attempt ${attempt + 1}: ${e.message?.slice(0, 80)}`);
@@ -128,13 +95,8 @@ class CerebrasManager {
   }
 
   status() {
-    const now  = Date.now();
     const left = Math.round((DAILY_TOKEN_BUDGET * SOFT - this.dailyUsed) / 1000);
-    const keys = this.keys.map(k =>
-      `...${k.slice(-4)}${this.cooldowns.get(k) && now < this.cooldowns.get(k)!
-        ? ` (cd ${Math.ceil((this.cooldowns.get(k)! - now) / 1000)}s)` : ''}`
-    ).join(' | ');
-    return `${keys} | daily left ≈${left}k tokens | rpm ${this.minuteCalls.length}/25`;
+    return `daily left ≈${left}k tokens | rpm ${this.minuteCalls.length}/25`;
   }
 }
 
@@ -143,10 +105,9 @@ const cerebras = new CerebrasManager();
 const MAX_TRANSCRIPT_CHARS = 1800;
 const MAX_MEM_CHARS        = 400;
 const MAX_SUMMARY_CHARS    = 300;
-
-const SESSION_BUFFER_MAX  = 60;
-const sessionBuffers       = new Map<string, string[]>();
-const sessionSummaries     = new Map<string, string>();
+const SESSION_BUFFER_MAX   = 60;
+const sessionBuffers        = new Map<string, string[]>();
+const sessionSummaries      = new Map<string, string>();
 
 function sessionBufferPush(channelId: string, line: string) {
   if (!sessionBuffers.has(channelId)) sessionBuffers.set(channelId, []);
@@ -179,14 +140,12 @@ let botClient: Client | null = null;
 
 interface FocusState { channelId: string; since: number; }
 let focus: FocusState | null = null;
-const FOCUS_DRIFT_MS    = 12 * 60_000;
-const FOCUS_SHIFT_COST  = 45_000;
+const FOCUS_DRIFT_MS   = 12 * 60_000;
+const FOCUS_SHIFT_COST = 45_000;
 let lastFocusShift = 0;
 const unreadCounts = new Map<string, number>();
 
-function tickUnread(channelId: string) {
-  unreadCounts.set(channelId, (unreadCounts.get(channelId) ?? 0) + 1);
-}
+function tickUnread(channelId: string) { unreadCounts.set(channelId, (unreadCounts.get(channelId) ?? 0) + 1); }
 
 function checkFocus(channelId: string, mentioned: boolean): boolean {
   const now = Date.now();
@@ -194,32 +153,21 @@ function checkFocus(channelId: string, mentioned: boolean): boolean {
   if (!focus) { focus = { channelId, since: now }; unreadCounts.delete(channelId); return true; }
   const focusExpired = now - focus.since > FOCUS_DRIFT_MS;
   if (focusExpired) {
-    const unread = unreadCounts.get(channelId) ?? 0;
-    console.log(`[Focus] drift from #${focus.channelId.slice(-5)} → #${channelId.slice(-5)} (${unread} unread)`);
     focus = { channelId, since: now }; unreadCounts.delete(channelId); lastFocusShift = now; return true;
   }
   if (mentioned && now - lastFocusShift > FOCUS_SHIFT_COST) {
-    const unread = unreadCounts.get(channelId) ?? 0;
-    console.log(`[Focus] ping pulled from #${focus.channelId.slice(-5)} → #${channelId.slice(-5)} (${unread} unread)`);
     focus = { channelId, since: now }; unreadCounts.delete(channelId); lastFocusShift = now; return true;
   }
-  tickUnread(channelId);
-  console.log(`[Focus] #${channelId.slice(-5)} — bot in #${focus.channelId.slice(-5)}, unread now ${unreadCounts.get(channelId)}`);
-  return false;
+  tickUnread(channelId); return false;
 }
 
 const idCache = new Map<string, string>();
 function cacheId(id: string, name: string) { if (id && name) idCache.set(id, name); }
 
 function resolveMentions(text: string): string {
-  return text.replace(/<@!?(\d+)>/g, (_, id) =>
-    id === BOT_ID ? `@${BOT_NAME}` : `@${idCache.get(id) || 'someone'}`
-  );
+  return text.replace(/<@!?(\d+)>/g, (_, id) => id === BOT_ID ? `@${BOT_NAME}` : `@${idCache.get(id) || 'someone'}`);
 }
-
-function cleanContent(raw: string): string {
-  return resolveMentions(raw).trim();
-}
+function cleanContent(raw: string): string { return resolveMentions(raw).trim(); }
 
 interface STMsg { ts: number; authorId: string; author: string; content: string; }
 const stmStore = new Map<string, STMsg[]>();
@@ -236,7 +184,7 @@ function stmGet(channelId: string): STMsg[] { return stmStore.get(channelId) ?? 
 
 function stmFormat(msgs: STMsg[]): string {
   if (!msgs.length) return '(no messages yet)';
-  const now   = Date.now();
+  const now = Date.now();
   const lines: string[] = [];
   for (let i = 0; i < msgs.length; i++) {
     if (i > 0) {
@@ -245,7 +193,7 @@ function stmFormat(msgs: STMsg[]): string {
       else if (gap >= GAP_MINOR_MS) lines.push(`  (${Math.round(gap / 60_000)}m gap)`);
     }
     const ago = now - msgs[i].ts;
-    const t   = ago < 90_000 ? `${Math.round(ago / 1000)}s ago` : `${Math.round(ago / 60_000)}m ago`;
+    const t = ago < 90_000 ? `${Math.round(ago / 1000)}s ago` : `${Math.round(ago / 60_000)}m ago`;
     lines.push(`[${t}] ${msgs[i].author}: ${msgs[i].content}`);
   }
   return lines.join('\n').slice(0, MAX_TRANSCRIPT_CHARS);
@@ -254,16 +202,14 @@ function stmFormat(msgs: STMsg[]): string {
 function seedSTM(channelId: string, msgs: Message[]) {
   if (stmStore.has(channelId)) return;
   stmStore.set(channelId, msgs.slice(-STM_MAX).map(m => ({
-    ts:       m.createdTimestamp,
-    authorId: m.author.id,
-    author:   m.author.id === BOT_ID ? '[me]' : (m.member?.displayName || m.author.username),
-    content:  (() => { const c = cleanContent(m.content); return c.length > 100 ? c.slice(0, 97) + '…' : c; })(),
+    ts: m.createdTimestamp, authorId: m.author.id,
+    author: m.author.id === BOT_ID ? '[me]' : (m.member?.displayName || m.author.username),
+    content: (() => { const c = cleanContent(m.content); return c.length > 100 ? c.slice(0, 97) + '…' : c; })(),
   })));
 }
 
 interface Mood { mode: 'active' | 'passive'; until?: number; count: number; }
 const moods = new Map<string, Mood>();
-
 interface ActivityClock { activeSince: number; replies: number; }
 const activityClocks = new Map<string, ActivityClock>();
 
@@ -278,9 +224,7 @@ function clockLine(channelId: string, mood: Mood): string {
 function getMood(channelId: string): Mood {
   let m = moods.get(channelId) ?? { mode: 'passive', count: 0 };
   if (m.mode === 'active' && m.until && Date.now() >= m.until) {
-    m = { mode: 'passive', count: 0 };
-    moods.set(channelId, m);
-    console.log(`[Mood] #${channelId.slice(-5)} active→passive (expired)`);
+    m = { mode: 'passive', count: 0 }; moods.set(channelId, m);
   }
   return m;
 }
@@ -292,10 +236,7 @@ function goActive(channelId: string, mins = ACTIVE_MINS, reason = '') {
   console.log(`[Mood] #${channelId.slice(-5)} active ${mins}m${reason ? ` — ${reason}` : ''}`);
 }
 
-function goPassive(channelId: string) {
-  moods.set(channelId, { mode: 'passive', count: 0 });
-  console.log(`[Mood] #${channelId.slice(-5)} passive`);
-}
+function goPassive(channelId: string) { moods.set(channelId, { mode: 'passive', count: 0 }); }
 
 function moodTick(channelId: string, authorId: string, mentioned: boolean, isDM: boolean): boolean {
   if (isDM || mentioned) { goActive(channelId, ACTIVE_MINS, isDM ? 'DM' : 'mentioned'); return true; }
@@ -305,26 +246,20 @@ function moodTick(channelId: string, authorId: string, mentioned: boolean, isDM:
     if (gap > 8 * 60_000) { goActive(channelId, ACTIVE_MINS, `${Math.round(gap / 60_000)}m idle gap`); return true; }
   }
   if (msgs.length >= MONOPOLY_N) {
-    const recent  = msgs.slice(-MONOPOLY_N);
+    const recent = msgs.slice(-MONOPOLY_N);
     const authors = new Set(recent.map(m => m.authorId).filter(id => id !== BOT_ID));
     if (authors.size === 1 && [...authors][0] === authorId) {
-      const addressingOthers = recent.some(m => {
-        const withoutMe = m.content.replace(new RegExp(`@${BOT_NAME}`, 'gi'), '');
-        return withoutMe.includes('@');
-      });
-      if (!addressingOthers) { goActive(channelId, ACTIVE_MINS, `monopoly`); return true; }
+      const addressingOthers = recent.some(m => { const w = m.content.replace(new RegExp(`@${BOT_NAME}`, 'gi'), ''); return w.includes('@'); });
+      if (!addressingOthers) { goActive(channelId, ACTIVE_MINS, 'monopoly'); return true; }
     }
   }
   const m = getMood(channelId);
   if (m.mode === 'active') return true;
-  m.count++;
-  moods.set(channelId, m);
-  const cutoff  = Date.now() - VELOCITY_WINDOW_MS;
-  const vel     = stmGet(channelId).filter(x => x.ts >= cutoff && x.authorId !== BOT_ID).length;
-  const every   = vel > VELOCITY_THRESH ? PASSIVE_EVERY_BUSY : PASSIVE_EVERY;
-  const fire    = m.count % every === 0;
-  if (!fire) console.log(`[Mood] #${channelId.slice(-5)} passive ${m.count}/${every}`);
-  return fire;
+  m.count++; moods.set(channelId, m);
+  const cutoff = Date.now() - VELOCITY_WINDOW_MS;
+  const vel = stmGet(channelId).filter(x => x.ts >= cutoff && x.authorId !== BOT_ID).length;
+  const every = vel > VELOCITY_THRESH ? PASSIVE_EVERY_BUSY : PASSIVE_EVERY;
+  return m.count % every === 0;
 }
 
 interface SpeakState { mode: 'active' | 'paused' | 'waiting'; resumeAt?: number; reason: string; }
@@ -335,9 +270,7 @@ async function getSpeakState(channelId: string, guildId: string): Promise<SpeakS
     const s = speakStates.get(channelId)!;
     if (s.mode === 'paused' && s.resumeAt && Date.now() >= s.resumeAt) {
       const next: SpeakState = { mode: 'active', reason: 'pause expired' };
-      speakStates.set(channelId, next);
-      saveSpeakState(channelId, guildId, next);
-      return next;
+      speakStates.set(channelId, next); saveSpeakState(channelId, guildId, next); return next;
     }
     return s;
   }
@@ -345,22 +278,17 @@ async function getSpeakState(channelId: string, guildId: string): Promise<SpeakS
     const snap = await db.collection('servers').doc(guildId).collection('channels').doc(channelId).get();
     const s: SpeakState = snap.data()?.speakState ?? { mode: 'active', reason: 'default' };
     if (s.mode === 'paused' && s.resumeAt && Date.now() >= s.resumeAt) { s.mode = 'active'; s.reason = 'pause expired'; }
-    speakStates.set(channelId, s);
-    return s;
+    speakStates.set(channelId, s); return s;
   } catch { return { mode: 'active', reason: 'default' }; }
 }
 
 async function setSpeakState(channelId: string, guildId: string, s: SpeakState) {
-  speakStates.set(channelId, s);
-  saveSpeakState(channelId, guildId, s);
-  const eta = s.resumeAt ? ` → resumes ${new Date(s.resumeAt).toLocaleTimeString()}` : '';
-  console.log(`[Speak] #${channelId.slice(-5)} → ${s.mode}${eta} | ${s.reason}`);
+  speakStates.set(channelId, s); saveSpeakState(channelId, guildId, s);
 }
 
 function saveSpeakState(channelId: string, guildId: string, s: SpeakState) {
   if (guildId === 'dm') return;
-  db.collection('servers').doc(guildId).collection('channels').doc(channelId)
-    .set({ speakState: s }, { merge: true }).catch(() => {});
+  db.collection('servers').doc(guildId).collection('channels').doc(channelId).set({ speakState: s }, { merge: true }).catch(() => {});
 }
 
 interface ServerMemory { facts: string[]; jokes: string[]; }
@@ -372,8 +300,7 @@ async function getMemory(guildId: string): Promise<ServerMemory> {
   try {
     const snap = await db.collection('servers').doc(guildId).collection('memory').doc('global').get();
     const d: ServerMemory = { facts: snap.data()?.facts ?? [], jokes: snap.data()?.jokes ?? [] };
-    memCache.set(guildId, { d, ts: Date.now() });
-    return d;
+    memCache.set(guildId, { d, ts: Date.now() }); return d;
   } catch { return { facts: [], jokes: [] }; }
 }
 
@@ -384,9 +311,7 @@ async function addFact(guildId: string, fact: string, bucket: 'facts' | 'jokes' 
   m[bucket].push(fact.trim());
   if (m[bucket].length > 30) m[bucket].shift();
   memCache.delete(guildId);
-  await db.collection('servers').doc(guildId).collection('memory').doc('global')
-    .set({ [bucket]: m[bucket] }, { merge: true }).catch(() => {});
-  console.log(`[Mem:${bucket}] "${fact.slice(0, 60)}"`);
+  await db.collection('servers').doc(guildId).collection('memory').doc('global').set({ [bucket]: m[bucket] }, { merge: true }).catch(() => {});
 }
 
 interface MemberData { displayName?: string; username?: string; bond?: number; personality?: string; }
@@ -394,25 +319,23 @@ const memberCache = new Map<string, { d: MemberData; ts: number }>();
 
 async function getMember(guildId: string, userId: string): Promise<MemberData> {
   const key = `${guildId}:${userId}`;
-  const c   = memberCache.get(key);
+  const c = memberCache.get(key);
   if (c && Date.now() - c.ts < 5 * 60_000) return c.d;
   try {
     const snap = await db.collection('servers').doc(guildId).collection('members').doc(userId).get();
-    const d    = (snap.data() ?? {}) as MemberData;
-    memberCache.set(key, { d, ts: Date.now() });
-    return d;
+    const d = (snap.data() ?? {}) as MemberData;
+    memberCache.set(key, { d, ts: Date.now() }); return d;
   } catch { return {}; }
 }
 
 async function upsertMember(guildId: string, userId: string, data: Partial<MemberData>) {
   memberCache.delete(`${guildId}:${userId}`);
-  await db.collection('servers').doc(guildId).collection('members').doc(userId)
-    .set({ ...data, updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+  await db.collection('servers').doc(guildId).collection('members').doc(userId).set({ ...data, updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
 }
 
 async function updateBond(guildId: string, userId: string, delta: number) {
   if (!delta || guildId === 'dm') return;
-  const m   = await getMember(guildId, userId);
+  const m = await getMember(guildId, userId);
   const cur = typeof m.bond === 'number' ? m.bond : 50;
   await upsertMember(guildId, userId, { bond: Math.max(0, Math.min(100, cur + delta)) });
 }
@@ -442,47 +365,24 @@ when to ignore:
 output ONLY valid JSON, nothing else:
 {"action":"speak|react|ignore","reply":"your message or empty","reaction":"single emoji or empty","pause":0}`;
 
-interface BrainDecision {
-  action:   'speak' | 'react' | 'ignore';
-  reply:    string;
-  reaction: string;
-  pause:    number;
-}
+interface BrainDecision { action: 'speak' | 'react' | 'ignore'; reply: string; reaction: string; pause: number; }
 
 async function brain(opts: {
-  sender:          string;
-  bond:            number;
-  message:         string;
-  transcript:      string;
-  thread?:         string;
-  memCtx:          string;
-  sessionSummary?: string;
-  clock?:          string;
-  mentioned:       boolean;
-  isDM:            boolean;
-  mood:            Mood;
-  speakState:      SpeakState;
-  inExchange:      boolean;
-  channelName:     string;
-  everyonePing:    boolean;
-  endingConvo:     boolean;
+  sender: string; bond: number; message: string; transcript: string; thread?: string;
+  memCtx: string; sessionSummary?: string; clock?: string; mentioned: boolean; isDM: boolean;
+  mood: Mood; speakState: SpeakState; inExchange: boolean; channelName: string;
+  everyonePing: boolean; endingConvo: boolean;
 }): Promise<BrainDecision> {
-
   const bondLabel = opts.bond > 70 ? 'close' : opts.bond > 40 ? 'neutral' : 'distant';
   const moodLine  = opts.mood.mode === 'active'
-    ? opts.mood.until
-      ? `active (${Math.round((opts.mood.until - Date.now()) / 60_000)}m left)`
-      : 'active'
+    ? opts.mood.until ? `active (${Math.round((opts.mood.until - Date.now()) / 60_000)}m left)` : 'active'
     : 'passive';
 
-  const parts: string[] = [
-    `mood: ${moodLine} | speak: ${opts.speakState.mode} | channel: #${opts.channelName}`,
-  ];
-
-  if (opts.memCtx)          parts.push(`\nCONTEXT:\n${opts.memCtx.slice(0, MAX_MEM_CHARS)}`);
-  if (opts.sessionSummary)  parts.push(`\nSESSION (earlier today):\n${opts.sessionSummary.slice(0, MAX_SUMMARY_CHARS)}`);
-  if (opts.clock)           parts.push(`\nCLOCK: ${opts.clock}`);
-  if (opts.thread)          parts.push(`\nREPLY TO:\n${opts.thread}`);
+  const parts: string[] = [`mood: ${moodLine} | speak: ${opts.speakState.mode} | channel: #${opts.channelName}`];
+  if (opts.memCtx)         parts.push(`\nCONTEXT:\n${opts.memCtx.slice(0, MAX_MEM_CHARS)}`);
+  if (opts.sessionSummary) parts.push(`\nSESSION (earlier today):\n${opts.sessionSummary.slice(0, MAX_SUMMARY_CHARS)}`);
+  if (opts.clock)          parts.push(`\nCLOCK: ${opts.clock}`);
+  if (opts.thread)         parts.push(`\nREPLY TO:\n${opts.thread}`);
   parts.push(`\nCHAT:\n${opts.transcript}`);
 
   const flags: string[] = [];
@@ -500,31 +400,18 @@ async function brain(opts: {
 
   try {
     const raw = await cerebras.call(
-      [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user',   content: parts.join('\n') },
-      ],
-      0.88,
-      1024,
+      [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: parts.join('\n') }],
+      0.88, 1024,
     );
-
-    console.log(`[Brain] raw response: ${raw.slice(0, 200)}`);
+    console.log(`[Brain] raw: ${raw.slice(0, 200)}`);
     const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('no JSON found in response');
-    const parsed   = JSON.parse(jsonMatch[0]);
-    const action   = (['speak', 'react', 'ignore'] as const).includes(parsed.action)
-      ? parsed.action as BrainDecision['action']
-      : 'ignore';
-    const reply    = typeof parsed.reply === 'string'
-      ? parsed.reply.trim().replace(/^["']|["']$/g, '')
-      : '';
+    if (!jsonMatch) throw new Error('no JSON in response');
+    const parsed  = JSON.parse(jsonMatch[0]);
+    const action  = (['speak', 'react', 'ignore'] as const).includes(parsed.action) ? parsed.action as BrainDecision['action'] : 'ignore';
+    const reply   = typeof parsed.reply === 'string' ? parsed.reply.trim().replace(/^["']|["']$/g, '') : '';
     const reaction = sanitizeEmoji(parsed.reaction);
-    const pause    = typeof parsed.pause === 'number' && parsed.pause > 0
-      ? Math.min(Math.round(parsed.pause), PAUSE_MAX_MINS)
-      : 0;
-
+    const pause   = typeof parsed.pause === 'number' && parsed.pause > 0 ? Math.min(Math.round(parsed.pause), PAUSE_MAX_MINS) : 0;
     return { action, reply, reaction, pause };
-
   } catch (e: any) {
     console.warn('[Brain] parse error:', e.message?.slice(0, 80));
     return (opts.mentioned || opts.isDM)
@@ -541,10 +428,9 @@ function sanitizeEmoji(raw: any): string {
   return RE.test(e) ? e : '';
 }
 
-function fireSideEffects(opts: { guildId: string; userId: string; action: string; newFact?: string; }) {
+function fireSideEffects(opts: { guildId: string; userId: string; action: string; }) {
   if (opts.guildId === 'dm') return;
   if (opts.action === 'speak') updateBond(opts.guildId, opts.userId, 1).catch(() => {});
-  if (opts.newFact) addFact(opts.guildId, opts.newFact).catch(() => {});
 }
 
 let bgLock        = false;
@@ -553,10 +439,7 @@ let lastCompress  = 0;
 let lastProactive = 0;
 
 async function withBgBudget<T>(fn: () => Promise<T>): Promise<T | null> {
-  if (bgLock || !cerebras.canCall(EST_BG_TOKENS)) {
-    console.log(`[BG] skipped — bgLock=${bgLock} or budget tight`);
-    return null;
-  }
+  if (bgLock || !cerebras.canCall(EST_BG_TOKENS)) { console.log(`[BG] skipped`); return null; }
   bgLock = true;
   try { return await fn(); }
   finally { setTimeout(() => { bgLock = false; }, 30_000); }
@@ -571,16 +454,13 @@ async function runProfiler(client: Client) {
         if (!cerebras.canCall(EST_BG_TOKENS)) break;
         try {
           const fetched = await (ch as any).messages.fetch({ limit: 15 });
-          const msgs    = ([...fetched.values()] as Message[]).reverse();
+          const msgs = ([...fetched.values()] as Message[]).reverse();
           seedSTM(ch.id, msgs);
           const byAuthor = new Map<string, string[]>();
           for (const m of msgs) {
             if (m.author.bot || !m.content.trim()) continue;
             cacheId(m.author.id, m.member?.displayName || m.author.username);
-            await upsertMember(guild.id, m.author.id, {
-              displayName: m.member?.displayName || m.author.username,
-              username:    m.author.username,
-            });
+            await upsertMember(guild.id, m.author.id, { displayName: m.member?.displayName || m.author.username, username: m.author.username });
             if (!byAuthor.has(m.author.id)) byAuthor.set(m.author.id, []);
             byAuthor.get(m.author.id)!.push(m.content.slice(0, 80));
           }
@@ -592,12 +472,12 @@ async function runProfiler(client: Client) {
             try {
               const raw = await cerebras.call([
                 { role: 'system', content: 'one-line personality read from discord messages. output ONLY: {"p":"..."}' },
-                { role: 'user',   content: `${name}: ${lines.slice(0, 8).join(' | ')}` },
+                { role: 'user', content: `${name}: ${lines.slice(0, 8).join(' | ')}` },
               ], 0.4, 50, FAST_MODEL);
-              const jsonMatch = raw.match(/\{[\s\S]*\}/);
-              if (!jsonMatch) continue;
-              const parsed = JSON.parse(jsonMatch[0]);
-              if (parsed.p) await upsertMember(guild.id, uid, { personality: parsed.p });
+              const m2 = raw.match(/\{[\s\S]*\}/);
+              if (!m2) continue;
+              const p = JSON.parse(m2[0]);
+              if (p.p) await upsertMember(guild.id, uid, { personality: p.p });
             } catch {}
           }
         } catch {}
@@ -617,38 +497,32 @@ async function runCompress(guildId: string, channelId: string) {
     try {
       const raw = await cerebras.call([
         { role: 'system', content: 'extract memorable facts and inside jokes. ONLY valid JSON: {"facts":["x"],"jokes":["x"]}' },
-        { role: 'user',   content: stmText },
+        { role: 'user', content: stmText },
       ], 0.4, 120, FAST_MODEL);
-      const jsonMatch = raw.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) return;
-      const p = JSON.parse(jsonMatch[0]);
+      const m2 = raw.match(/\{[\s\S]*\}/);
+      if (!m2) return;
+      const p = JSON.parse(m2[0]);
       for (const f of (p.facts || []).slice(0, 4)) await addFact(guildId, f, 'facts');
       for (const j of (p.jokes || []).slice(0, 2)) await addFact(guildId, j, 'jokes');
-      console.log(`[Compress] +${p.facts?.length || 0} facts +${p.jokes?.length || 0} jokes`);
     } catch {}
     const buf = sessionBuffers.get(channelId);
-    if (!buf || buf.length < 10) return;
-    if (!cerebras.canCall(EST_BG_TOKENS)) return;
+    if (!buf || buf.length < 10 || !cerebras.canCall(EST_BG_TOKENS)) return;
     const bufText = buf.join('\n').slice(-2000);
     try {
       const raw2 = await cerebras.call([
-        { role: 'system', content: 'summarize this discord chat in 2-3 sentences: main topics, who said what, mood/vibe. be concise, no fluff. output ONLY: {"s":"..."}' },
-        { role: 'user',   content: bufText },
+        { role: 'system', content: 'summarize discord chat in 2-3 sentences. ONLY: {"s":"..."}' },
+        { role: 'user', content: bufText },
       ], 0.3, 80, FAST_MODEL);
-      const m2 = raw2.match(/\{[\s\S]*\}/);
-      if (!m2) return;
-      const p2 = JSON.parse(m2[0]);
-      if (p2.s?.trim()) {
-        sessionSummaries.set(channelId, p2.s.trim().slice(0, MAX_SUMMARY_CHARS));
-        console.log(`[Compress] session summary updated for #${channelId.slice(-5)}`);
-      }
+      const m3 = raw2.match(/\{[\s\S]*\}/);
+      if (!m3) return;
+      const p2 = JSON.parse(m3[0]);
+      if (p2.s?.trim()) sessionSummaries.set(channelId, p2.s.trim().slice(0, MAX_SUMMARY_CHARS));
     } catch {}
   });
 }
 
 async function runProactive(client: Client) {
-  if (Date.now() - lastProactive < PROACTIVE_INTERVAL) return;
-  if (!cerebras.canCall(EST_BG_TOKENS)) return;
+  if (Date.now() - lastProactive < PROACTIVE_INTERVAL || !cerebras.canCall(EST_BG_TOKENS)) return;
   lastProactive = Date.now();
   await withBgBudget(async () => {
     const now = Date.now();
@@ -662,24 +536,23 @@ async function runProactive(client: Client) {
     if (!candidates.length) return;
     const pick = candidates[Math.floor(Math.random() * Math.min(candidates.length, 5))];
     const sensitiveWords = /\b(sorry|rip|died?|passed?|grief|depress|sad|hurt|cry|miss(ing)?|loss|trauma|broke up|suicide|cutting|abuse)\b/i;
-    if (sensitiveWords.test(pick.hint)) { console.log(`[Proactive] skipped — sensitive topic`); return; }
+    if (sensitiveWords.test(pick.hint)) return;
     const ch = client.channels.cache.get(pick.id) as TextChannel | undefined;
     if (!ch?.isTextBased()) return;
     try {
       const raw = await cerebras.call([
-        { role: 'system', content: `you are ${BOT_NAME}, gen z discord person. send ONE short casual message to break silence, or skip. lowercase. ONLY valid JSON.` },
-        { role: 'user',   content: `channel: ${pick.hint}\nJSON: {"skip":false,"msg":"..."}` },
+        { role: 'system', content: `you are ${BOT_NAME}, gen z discord person. ONE short casual message to break silence, or skip. lowercase. ONLY valid JSON.` },
+        { role: 'user', content: `channel: ${pick.hint}\nJSON: {"skip":false,"msg":"..."}` },
       ], 0.9, 80, FAST_MODEL);
-      const jsonMatch = raw.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) return;
-      const p = JSON.parse(jsonMatch[0]);
+      const m2 = raw.match(/\{[\s\S]*\}/);
+      if (!m2) return;
+      const p = JSON.parse(m2[0]);
       if (p.skip || !p.msg?.trim()) return;
       const text = p.msg.trim().slice(0, 150);
       await ch.sendTyping().catch(() => {});
       await sleep(Math.min(400 + text.length * 20, 2500));
       await ch.send(text);
       stmPush(pick.id, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
-      console.log(`[Proactive] #${pick.id.slice(-5)}: "${text.slice(0, 50)}"`);
     } catch {}
   });
 }
@@ -694,9 +567,8 @@ async function handleDirectMessage(msg: Message) {
   const content   = cleanContent(msg.content);
 
   cacheId(msg.author.id, sender);
-  console.log(`[DM] ${sender}: "${content.slice(0, 80)}"`);
+  console.log(`[DM ✓] from ${sender} (${msg.author.id}): "${content.slice(0, 80)}"`);
 
-  // Seed history before pushing current message
   if (!stmStore.has(channelId)) {
     try {
       const fetched = await msg.channel.messages.fetch({ limit: STM_MAX });
@@ -705,10 +577,8 @@ async function handleDirectMessage(msg: Message) {
   }
 
   stmPush(channelId, {
-    ts:       msg.createdTimestamp,
-    authorId: msg.author.id,
-    author:   sender,
-    content:  content.length > 100 ? content.slice(0, 97) + '…' : content,
+    ts: msg.createdTimestamp, authorId: msg.author.id, author: sender,
+    content: content.length > 100 ? content.slice(0, 97) + '…' : content,
   });
 
   dmPending.set(channelId, msg);
@@ -726,10 +596,12 @@ async function respondToDM(msg: Message) {
   const sender    = msg.author.username;
   const content   = cleanContent(msg.content);
 
+  console.log(`[DM respond] to ${sender}: "${content.slice(0, 60)}"`);
+
   let threadCtx: string | undefined;
   if (msg.reference?.messageId) {
     try {
-      const ref       = await msg.channel.messages.fetch(msg.reference.messageId);
+      const ref = await msg.channel.messages.fetch(msg.reference.messageId);
       const refAuthor = ref.author.id === BOT_ID ? BOT_NAME : ref.author.username;
       threadCtx = `${refAuthor}: "${cleanContent(ref.content).slice(0, 150)}"`;
     } catch {}
@@ -739,29 +611,20 @@ async function respondToDM(msg: Message) {
   const botReplied   = recentMsgs.some(m => m.authorId === BOT_ID);
   const senderRecent = recentMsgs.filter(m => m.authorId === msg.author.id).length;
   const inExchange   = botReplied && senderRecent >= 2;
-
-  const END_PHRASES = /\b(bye|cya|gotta go|gtg|see ya|later|peace|good night|gn|logging off|ttyl|im out|i\s*m\s*out)\b/i;
-  const endingConvo = END_PHRASES.test(content);
+  const END_PHRASES  = /\b(bye|cya|gotta go|gtg|see ya|later|peace|good night|gn|logging off|ttyl|im out|i\s*m\s*out)\b/i;
+  const endingConvo  = END_PHRASES.test(content);
 
   lastBrainCallAt = Date.now();
   const decision = await brain({
-    sender,
-    bond:         50,
-    message:      content,
-    transcript:   stmFormat(stmGet(channelId)),
-    thread:       threadCtx,
-    memCtx:       '',
-    mentioned:    true,
-    isDM:         true,
-    mood:         { mode: 'active', count: 0 },
-    speakState:   { mode: 'active', reason: 'dm' },
-    inExchange,
-    channelName:  'DM',
-    everyonePing: false,
-    endingConvo,
+    sender, bond: 50, message: content,
+    transcript: stmFormat(stmGet(channelId)), thread: threadCtx, memCtx: '',
+    mentioned: true, isDM: true,
+    mood: { mode: 'active', count: 0 },
+    speakState: { mode: 'active', reason: 'dm' },
+    inExchange, channelName: 'DM', everyonePing: false, endingConvo,
   });
 
-  console.log(`[DM] ${sender} → ${decision.action}${decision.reply ? ` — "${decision.reply.slice(0, 50)}"` : decision.reaction ? ` — ${decision.reaction}` : ''}`);
+  console.log(`[DM decision] ${sender} → action:${decision.action} reply:"${decision.reply?.slice(0, 50)}"`);
 
   if (decision.reaction) msg.react(decision.reaction).catch(() => {});
 
@@ -772,38 +635,15 @@ async function respondToDM(msg: Message) {
     await sleep(typingMs);
     await msg.reply({ content: text, allowedMentions: { repliedUser: false } });
     stmPush(channelId, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
+    console.log(`[DM sent] to ${sender}: "${text.slice(0, 80)}"`);
   }
 }
 
-// ── MAIN MESSAGE HANDLER (guild channels) ─────────────────────────
+// ── GUILD MESSAGE HANDLER ──────────────────────────────────────────
 const debounceTimers  = new Map<string, NodeJS.Timeout>();
-const pendingTriggers = new Map<string, {
-  msg: Message; mentioned: boolean; guildId: string; everyonePing: boolean;
-}>();
+const pendingTriggers = new Map<string, { msg: Message; mentioned: boolean; guildId: string; everyonePing: boolean; }>();
 
-async function handleMessage(msg: Message) {
-  // FIX 1: fetch partial message first — DM messages often come in as partials
-  // with empty content until fetched. Must happen before ANY content checks.
-  if (msg.partial) {
-    try { msg = await msg.fetch(); } catch { return; }
-  }
-
-  // FIX 2: bot check before anything else
-  if (msg.author?.bot) return;
-
-  // FIX 3: DM check uses BOTH isDMBased() AND guildId null check as fallback.
-  // Partial DMChannels can make isDMBased() unreliable before the channel is
-  // cached — guildId === null is the ground truth for "this is a DM".
-  const isDM = msg.channel.isDMBased() || msg.guildId === null;
-  if (isDM) {
-    // Content check AFTER DM route decision — don't bail early on empty partial content
-    if (!msg.content?.trim()) return;
-    return handleDirectMessage(msg);
-  }
-
-  // Guild messages from here down
-  if (!msg.content?.trim()) return;
-
+async function handleGuildMessage(msg: Message) {
   try {
     const guildId   = msg.guildId!;
     const channelId = msg.channelId;
@@ -815,10 +655,9 @@ async function handleMessage(msg: Message) {
     upsertMember(guildId, msg.author.id, { displayName: sender, username: msg.author.username }).catch(() => {});
 
     stmPush(channelId, {
-      ts:       msg.createdTimestamp,
-      authorId: msg.author.id,
-      author:   msg.author.id === BOT_ID ? '[me]' : sender,
-      content:  content.length > 100 ? content.slice(0, 97) + '…' : content,
+      ts: msg.createdTimestamp, authorId: msg.author.id,
+      author: msg.author.id === BOT_ID ? '[me]' : sender,
+      content: content.length > 100 ? content.slice(0, 97) + '…' : content,
     });
 
     tickUnread(channelId);
@@ -826,26 +665,20 @@ async function handleMessage(msg: Message) {
     if (!moodTick(channelId, msg.author.id, mentioned, false)) return;
 
     if (!cerebras.canCall(EST_TOKENS_PER_CALL)) {
-      console.log(`[Budget] Cerebras tight${mentioned ? ' (mention!)' : ''}`);
+      console.log(`[Budget] tight${mentioned ? ' (mention!)' : ''}`);
       if (!mentioned) return;
     }
 
     if (!mentioned && Date.now() - lastBrainCallAt < MIN_BRAIN_GAP_MS) {
-      console.log('[Pace] skip — too soon since last brain call');
-      return;
+      console.log('[Pace] too soon'); return;
     }
 
     const prevTrigger        = pendingTriggers.get(channelId);
     const effectiveMentioned = mentioned || (prevTrigger?.mentioned ?? false);
     const everyonePing       = msg.mentions.everyone ?? false;
 
-    pendingTriggers.set(channelId, {
-      msg, mentioned: effectiveMentioned, guildId,
-      everyonePing: everyonePing || (prevTrigger?.everyonePing ?? false),
-    });
+    pendingTriggers.set(channelId, { msg, mentioned: effectiveMentioned, guildId, everyonePing: everyonePing || (prevTrigger?.everyonePing ?? false) });
     if (debounceTimers.has(channelId)) clearTimeout(debounceTimers.get(channelId)!);
-
-    const debounceMs = mentioned ? 350 : DEBOUNCE_MS;
 
     debounceTimers.set(channelId, setTimeout(async () => {
       debounceTimers.delete(channelId);
@@ -862,54 +695,48 @@ async function handleMessage(msg: Message) {
       try {
         const speakState = await getSpeakState(tChannel, tGuild);
         if (speakState.mode === 'paused' && speakState.resumeAt && Date.now() < speakState.resumeAt && !tMentioned) {
-          console.log(`[Speak] paused — skip`);
-          return;
+          console.log(`[Speak] paused — skip`); return;
         }
 
         if (!stmStore.has(tChannel)) {
-          try {
-            const fetched = await tMsg.channel.messages.fetch({ limit: STM_MAX });
-            seedSTM(tChannel, ([...fetched.values()] as Message[]).reverse());
-          } catch {}
+          try { const f = await tMsg.channel.messages.fetch({ limit: STM_MAX }); seedSTM(tChannel, ([...f.values()] as Message[]).reverse()); } catch {}
         }
 
         let threadCtx: string | undefined;
         if (tMsg.reference?.messageId) {
           try {
-            const ref       = await tMsg.channel.messages.fetch(tMsg.reference.messageId);
+            const ref = await tMsg.channel.messages.fetch(tMsg.reference.messageId);
             const refAuthor = ref.author.id === BOT_ID ? BOT_NAME : (ref.member?.displayName || ref.author.username);
             threadCtx = `${refAuthor}: "${cleanContent(ref.content).slice(0, 150)}"`;
           } catch {}
         }
 
         const [memberData, memory] = await Promise.all([getMember(tGuild, tMsg.author.id), getMemory(tGuild)]);
-        const bond    = typeof memberData.bond === 'number' ? memberData.bond : 50;
+        const bond = typeof memberData.bond === 'number' ? memberData.bond : 50;
         const memLines: string[] = [];
         if (memory.facts.length)    memLines.push(`facts: ${memory.facts.slice(-3).join(' | ')}`);
         if (memory.jokes.length)    memLines.push(`jokes: ${memory.jokes.slice(-2).join(' | ')}`);
         if (memberData.personality) memLines.push(`${tSender}: ${memberData.personality}`);
-        const memCtx = memLines.join('\n');
 
-        const mood          = getMood(tChannel);
-        const recentMsgs    = stmGet(tChannel).slice(-8);
-        const botReplied    = recentMsgs.some(m => m.authorId === BOT_ID);
-        const senderRecent  = recentMsgs.filter(m => m.authorId === tMsg.author.id).length;
-        const inExchange    = botReplied && senderRecent >= 2;
-        const END_PHRASES   = /\b(bye|cya|gotta go|gtg|see ya|later|peace|good night|gn|logging off|ttyl|im out|i\s*m\s*out)\b/i;
-        const endingConvo   = END_PHRASES.test(tContent);
-        const sessionSummary = sessionSummaries.get(tChannel);
-        const clock         = clockLine(tChannel, mood);
+        const mood         = getMood(tChannel);
+        const recentMsgs   = stmGet(tChannel).slice(-8);
+        const botReplied   = recentMsgs.some(m => m.authorId === BOT_ID);
+        const senderRecent = recentMsgs.filter(m => m.authorId === tMsg.author.id).length;
+        const inExchange   = botReplied && senderRecent >= 2;
+        const END_PHRASES  = /\b(bye|cya|gotta go|gtg|see ya|later|peace|good night|gn|logging off|ttyl|im out|i\s*m\s*out)\b/i;
+        const endingConvo  = END_PHRASES.test(tContent);
 
         lastBrainCallAt = Date.now();
-        const decision  = await brain({
+        const decision = await brain({
           sender: tSender, bond, message: tContent,
           transcript: stmFormat(stmGet(tChannel)), thread: threadCtx,
-          memCtx, sessionSummary, clock,
+          memCtx: memLines.join('\n'), sessionSummary: sessionSummaries.get(tChannel),
+          clock: clockLine(tChannel, mood),
           mentioned: tMentioned, isDM: false, mood, speakState,
           inExchange, channelName: tChannelName, everyonePing: tEveryonePing, endingConvo,
         });
 
-        console.log(`[Brain] ${tSender}: ${decision.action}${decision.reply ? ` — "${decision.reply.slice(0, 50)}"` : decision.reaction ? ` — ${decision.reaction}` : ''}`);
+        console.log(`[Brain] ${tSender}: ${decision.action}${decision.reply ? ` — "${decision.reply.slice(0, 50)}"` : ''}`);
 
         if (decision.reaction) tMsg.react(decision.reaction).catch(() => {});
 
@@ -923,23 +750,20 @@ async function handleMessage(msg: Message) {
           const clk = activityClocks.get(tChannel);
           if (clk) clk.replies++;
           fireSideEffects({ guildId: tGuild, userId: tMsg.author.id, action: 'speak' });
-          if (endingConvo) { console.log(`[Mood] ${tSender} ending convo → passive`); goPassive(tChannel); }
+          if (endingConvo) goPassive(tChannel);
           else if (speakState.mode !== 'active') setSpeakState(tChannel, tGuild, { mode: 'active', reason: 'spoke' }).catch(() => {});
-        } else if (decision.action === 'speak') {
-          console.log('[Brain] speak→empty reply, skipping');
         }
 
         if (decision.pause > 0) {
           await setSpeakState(tChannel, tGuild, { mode: 'paused', resumeAt: Date.now() + decision.pause * 60_000, reason: 'self-paced' });
           goPassive(tChannel);
-          console.log(`[Pause] #${tChannel.slice(-5)} — self-paced ${decision.pause}m`);
         }
 
         runCompress(tGuild, tChannel).catch(() => {});
-      } catch (e) { console.error('[Handler debounce]', e); }
-    }, debounceMs));
+      } catch (e) { console.error('[Guild debounce]', e); }
+    }, mentioned ? 350 : DEBOUNCE_MS));
 
-  } catch (e) { console.error('[Handler outer]', e); }
+  } catch (e) { console.error('[Guild handler]', e); }
 }
 
 // ── STARTUP ──────────────────────────────────────────────────────
@@ -956,10 +780,6 @@ export async function startBot(token: string) {
       GatewayIntentBits.MessageContent,
       GatewayIntentBits.GuildMembers,
     ],
-    // FIX 4: Partials.Message + Partials.Channel are both required for DMs.
-    // Partials.Channel makes the DMChannel partial until fetched — without it,
-    // DM messageCreate events simply do not fire in discord.js v14.
-    // Partials.User ensures DM events fire reliably when the user isn't cached.
     partials: [Partials.Message, Partials.Channel, Partials.User],
   });
 
@@ -968,18 +788,9 @@ export async function startBot(token: string) {
     BOT_ID   = botClient!.user!.id;
     cacheId(BOT_ID, BOT_NAME);
 
-    console.log(`
-╔═══════════════════════════════════════════════════════════╗
-║  ✓ ${BOT_NAME} — Cerebras Edition
-║  BRAIN  : ${BRAIN_MODEL}
-║  FAST   : ${FAST_MODEL} (bg jobs only)
-║  LIMITS : 30 RPM | 14,400 RPD | 1M tokens/day | 8192 ctx
-║  CACHE  : system prompt cached after 1st call (≈350 tok)
-║  KEYS   : ${cerebras.status().split('|')[0].trim()}
-║  STM    : ${STM_MAX} msgs | Debounce: ${DEBOUNCE_MS}ms | DM: ${DM_DEBOUNCE_MS}ms
-║  Passive: every ${PASSIVE_EVERY}/${PASSIVE_EVERY_BUSY} msgs | Active: ${ACTIVE_MINS}m
-║  Pause  : AI sets its own quiet window (0-${PAUSE_MAX_MINS}m) via decision JSON
-╚═══════════════════════════════════════════════════════════╝\n`);
+    console.log(`[Boot] ${BOT_NAME} (${BOT_ID}) ready`);
+    console.log(`[Boot] partials: Message, Channel, User`);
+    console.log(`[Boot] intents include DirectMessages: true`);
 
     botClient!.user!.setPresence({ status: 'online', activities: [{ name: 'the chat', type: 3 }] });
 
@@ -994,14 +805,14 @@ export async function startBot(token: string) {
         console.log(`[Boot] synced ${members.size} members — "${g.name}"`);
       }
       try {
-        const pastMembersSnap = await db.collection('servers').doc(g.id).collection('members').get();
+        const snap = await db.collection('servers').doc(g.id).collection('members').get();
         let warmed = 0;
-        for (const doc of pastMembersSnap.docs) {
+        for (const doc of snap.docs) {
           const d = doc.data() as MemberData;
           const name = d.displayName || d.username;
           if (name && !idCache.has(doc.id)) { cacheId(doc.id, name); warmed++; }
         }
-        if (warmed) console.log(`[Boot] warmed ${warmed} past members from Firebase — "${g.name}"`);
+        if (warmed) console.log(`[Boot] warmed ${warmed} past members — "${g.name}"`);
       } catch {}
     }
 
@@ -1020,25 +831,50 @@ export async function startBot(token: string) {
     scheduleProactive();
   });
 
-  // FIX 5: single MessageCreate handler — no more duplicate registration.
-  // Admin commands are handled inline via early-return guards.
-  botClient.on(Events.MessageCreate, handleMessage);
+  // ── THE ONLY MessageCreate HANDLER ────────────────────────────
+  // Split into DM vs guild at the very top, after partial fetch.
+  // No dual-handler, no racing, no silent drops.
+  botClient.on(Events.MessageCreate, async (msg: Message) => {
+    // STEP 1: always fetch partials first — DM messages arrive with empty content
+    if (msg.partial) {
+      try { msg = await msg.fetch(); }
+      catch (e) { console.error('[MessageCreate] partial fetch failed:', e); return; }
+    }
 
-  // FIX 6: Admin commands in a separate handler with explicit DM guard at top.
-  // Without this, msg.member is null in DMs and permission checks throw/silently fail.
-  botClient.on(Events.MessageCreate, async (msg) => {
-    if (!msg.guildId) return; // <-- DM guard: skip all admin logic for DMs
-    if (
-      !msg.member?.permissions.has('Administrator') &&
-      !msg.member?.permissions.has('ManageMessages')
-    ) return;
+    // STEP 2: ignore bots (after fetch so author is populated)
+    if (!msg.author || msg.author.bot) return;
 
-    const c       = msg.content.trim();
-    const guildId = msg.guildId!;
+    // STEP 3: route — guildId is the ground truth
+    // isDMBased() can be unreliable on uncached partial channels
+    const isDM = !msg.guildId;
+
+    console.log(`[MSG] from:${msg.author.username} guild:${msg.guildId ?? 'DM'} isDM:${isDM} content:"${msg.content?.slice(0, 40)}"`);
+
+    if (isDM) {
+      // Extra safety: ensure content is populated after partial fetch
+      if (!msg.content?.trim()) {
+        console.log('[DM] empty content after fetch — skipping');
+        return;
+      }
+      return handleDirectMessage(msg);
+    }
+
+    // Guild message
+    if (!msg.content?.trim()) return;
+    return handleGuildMessage(msg);
+  });
+
+  // ── ADMIN COMMANDS (guild only) ────────────────────────────────
+  botClient.on(Events.MessageCreate, async (msg: Message) => {
+    if (!msg.guildId) return; // hard DM guard
+    if (!msg.member?.permissions.has('Administrator') && !msg.member?.permissions.has('ManageMessages')) return;
+
+    const c       = msg.content?.trim() ?? '';
+    const guildId = msg.guildId;
     const chId    = msg.channelId;
 
-    if (c === '!wake') { await setSpeakState(chId, guildId, { mode: 'active', reason: 'admin' }); msg.reply('im up'); }
-    if (c === '!sleep') { await setSpeakState(chId, guildId, { mode: 'waiting', reason: 'admin' }); msg.reply('going quiet'); }
+    if (c === '!wake')    { await setSpeakState(chId, guildId, { mode: 'active', reason: 'admin' }); msg.reply('im up'); }
+    if (c === '!sleep')   { await setSpeakState(chId, guildId, { mode: 'waiting', reason: 'admin' }); msg.reply('going quiet'); }
     if (c.startsWith('!pause ')) {
       const mins = parseInt(c.split(' ')[1]) || 10;
       await setSpeakState(chId, guildId, { mode: 'paused', resumeAt: Date.now() + mins * 60_000, reason: 'admin' });
@@ -1055,11 +891,11 @@ export async function startBot(token: string) {
       const moodStr = mood.mode === 'active' && mood.until
         ? `active (${Math.round((mood.until - Date.now()) / 60_000)}m left)`
         : `passive (count: ${mood.count})`;
-      const clk = clockLine(chId, mood);
       await msg.reply([
-        `mood: ${moodStr}`, clk ? `clock: ${clk}` : '',
+        `mood: ${moodStr}`,
         `speak: ${speak.mode}${speak.resumeAt ? ` until ${new Date(speak.resumeAt).toLocaleTimeString()}` : ''}`,
-        `cerebras: ${cerebras.status()}`, `bgLock: ${bgLock}`,
+        `cerebras: ${cerebras.status()}`,
+        `bgLock: ${bgLock}`,
       ].filter(Boolean).join('\n'));
     }
     if (c === '!memory') {
@@ -1093,5 +929,5 @@ export async function startBot(token: string) {
   await botClient.login(token);
 }
 
-export function stopBot() { botClient?.destroy(); botClient = null; }
+export function stopBot()      { botClient?.destroy(); botClient = null; }
 export function getBotStatus() { return botClient ? 'running' : 'stopped'; }
