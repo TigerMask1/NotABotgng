@@ -978,7 +978,14 @@ const pendingTriggers = new Map<string, {
 }>();
 
 async function handleMessage(msg: Message) {
-  console.log(`[DEBUG] Event fired! DM? ${msg.channel?.isDMBased()} | Author: ${msg.author?.username} | Content: "${msg.content}"`);
+ try {
+    console.log("[GATEWAY TRACE] Event hit handleMessage!");
+    console.log(` -> Channel ID: ${msg.channelId}`);
+    console.log(` -> Is Partial Message: ${msg.partial}`);
+    console.log(` -> Author ID: ${msg.author?.id || "Unknown (Partial)"}`);
+  } catch (debugError) {
+    console.error("[DEBUG CRASHED]", debugError);
+  }
   // Partials — content is empty until fetched.
   if (msg.partial) {
     try { msg = await msg.fetch(); } catch { return; }
