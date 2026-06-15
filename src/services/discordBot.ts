@@ -978,14 +978,6 @@ const pendingTriggers = new Map<string, {
 }>();
 
 async function handleMessage(msg: Message) {
- try {
-    console.log("[GATEWAY TRACE] Event hit handleMessage!");
-    console.log(` -> Channel ID: ${msg.channelId}`);
-    console.log(` -> Is Partial Message: ${msg.partial}`);
-    console.log(` -> Author ID: ${msg.author?.id || "Unknown (Partial)"}`);
-  } catch (debugError) {
-    console.error("[DEBUG CRASHED]", debugError);
-  }
   // Partials — content is empty until fetched.
   if (msg.partial) {
     try { msg = await msg.fetch(); } catch { return; }
@@ -1220,12 +1212,6 @@ export async function startBot(token: string) {
     // Partials.Channel is required for DM messageCreate events to fire at all.
     // Partials.User needed for DM events to fire reliably.
   });
-
-  // ── TEMPORARY DIAGNOSTIC LISTENER ────────────────────────────────
-  botClient.on('messageCreate', (msg) => {
-    console.log(`[GATEWAY DEBUG] Event fired! DM: ${msg.channel.isDMBased()}, Content: "${msg.content}"`);
-  });
-  // ─────────────────────────────────────────────────────────────────
 
   botClient.on(Events.ClientReady, async () => {
     BOT_NAME = botClient!.user!.username;
