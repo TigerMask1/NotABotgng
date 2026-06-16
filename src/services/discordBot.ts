@@ -894,10 +894,20 @@ function evaluateEngagementCandidate(opts: {
   const botStreak = botReplyStreak(opts.channelId);
   const directQuestion = /\?|\b(what|wht|why|how|do u|do you|are u|are you|can u|can you|think)\b/i.test(opts.content);
   const veryShort = extractTopicWords(opts.content).length === 0 && opts.content.length < 24;
+  const lastBotMsg = [...recent].reverse().find(m => m.authorId === BOT_ID);
+  const afterLastBot = lastBotMsg
+    ? recent.filter(m => m.ts > lastBotMsg.ts && m.authorId !== BOT_ID)
+    : [];
+  const sameAuthorAfterBot = afterLastBot.length > 0 && afterLastBot.every(m => m.authorId === opts.authorId);
+  const tightFollowup = !!lastBotMsg
+    && now - lastBotMsg.ts < 90_000
+    && sameAuthorAfterBot
+    && directQuestion;
 
   if (opts.mentioned) { score += 0.95; reasons.push('direct mention'); }
   if (replyToBot) { score += 0.9; reasons.push('reply to bot'); }
   if (alias) { score += 0.55; reasons.push('bot name/alias'); }
+  if (tightFollowup) { score += 0.35; reasons.push('tight followup after bot reply'); }
   if (secondPerson && recentBot && directQuestion) { score += 0.28; reasons.push('second-person question after bot activity'); }
   else if (secondPerson && recentBot) { score += 0.16; reasons.push('second-person after bot activity'); }
   else if (secondPerson && attention && directQuestion) { score += 0.14; reasons.push('second-person question while attentive'); }
@@ -915,8 +925,9 @@ function evaluateEngagementCandidate(opts: {
   if (intensity.level === 'quiet') { score += 0.1; reasons.push('quiet chat'); }
   const clk = activityClocks.get(opts.channelId);
   if (clk && clk.replies >= 2) { score -= 0.25; reasons.push('bot already spoke recently'); }
-  if (botStreak >= 2 && !explicit) { score -= 0.45; reasons.push('anti-monologue'); }
-  if (botStreak >= 3 && !explicit && !directQuestion) {
+  if (botStreak >= 2 && !explicit && !tightFollowup) { score -= 0.45; reasons.push('anti-monologue'); }
+  else if (botStreak >= 2 && !explicit && tightFollowup) { score -= 0.12; reasons.push('soft anti-monologue'); }
+  if (botStreak >= 3 && !explicit && !tightFollowup) {
     return {
       allowAi: false,
       probability: 0,
