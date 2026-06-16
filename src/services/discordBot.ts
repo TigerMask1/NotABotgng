@@ -218,6 +218,24 @@ const PROACTIVE_OPEN_LOOP_CHANCE = 0.45;
 const GLOBAL_SOCIAL_MEMORY_CHANCE = 0.35;
 const MIN_BRAIN_GAP_MS   = 2200;
 const PAUSE_MAX_MINS     = 30;
+
+const ACTIVITY_WINDOW_MS       = 3 * 60_000;
+const ACTIVITY_KEEP_MS         = 5 * 60_000;
+const ATTENTION_BUSY_MIN_MS    = 45_000;
+const ATTENTION_BUSY_MAX_MS    = 120_000;
+const ATTENTION_NORMAL_MIN_MS  = 2 * 60_000;
+const ATTENTION_NORMAL_MAX_MS  = 5 * 60_000;
+const ATTENTION_QUIET_MIN_MS   = 5 * 60_000;
+const ATTENTION_QUIET_MAX_MS   = 10 * 60_000;
+const ENGAGE_GLOBAL_COOLDOWN_MS = 3500;
+const ENGAGE_CHANNEL_COOLDOWN_MS = 18_000;
+const ENGAGE_BURST_WINDOW_MS   = 60_000;
+const ENGAGE_BURST_MAX_GLOBAL  = 12;
+const ENGAGE_BURST_MAX_CHANNEL = 4;
+const TOPIC_MAX_PER_CHANNEL    = 16;
+const TOPIC_DECAY_MS           = 45 * 60_000;
+const TOPIC_GOAL_MAX_MSGS      = 6;
+const TOPIC_GOAL_MAX_MS        = 8 * 60_000;
 const SOCIAL_SIGNAL_MAX   = 45;
 const FOLLOW_UP_MAX       = 35;
 const SERVER_IMPRESSION_MAX = 25;
@@ -558,6 +576,340 @@ function moodTick(
   return fire;
 }
 
+// â”€â”€ LOCAL ENGAGEMENT / ATTENTION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+interface ActivitySample {
+  ts: number;
+  authorId: string;
+}
+
+interface ChatIntensity {
+  messages: number;
+  speakers: number;
+  perMinute: number;
+  level: 'quiet' | 'normal' | 'busy';
+}
+
+type TopicGoalKind = 'ask_question' | 'make_comment' | 'continue_thread' | 'observe_vibe';
+
+interface TopicCandidate {
+  key: string;
+  words: string[];
+  score: number;
+  firstSeen: number;
+  lastSeen: number;
+  speakers: Set<string>;
+  sample: string;
+}
+
+interface TopicGoal {
+  kind: TopicGoalKind;
+  topic: string;
+  startedAt: number;
+  expiresAt: number;
+  messagesLeft: number;
+  reason: string;
+}
+
+interface AttentionState {
+  activeUntil: number;
+  startedAt: number;
+  reason: string;
+  messagesSeen: number;
+  topicGoal?: TopicGoal;
+}
+
+interface EngagementDecision {
+  allowAi: boolean;
+  probability: number;
+  score: number;
+  threshold: number;
+  reasons: string[];
+  intensity: ChatIntensity;
+  attention?: AttentionState;
+  topicGoal?: TopicGoal;
+  explicit: boolean;
+  rateLimited: boolean;
+}
+
+const activityWindows = new Map<string, ActivitySample[]>();
+const attentionStates = new Map<string, AttentionState>();
+const topicCandidates = new Map<string, TopicCandidate[]>();
+const aiCallTimesGlobal: number[] = [];
+const aiCallTimesByChannel = new Map<string, number[]>();
+
+let lastEngageGlobalAt = 0;
+const lastEngageChannelAt = new Map<string, number>();
+
+const STOPWORDS = new Set([
+  'the', 'and', 'for', 'that', 'this', 'with', 'have', 'just', 'like', 'yeah', 'yea', 'lol', 'lmao', 'lmfao',
+  'you', 'your', 'are', 'was', 'were', 'what', 'when', 'where', 'why', 'how', 'can', 'cant', 'dont', 'didnt',
+  'but', 'not', 'all', 'any', 'from', 'they', 'them', 'then', 'than', 'too', 'very', 'really', 'bro', 'bruh',
+  'idk', 'tbh', 'ngl', 'imo', 'its', 'im', 'ive', 'ill', 'ur', 'u', 'me', 'my', 'we', 'our', 'us',
+]);
+
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function randBetween(min: number, max: number) {
+  return min + Math.floor(Math.random() * Math.max(1, max - min));
+}
+
+function trackActivity(channelId: string, authorId: string, ts = Date.now()): ChatIntensity {
+  const arr = activityWindows.get(channelId) ?? [];
+  arr.push({ ts, authorId });
+  const cutoff = ts - ACTIVITY_KEEP_MS;
+  const kept = arr.filter(x => x.ts >= cutoff);
+  activityWindows.set(channelId, kept);
+  return getChatIntensity(channelId, ts);
+}
+
+function getChatIntensity(channelId: string, now = Date.now()): ChatIntensity {
+  const cutoff = now - ACTIVITY_WINDOW_MS;
+  const recent = (activityWindows.get(channelId) ?? []).filter(x => x.ts >= cutoff && x.authorId !== BOT_ID);
+  const speakers = new Set(recent.map(x => x.authorId)).size;
+  const perMinute = recent.length / (ACTIVITY_WINDOW_MS / 60_000);
+  const level = perMinute >= 7 || speakers >= 5 ? 'busy' : perMinute <= 1.4 && speakers <= 2 ? 'quiet' : 'normal';
+  return { messages: recent.length, speakers, perMinute, level };
+}
+
+function attentionDuration(intensity: ChatIntensity, explicit: boolean): number {
+  if (explicit || intensity.level === 'quiet') return randBetween(ATTENTION_QUIET_MIN_MS, ATTENTION_QUIET_MAX_MS);
+  if (intensity.level === 'busy') return randBetween(ATTENTION_BUSY_MIN_MS, ATTENTION_BUSY_MAX_MS);
+  return randBetween(ATTENTION_NORMAL_MIN_MS, ATTENTION_NORMAL_MAX_MS);
+}
+
+function getAttention(channelId: string): AttentionState | undefined {
+  const a = attentionStates.get(channelId);
+  if (!a) return undefined;
+  const now = Date.now();
+  if (now >= a.activeUntil) {
+    attentionStates.delete(channelId);
+    return undefined;
+  }
+  if (a.topicGoal && (now >= a.topicGoal.expiresAt || a.topicGoal.messagesLeft <= 0)) {
+    delete a.topicGoal;
+  }
+  return a;
+}
+
+function topicGoalLine(goal?: TopicGoal): string {
+  if (!goal) return '';
+  return `${goal.kind} about "${goal.topic}" (${goal.messagesLeft} msgs left): ${goal.reason}`;
+}
+
+function topicSummary(channelId: string): string {
+  const now = Date.now();
+  const topics = (topicCandidates.get(channelId) ?? [])
+    .filter(t => now - t.lastSeen < TOPIC_DECAY_MS)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 4);
+  return topics.map(t => `${t.key} (${t.speakers.size}p, ${Math.round(t.score)})`).join(' | ');
+}
+
+function selectTopicGoal(channelId: string, reason: string, content: string, thread?: string): TopicGoal | undefined {
+  const now = Date.now();
+  const topics = (topicCandidates.get(channelId) ?? [])
+    .filter(t => now - t.lastSeen < TOPIC_DECAY_MS)
+    .sort((a, b) => b.score - a.score);
+  const topic = topics[0]?.key || extractTopicWords(content).slice(0, 3).join(' ') || (thread ? 'reply thread' : '');
+  if (!topic) return undefined;
+  const kinds: TopicGoalKind[] = thread ? ['continue_thread', 'make_comment'] : ['ask_question', 'make_comment', 'observe_vibe'];
+  return {
+    kind: kinds[Math.floor(Math.random() * kinds.length)],
+    topic,
+    startedAt: now,
+    expiresAt: now + TOPIC_GOAL_MAX_MS,
+    messagesLeft: TOPIC_GOAL_MAX_MSGS,
+    reason,
+  };
+}
+
+function activateAttention(channelId: string, intensity: ChatIntensity, explicit: boolean, reason: string, content: string, thread?: string): AttentionState {
+  const now = Date.now();
+  const existing = getAttention(channelId);
+  const duration = attentionDuration(intensity, explicit);
+  const topicGoal = existing?.topicGoal ?? selectTopicGoal(channelId, reason, content, thread);
+  const next: AttentionState = {
+    activeUntil: now + duration,
+    startedAt: existing?.startedAt ?? now,
+    reason,
+    messagesSeen: existing ? existing.messagesSeen + 1 : 1,
+    topicGoal,
+  };
+  attentionStates.set(channelId, next);
+  console.log(`[Attention] #${channelId.slice(-5)} ${Math.round(duration / 1000)}s | ${reason}${topicGoal ? ` | ${topicGoal.kind}:${topicGoal.topic}` : ''}`);
+  return next;
+}
+
+function extractTopicWords(content: string): string[] {
+  return content
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/<@!?\d+>|<#\d+>|<@&\d+>/g, ' ')
+    .replace(/[^a-z0-9\s']/g, ' ')
+    .split(/\s+/)
+    .map(w => w.replace(/^'+|'+$/g, ''))
+    .filter(w => w.length >= 4 && w.length <= 22 && !STOPWORDS.has(w) && !/^\d+$/.test(w))
+    .slice(0, 8);
+}
+
+function observeTopics(channelId: string, authorId: string, content: string) {
+  const words = extractTopicWords(content);
+  if (!words.length) return;
+  const now = Date.now();
+  const key = words.slice(0, 3).join(' ');
+  const arr = (topicCandidates.get(channelId) ?? []).filter(t => now - t.lastSeen < TOPIC_DECAY_MS);
+  let topic = arr.find(t => t.key === key || t.words.some(w => words.includes(w)));
+  if (!topic) {
+    topic = { key, words, score: 0, firstSeen: now, lastSeen: now, speakers: new Set(), sample: content.slice(0, 120) };
+    arr.push(topic);
+  }
+  topic.lastSeen = now;
+  topic.score = topic.score * 0.92 + words.length + (topic.speakers.has(authorId) ? 0.5 : 1.5);
+  topic.speakers.add(authorId);
+  topic.sample = content.slice(0, 120);
+  topic.words = [...new Set([...topic.words, ...words])].slice(0, 8);
+  topic.key = topic.words.slice(0, 3).join(' ');
+  arr.sort((a, b) => b.score - a.score);
+  topicCandidates.set(channelId, arr.slice(0, TOPIC_MAX_PER_CHANNEL));
+}
+
+function matchesBotAlias(content: string): boolean {
+  const escaped = BOT_NAME.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const aliases = [escaped, 'notabot', 'not a bot'];
+  return new RegExp(`\\b(${aliases.join('|')})\\b`, 'i').test(content);
+}
+
+function hasSecondPerson(content: string): boolean {
+  return /\b(you|u|ur|your|yours|youre|you're|yourself)\b/i.test(content);
+}
+
+function recordAiCallGate(channelId: string) {
+  const now = Date.now();
+  lastEngageGlobalAt = now;
+  lastEngageChannelAt.set(channelId, now);
+  aiCallTimesGlobal.push(now);
+  const arr = aiCallTimesByChannel.get(channelId) ?? [];
+  arr.push(now);
+  aiCallTimesByChannel.set(channelId, arr);
+}
+
+function isAiGateRateLimited(channelId: string, explicit: boolean): string | null {
+  const now = Date.now();
+  const globalCut = now - ENGAGE_BURST_WINDOW_MS;
+  while (aiCallTimesGlobal.length && aiCallTimesGlobal[0] < globalCut) aiCallTimesGlobal.shift();
+  const channelArr = (aiCallTimesByChannel.get(channelId) ?? []).filter(t => t >= globalCut);
+  aiCallTimesByChannel.set(channelId, channelArr);
+
+  if (aiCallTimesGlobal.length >= ENGAGE_BURST_MAX_GLOBAL) return 'global burst cap';
+  if (!explicit && channelArr.length >= ENGAGE_BURST_MAX_CHANNEL) return 'channel burst cap';
+  if (now - lastEngageGlobalAt < ENGAGE_GLOBAL_COOLDOWN_MS) return 'global cooldown';
+  if (!explicit && now - (lastEngageChannelAt.get(channelId) ?? 0) < ENGAGE_CHANNEL_COOLDOWN_MS) return 'channel cooldown';
+  return null;
+}
+
+function evaluateEngagementCandidate(opts: {
+  channelId: string;
+  authorId: string;
+  content: string;
+  mentioned: boolean;
+  replyAuthorId?: string;
+  speakState: SpeakState;
+  threadCtx?: string;
+}): EngagementDecision {
+  const now = Date.now();
+  const recent = stmGet(opts.channelId);
+  const intensity = getChatIntensity(opts.channelId, now);
+  const attention = getAttention(opts.channelId);
+  const reasons: string[] = [];
+  let score = 0;
+
+  const replyToBot = opts.replyAuthorId === BOT_ID;
+  const alias = matchesBotAlias(opts.content);
+  const secondPerson = hasSecondPerson(opts.content);
+  const recentBotIdx = [...recent].reverse().findIndex(m => m.authorId === BOT_ID);
+  const recentBot = recentBotIdx >= 0 && recentBotIdx <= 4;
+  const lastHuman = [...recent].reverse().find(m => m.authorId !== BOT_ID);
+  const adjacentSameAuthor = !!lastHuman && lastHuman.authorId === opts.authorId && recentBot;
+  const replyToOther = !!opts.replyAuthorId && opts.replyAuthorId !== BOT_ID && opts.replyAuthorId !== opts.authorId;
+  const explicit = opts.mentioned || replyToBot || alias;
+
+  if (opts.mentioned) { score += 0.95; reasons.push('direct mention'); }
+  if (replyToBot) { score += 0.9; reasons.push('reply to bot'); }
+  if (alias) { score += 0.55; reasons.push('bot name/alias'); }
+  if (secondPerson && recentBot) { score += 0.35; reasons.push('second-person after bot activity'); }
+  else if (secondPerson && attention) { score += 0.18; reasons.push('second-person while attentive'); }
+  if (recentBot) { score += 0.18; reasons.push('recent bot activity'); }
+  if (adjacentSameAuthor) { score += 0.18; reasons.push('same author continuing exchange'); }
+  if (attention) { score += intensity.level === 'busy' ? 0.1 : 0.22; reasons.push('attention active'); }
+  if (opts.threadCtx && !replyToOther) { score += 0.12; reasons.push('reply-chain context'); }
+  if (attention?.topicGoal && opts.content.toLowerCase().includes(attention.topicGoal.topic.split(' ')[0])) {
+    score += 0.12;
+    reasons.push('matches active topic goal');
+  }
+
+  if (replyToOther) { score -= 0.45; reasons.push('reply between other users'); }
+  if (intensity.level === 'busy') { score -= 0.22; reasons.push('busy chat'); }
+  if (intensity.level === 'quiet') { score += 0.1; reasons.push('quiet chat'); }
+  const clk = activityClocks.get(opts.channelId);
+  if (clk && clk.replies >= 2) { score -= 0.25; reasons.push('bot already spoke recently'); }
+  if (opts.speakState.mode === 'paused' && !explicit) { score -= 0.6; reasons.push('self-paused'); }
+
+  const rateReason = isAiGateRateLimited(opts.channelId, explicit);
+  if (rateReason) {
+    return {
+      allowAi: false,
+      probability: 0,
+      score,
+      threshold: 1,
+      reasons: [...reasons, rateReason],
+      intensity,
+      attention,
+      topicGoal: attention?.topicGoal,
+      explicit,
+      rateLimited: true,
+    };
+  }
+
+  if (!explicit && !attention && score < 0.42) {
+    return {
+      allowAi: false,
+      probability: clamp(score, 0, 1),
+      score,
+      threshold: 0.66,
+      reasons: [...reasons, 'outside attention'],
+      intensity,
+      attention,
+      topicGoal: undefined,
+      explicit,
+      rateLimited: false,
+    };
+  }
+
+  const threshold = explicit ? 0.28 : attention ? 0.5 : 0.66;
+  const probability = clamp(score + 0.16 + (Math.random() - 0.5) * 0.22, 0, 1);
+  const allowAi = probability >= threshold;
+  const nextAttention = allowAi
+    ? activateAttention(opts.channelId, intensity, explicit, reasons[0] || 'local engagement', opts.content, opts.threadCtx)
+    : attention;
+
+  if (nextAttention?.topicGoal) nextAttention.topicGoal.messagesLeft--;
+
+  return {
+    allowAi,
+    probability,
+    score,
+    threshold,
+    reasons,
+    intensity,
+    attention: nextAttention,
+    topicGoal: nextAttention?.topicGoal,
+    explicit,
+    rateLimited: false,
+  };
+}
+
 // ── SPEAK STATE ──────────────────────────────────────────────────
 interface SpeakState {
   mode:      'active' | 'paused' | 'waiting';
@@ -885,9 +1237,9 @@ function socialMemoryLines(userMem: SocialMemory, botMem?: SocialMemory): string
   if (userMem.patterns.length)      lines.push(`patterns: ${userMem.patterns.slice(-2).join(' | ')}`);
   if (userMem.arcs.length)          lines.push(`story arcs: ${userMem.arcs.slice(-2).join(' | ')}`);
   if (userMem.jokes.length)         lines.push(`old jokes: ${userMem.jokes.slice(-2).join(' | ')}`);
-  if (userMem.obsessions.length)    lines.push(`${userMem.obsessions.slice(-2).map(x => `sender owns habit: ${x}`).join('\n')}`);
-  if (botMem?.obsessions.length)    lines.push(`${botMem.obsessions.slice(-2).map(x => `[me] owns habit: ${x}`).join('\n')}`);
-  if (botMem?.reputation.length)    lines.push(`[me] reputation: ${botMem.reputation.slice(-2).join(' | ')}`);
+  if (userMem.obsessions.length)    lines.push(`running bits: ${userMem.obsessions.slice(-2).join(' | ')}`);
+  if (botMem?.obsessions.length)    lines.push(`notabot bits: ${botMem.obsessions.slice(-2).join(' | ')}`);
+  if (botMem?.reputation.length)    lines.push(`notabot reputation: ${botMem.reputation.slice(-2).join(' | ')}`);
   return lines.join('\n');
 }
 
@@ -1146,6 +1498,7 @@ async function brain(opts: {
   serverName?:      string;
   everyonePing:    boolean;
   endingConvo:     boolean;
+  engagementCtx?:  string;
 }): Promise<BrainDecision> {
 
   const bondLabel = opts.bond > 70 ? 'close' : opts.bond > 40 ? 'neutral' : 'distant';
@@ -1167,6 +1520,7 @@ async function brain(opts: {
   if (opts.summonCtx)       parts.push(`\nSOCIAL SUMMON:\n${opts.summonCtx.slice(0, 220)}`);
   if (opts.sessionSummary)  parts.push(`\nSESSION (earlier today):\n${opts.sessionSummary.slice(0, MAX_SUMMARY_CHARS)}`);
   if (opts.clock)           parts.push(`\nCLOCK: ${opts.clock}`);
+  if (opts.engagementCtx)   parts.push(`\nLOCAL ENGAGEMENT FILTER:\n${opts.engagementCtx.slice(0, 500)}\nthis only means the message was worth considering. ignore/react are still valid.`);
   if (opts.pronounHint)     parts.push(`\nPRONOUN MAP: ${opts.pronounHint}`);
   if (opts.thread)          parts.push(`\nREPLY TO:\n${opts.thread}`);
   parts.push(`\nCHAT:\n${opts.transcript}`);
@@ -1294,6 +1648,83 @@ async function withBgBudget<T>(fn: () => Promise<T>): Promise<T | null> {
   bgLock = true;
   try { return await fn(); }
   finally { setTimeout(() => { bgLock = false; }, 30_000); }
+}
+
+function engagementContextLine(channelId: string, d: EngagementDecision): string {
+  const attention = d.attention
+    ? `attention ${Math.max(0, Math.round((d.attention.activeUntil - Date.now()) / 1000))}s left, seen ${d.attention.messagesSeen}, reason: ${d.attention.reason}`
+    : 'attention inactive';
+  return [
+    `score ${d.score.toFixed(2)} -> p ${d.probability.toFixed(2)} / threshold ${d.threshold.toFixed(2)}`,
+    `intensity ${d.intensity.level}: ${d.intensity.messages} msgs, ${d.intensity.speakers} speakers, ${d.intensity.perMinute.toFixed(1)}/min`,
+    attention,
+    d.topicGoal ? `goal: ${topicGoalLine(d.topicGoal)}` : '',
+    topicSummary(channelId) ? `recent topics: ${topicSummary(channelId)}` : '',
+    d.reasons.length ? `signals: ${d.reasons.join(', ')}` : 'signals: none',
+  ].filter(Boolean).join('\n');
+}
+
+async function engagementProfiler(opts: {
+  channelId: string;
+  content: string;
+  sender: string;
+  local: EngagementDecision;
+  speakState: SpeakState;
+  sessionSummary?: string;
+}): Promise<(Partial<EngagementDecision> & { allowAi: boolean }) | null> {
+  const borderline = Math.abs(opts.local.probability - opts.local.threshold) <= 0.16;
+  if (!borderline || opts.local.rateLimited || !cerebras.canCall(EST_BG_TOKENS)) return null;
+
+  return withBgBudget(async () => {
+    try {
+      const raw = await cerebras.call([
+        { role: 'system', content: 'discord engagement profiler. decide if bot should consider AI reply. output ONLY valid JSON: {"engage":true,"attentionMins":3,"goal":"ask_question|make_comment|continue_thread|observe_vibe","topic":"short topic","reason":"short reason"}' },
+        { role: 'user', content: [
+          `sender: ${opts.sender}`,
+          `message: "${opts.content.slice(0, 220)}"`,
+          `local:\n${engagementContextLine(opts.channelId, opts.local)}`,
+          `speak: ${opts.speakState.mode} ${opts.speakState.reason}`,
+          opts.sessionSummary ? `summary: ${opts.sessionSummary}` : '',
+          `recent chat:\n${stmFormat(stmGet(opts.channelId)).slice(0, 900)}`,
+        ].filter(Boolean).join('\n') },
+      ], 0.35, 90, FAST_MODEL);
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) return null;
+      const p = JSON.parse(jsonMatch[0]);
+      const engage = !!p.engage;
+      const profilerReason = String(p.reason || (engage ? 'engage' : 'skip')).slice(0, 80);
+      const reasons = [...opts.local.reasons, `profiler: ${profilerReason}`];
+      if (engage) {
+        const mins = clamp(Number(p.attentionMins) || 3, 1, 10);
+        const kind = ['ask_question', 'make_comment', 'continue_thread', 'observe_vibe'].includes(String(p.goal))
+          ? String(p.goal) as TopicGoalKind
+          : 'make_comment';
+        const now = Date.now();
+        const topic = String(p.topic || topicSummary(opts.channelId) || extractTopicWords(opts.content).slice(0, 3).join(' ') || 'current chat').slice(0, 60);
+        const existing = getAttention(opts.channelId);
+        const attention: AttentionState = {
+          activeUntil: now + mins * 60_000,
+          startedAt: existing?.startedAt ?? now,
+          reason: `profiler: ${profilerReason}`,
+          messagesSeen: existing ? existing.messagesSeen + 1 : 1,
+          topicGoal: {
+            kind,
+            topic,
+            startedAt: now,
+            expiresAt: now + Math.min(mins * 60_000, TOPIC_GOAL_MAX_MS),
+            messagesLeft: TOPIC_GOAL_MAX_MSGS,
+            reason: profilerReason,
+          },
+        };
+        attentionStates.set(opts.channelId, attention);
+        return { allowAi: true, probability: Math.max(opts.local.probability, opts.local.threshold), reasons, attention, topicGoal: attention.topicGoal };
+      }
+      return { allowAi: false, reasons };
+    } catch (e: any) {
+      console.warn('[EngageProfiler] skipped:', e.message?.slice(0, 80));
+      return null;
+    }
+  });
 }
 
 async function runProfiler(client: Client) {
@@ -1639,19 +2070,13 @@ async function respondToDM(msg: Message) {
     getSocialMemory(msg.author.id),
     Math.random() < GLOBAL_SOCIAL_MEMORY_CHANCE ? getSocialMemory() : Promise.resolve(emptySocialMemory()),
   ]);
-
-  // Build a lightweight owned-memory proxy from global social memory so DMs
-  // still surface what this person owns (habits, open loops, opinions) even
-  // without a server guildId to pull from.
-  const dmOwnedProxy: OwnedMemory[] = [
-    ...userSocial.obsessions.map(t => ({ ownerName: sender, ownerId: msg.author.id, kind: 'habit' as const, text: t, scope: 'global' as MemoryScope, source: 'message' as MemorySource, updatedAt: '' })),
-    ...userSocial.openLoops.map(t => ({ ownerName: sender, ownerId: msg.author.id, kind: 'openLoop' as const, text: t, scope: 'global' as MemoryScope, source: 'message' as MemorySource, updatedAt: '' })),
-    ...userSocial.arcs.map(t => ({ ownerName: sender, ownerId: msg.author.id, kind: 'topic' as const, text: t, scope: 'global' as MemoryScope, source: 'message' as MemorySource, updatedAt: '' })),
-    ...botSocial.obsessions.map(t => ({ ownerName: BOT_NAME, ownerId: BOT_ID, kind: 'botBit' as const, text: t, scope: 'global' as MemoryScope, source: 'message' as MemorySource, updatedAt: '' })),
-  ];
-  const dmMemProxy: ServerMemory = { ...emptyServerMemory(), owned: dmOwnedProxy };
-  const peopleCtx = ownedMemoryLines(dmMemProxy, msg.author.id, sender);
+  const peopleCtx = ownedMemoryLines(emptyServerMemory(), msg.author.id, sender);
   const pronounHint = pronounHintLine(sender, content);
+
+  if (!cerebras.canCall(EST_TOKENS_PER_CALL)) {
+    console.log(`[DM] skipped brain — Cerebras budget/rate tight`);
+    return;
+  }
 
   lastBrainCallAt = Date.now();
   const decision = await brain({
@@ -1689,12 +2114,6 @@ async function respondToDM(msg: Message) {
 
     await msg.reply({ content: text, allowedMentions: { repliedUser: false } });
     stmPush(channelId, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
-
-    // Track open loops bot asks about in DMs via global social memory (no guildId)
-    const followTopic = followUpTopicFromBotReply(text, content);
-    if (followTopic) {
-      addSocialMemory('openLoops', followTopic, msg.author.id).catch(() => {});
-    }
   }
   // note: DMs ignore decision.pause entirely — every DM is a direct line,
   // there's no "monopoly" or ambient-chatter problem to self-pace away from.
@@ -1707,6 +2126,7 @@ const pendingTriggers = new Map<string, {
   mentioned:    boolean;
   guildId:      string;
   everyonePing: boolean;
+  engagementCtx: string;
 }>();
 
 async function handleMessage(msg: Message) {
@@ -1745,6 +2165,8 @@ async function handleMessage(msg: Message) {
       author:   msg.author.id === BOT_ID ? '[me]' : sender,
       content:  content.length > 100 ? content.slice(0, 97) + '…' : content,
     });
+    const intensity = trackActivity(channelId, msg.author.id, msg.createdTimestamp);
+    observeTopics(channelId, msg.author.id, content);
     maybeExtractOwnedMemory(guildId, {
       ts: msg.createdTimestamp,
       authorId: msg.author.id,
@@ -1777,34 +2199,48 @@ async function handleMessage(msg: Message) {
         expiresAt: new Date(Date.now() + 30 * 86_400_000).toISOString(),
       }).catch(() => {});
     }
-    // topic regular: if this user has ≥3 messages in recent STM sharing a keyword cluster,
-    // store a lightweight signal so the brain knows they're a recurring voice on that topic.
-    (() => {
-      const userRecent = stmGet(channelId).slice(-20).filter(m => m.authorId === msg.author.id);
-      if (userRecent.length < 3) return;
-      const TOPIC_WORDS = /\b(game|code|exam|physics|math|anime|music|art|film|book|server|project|build|study|crypto|ai|meme|politics|sport|school|college|work|gym)\b/gi;
-      const topicCounts = new Map<string, number>();
-      for (const m of userRecent) {
-        const matches = m.content.match(TOPIC_WORDS) ?? [];
-        for (const w of matches) topicCounts.set(w.toLowerCase(), (topicCounts.get(w.toLowerCase()) ?? 0) + 1);
-      }
-      const topTopic = [...topicCounts.entries()].sort((a, b) => b[1] - a[1])[0];
-      if (topTopic && topTopic[1] >= 2) {
-        addSocialSignal(guildId, {
-          userId: msg.author.id,
-          userName: sender,
-          label: 'topic regular',
-          text: `keeps bringing up ${topTopic[0]}`,
-          source: 'message',
-          expiresAt: new Date(Date.now() + 60 * 86_400_000).toISOString(),
-        }).catch(() => {});
-      }
-    })();
     maybeNoteBehaviorPattern(msg.author.id, channelId);
     tickUnread(channelId);
     if (!checkFocus(channelId, mentioned)) return;
 
-    if (!moodTick(channelId, msg.author.id, mentioned, false)) return;
+    let preThreadCtx: string | undefined;
+    let replyAuthorId: string | undefined;
+    if (msg.reference?.messageId) {
+      try {
+        const ref = await msg.channel.messages.fetch(msg.reference.messageId);
+        replyAuthorId = ref.author.id;
+        const refAuthor = ref.author.id === BOT_ID
+          ? BOT_NAME
+          : (ref.member?.displayName || ref.author.username);
+        preThreadCtx = `${refAuthor}: "${cleanContent(ref.content).slice(0, 150)}"`;
+      } catch {}
+    }
+
+    const preSpeakState = await getSpeakState(channelId, guildId);
+    let engagement = evaluateEngagementCandidate({
+      channelId,
+      authorId: msg.author.id,
+      content,
+      mentioned,
+      replyAuthorId,
+      speakState: preSpeakState,
+      threadCtx: preThreadCtx,
+    });
+
+    const profileOverride = await engagementProfiler({
+      channelId,
+      content,
+      sender,
+      local: engagement,
+      speakState: preSpeakState,
+      sessionSummary: sessionSummaries.get(channelId),
+    });
+    if (profileOverride) engagement = { ...engagement, ...profileOverride };
+
+    if (!engagement.allowAi) {
+      console.log(`[Engage] skip #${channelId.slice(-5)} p=${engagement.probability.toFixed(2)}/${engagement.threshold.toFixed(2)} | ${engagement.reasons.join(', ') || 'no signal'} | ${intensity.level}`);
+      return;
+    }
 
     // Rate budget gate
     if (!cerebras.canCall(EST_TOKENS_PER_CALL)) {
@@ -1830,7 +2266,9 @@ async function handleMessage(msg: Message) {
     pendingTriggers.set(channelId, {
       msg, mentioned: effectiveMentioned, guildId,
       everyonePing: everyonePing || (prevTrigger?.everyonePing ?? false),
+      engagementCtx: engagementContextLine(channelId, engagement),
     });
+    recordAiCallGate(channelId);
     if (debounceTimers.has(channelId)) clearTimeout(debounceTimers.get(channelId)!);
 
     // Mentions get a snappy response; passive triggers wait for burst to settle
@@ -1842,7 +2280,7 @@ async function handleMessage(msg: Message) {
       pendingTriggers.delete(channelId);
       if (!trigger) return;
 
-      const { msg: tMsg, mentioned: tMentioned, guildId: tGuild, everyonePing: tEveryonePing } = trigger;
+      const { msg: tMsg, mentioned: tMentioned, guildId: tGuild, everyonePing: tEveryonePing, engagementCtx } = trigger;
       const tChannel     = tMsg.channelId;
       const tSender      = tMsg.member?.displayName || tMsg.author.username;
       const tContent     = cleanContent(tMsg.content);
@@ -1940,6 +2378,7 @@ async function handleMessage(msg: Message) {
           summonCtx,
           sessionSummary,
           clock,
+          engagementCtx,
           pronounHint,
           vibe,
           mentioned:      tMentioned,
@@ -2265,8 +2704,7 @@ export async function startBot(token: string) {
         `jokes (${m.jokes.length}): ${m.jokes.slice(-3).join(' | ') || 'none'}\n` +
         `owned (${m.owned?.length ?? 0}): ${(m.owned ?? []).slice(-5).map(x => `${x.ownerName}/${x.kind}: ${x.text}`).join(' | ') || 'none'}\n` +
         `signals (${m.socialSignals?.length ?? 0}): ${(m.socialSignals ?? []).slice(-4).map(x => `${x.userName}/${x.label}`).join(' | ') || 'none'}\n` +
-        `followups (${m.followUps?.filter(x => !x.resolvedAt).length ?? 0}): ${(m.followUps ?? []).filter(x => !x.resolvedAt).slice(-3).map(x => `${x.ownerName}: ${x.topic}`).join(' | ') || 'none'}\n` +
-        `impressions (${m.serverImpressions?.length ?? 0}): ${(m.serverImpressions ?? []).filter(x => !x.expiresAt || Date.parse(x.expiresAt) > Date.now()).slice(-3).map(x => x.text).join(' | ') || 'none'}`
+        `followups (${m.followUps?.filter(x => !x.resolvedAt).length ?? 0}): ${(m.followUps ?? []).filter(x => !x.resolvedAt).slice(-3).map(x => `${x.ownerName}: ${x.topic}`).join(' | ') || 'none'}`
       );
     }
     if (c.startsWith('!remember ')) {
@@ -2292,38 +2730,6 @@ export async function startBot(token: string) {
     }
     if (c === '!budget') {
       await msg.reply(cerebras.status());
-    }
-    // ── social memory prune commands ──────────────────────────────
-    // !forgetsocial <word>  — drop any owned/signal/followUp containing that word
-    // !forgetowned          — wipe all owned memory for this server
-    // !forgetloops          — mark all pending follow-ups resolved
-    if (c.startsWith('!forgetsocial ')) {
-      const word = c.slice(14).trim().toLowerCase();
-      if (!word) { msg.reply('usage: !forgetsocial <word>'); return; }
-      const m = await getMemory(guildId);
-      const owned = (m.owned ?? []).filter(x => !normalizeMemoryText(x.text).includes(word) && !x.ownerName.toLowerCase().includes(word));
-      const socialSignals = (m.socialSignals ?? []).filter(x => !normalizeMemoryText(x.text).includes(word) && !x.label.toLowerCase().includes(word));
-      const followUps = (m.followUps ?? []).filter(x => !normalizeMemoryText(x.topic).includes(word) && !x.ownerName.toLowerCase().includes(word));
-      const serverImpressions = (m.serverImpressions ?? []).filter(x => !normalizeMemoryText(x.text).includes(word));
-      memCache.delete(guildId);
-      await db.collection('servers').doc(guildId).collection('memory').doc('global')
-        .set({ owned, socialSignals, followUps, serverImpressions }, { merge: true }).catch(() => {});
-      const removed = ((m.owned?.length ?? 0) - owned.length) + ((m.socialSignals?.length ?? 0) - socialSignals.length) + ((m.followUps?.length ?? 0) - followUps.length) + ((m.serverImpressions?.length ?? 0) - serverImpressions.length);
-      await msg.reply(`pruned ${removed} record(s) containing "${word}"`);
-    }
-    if (c === '!forgetowned') {
-      memCache.delete(guildId);
-      await db.collection('servers').doc(guildId).collection('memory').doc('global')
-        .set({ owned: [] }, { merge: true }).catch(() => {});
-      await msg.reply('owned memory cleared');
-    }
-    if (c === '!forgetloops') {
-      const m = await getMemory(guildId);
-      const followUps = (m.followUps ?? []).map(f => ({ ...f, resolvedAt: f.resolvedAt ?? new Date().toISOString() }));
-      memCache.delete(guildId);
-      await db.collection('servers').doc(guildId).collection('memory').doc('global')
-        .set({ followUps }, { merge: true }).catch(() => {});
-      await msg.reply('all pending follow-ups marked resolved');
     }
     if (c === 'tiki waka wiki') {
       const dm = await msg.author.createDM().catch(() => null);
