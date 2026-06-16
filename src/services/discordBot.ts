@@ -842,6 +842,18 @@ function hasSecondPerson(content: string): boolean {
   return /\b(you|u|ur|your|yours|youre|you're|yourself)\b/i.test(content);
 }
 
+function looksLikeConversationalContinuation(content: string): boolean {
+  const cleaned = content
+    .replace(/<@!?\d+>|<#\d+>|<@&\d+>/g, '')
+    .replace(/https?:\/\/\S+/g, '')
+    .trim();
+  if (!cleaned) return false;
+  if (cleaned.length <= 90) return true;
+  const words = cleaned.split(/\s+/).filter(Boolean);
+  const topicWords = extractTopicWords(cleaned);
+  return words.length <= 14 && topicWords.length <= 5;
+}
+
 function recordAiCallGate(channelId: string) {
   const now = Date.now();
   lastEngageGlobalAt = now;
@@ -893,7 +905,14 @@ function evaluateEngagementCandidate(opts: {
   const explicit = opts.mentioned || replyToBot || alias;
   const botStreak = botReplyStreak(opts.channelId);
   const directQuestion = /\?|\b(what|wht|why|how|do u|do you|are u|are you|can u|can you|think)\b/i.test(opts.content);
+  const conversationalFollowup = looksLikeConversationalContinuation(opts.content);
   const veryShort = extractTopicWords(opts.content).length === 0 && opts.content.length < 24;
+  const namedMentions = [...opts.content.matchAll(/@([A-Za-z0-9_()[\]\-.]+)/g)]
+    .map(m => m[1].trim().toLowerCase())
+    .filter(Boolean);
+  const botAliasNames = new Set([BOT_NAME.toLowerCase(), 'notabot', 'not a bot']);
+  const mentionsOtherPerson = namedMentions.some(n => !botAliasNames.has(n));
+  const likelyAddressedToOther = mentionsOtherPerson && secondPerson && !explicit;
   const lastBotMsg = [...recent].reverse().find(m => m.authorId === BOT_ID);
   const afterLastBot = lastBotMsg
     ? recent.filter(m => m.ts > lastBotMsg.ts && m.authorId !== BOT_ID)
@@ -902,15 +921,16 @@ function evaluateEngagementCandidate(opts: {
   const tightFollowup = !!lastBotMsg
     && now - lastBotMsg.ts < 90_000
     && sameAuthorAfterBot
-    && directQuestion;
+    && !likelyAddressedToOther
+    && (directQuestion || conversationalFollowup);
 
   if (opts.mentioned) { score += 0.95; reasons.push('direct mention'); }
   if (replyToBot) { score += 0.9; reasons.push('reply to bot'); }
   if (alias) { score += 0.55; reasons.push('bot name/alias'); }
-  if (tightFollowup) { score += 0.35; reasons.push('tight followup after bot reply'); }
-  if (secondPerson && recentBot && directQuestion) { score += 0.28; reasons.push('second-person question after bot activity'); }
-  else if (secondPerson && recentBot) { score += 0.16; reasons.push('second-person after bot activity'); }
-  else if (secondPerson && attention && directQuestion) { score += 0.14; reasons.push('second-person question while attentive'); }
+  if (tightFollowup) { score += directQuestion ? 0.35 : 0.24; reasons.push(directQuestion ? 'tight followup after bot reply' : 'tight conversational followup'); }
+  if (secondPerson && recentBot && directQuestion && !likelyAddressedToOther) { score += 0.28; reasons.push('second-person question after bot activity'); }
+  else if (secondPerson && recentBot && !likelyAddressedToOther) { score += 0.16; reasons.push('second-person after bot activity'); }
+  else if (secondPerson && attention && directQuestion && !likelyAddressedToOther) { score += 0.14; reasons.push('second-person question while attentive'); }
   if (recentBot && directQuestion) { score += 0.1; reasons.push('recent bot activity'); }
   if (adjacentSameAuthor && directQuestion) { score += 0.12; reasons.push('same author continuing exchange'); }
   if (attention) { score += intensity.level === 'busy' ? 0.06 : 0.14; reasons.push('attention active'); }
@@ -921,6 +941,7 @@ function evaluateEngagementCandidate(opts: {
   }
 
   if (replyToOther) { score -= 0.45; reasons.push('reply between other users'); }
+  if (likelyAddressedToOther) { score -= 0.65; reasons.push('addressed to another mentioned user'); }
   if (intensity.level === 'busy') { score -= 0.22; reasons.push('busy chat'); }
   if (intensity.level === 'quiet') { score += 0.1; reasons.push('quiet chat'); }
   const clk = activityClocks.get(opts.channelId);
