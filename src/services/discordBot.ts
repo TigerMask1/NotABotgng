@@ -236,6 +236,7 @@ const TOPIC_MAX_PER_CHANNEL    = 16;
 const TOPIC_DECAY_MS           = 45 * 60_000;
 const TOPIC_GOAL_MAX_MSGS      = 6;
 const TOPIC_GOAL_MAX_MS        = 8 * 60_000;
+const BOT_REPLY_STREAK_WINDOW_MS = 4 * 60_000;
 const SOCIAL_SIGNAL_MAX   = 45;
 const FOLLOW_UP_MAX       = 35;
 const SERVER_IMPRESSION_MAX = 25;
@@ -707,6 +708,56 @@ function topicSummary(channelId: string): string {
   return topics.map(t => `${t.key} (${t.speakers.size}p, ${Math.round(t.score)})`).join(' | ');
 }
 
+function leadingTopic(channelId: string): TopicCandidate | undefined {
+  const now = Date.now();
+  return (topicCandidates.get(channelId) ?? [])
+    .filter(t => now - t.lastSeen < TOPIC_DECAY_MS)
+    .sort((a, b) => b.score - a.score)[0];
+}
+
+function topicOverlap(goal: TopicGoal | undefined, content: string): boolean {
+  if (!goal) return false;
+  const goalWords = extractTopicWords(goal.topic);
+  const msgWords = new Set(extractTopicWords(content));
+  return goalWords.some(w => msgWords.has(w));
+}
+
+function maybeRefreshTopicGoal(channelId: string, attention: AttentionState | undefined, content: string) {
+  if (!attention?.topicGoal) return;
+  const lead = leadingTopic(channelId);
+  if (!lead) return;
+  const goalWords = new Set(extractTopicWords(attention.topicGoal.topic));
+  const leadOverlap = lead.words.some(w => goalWords.has(w));
+  const freshAndDifferent = Date.now() - lead.lastSeen < 90_000 && lead.score >= 4 && !leadOverlap;
+  if (!freshAndDifferent) return;
+  attention.topicGoal = {
+    kind: content.includes('?') ? 'continue_thread' : 'make_comment',
+    topic: lead.key,
+    startedAt: Date.now(),
+    expiresAt: Date.now() + TOPIC_GOAL_MAX_MS,
+    messagesLeft: Math.max(3, Math.floor(TOPIC_GOAL_MAX_MSGS / 2)),
+    reason: 'topic shifted locally',
+  };
+  attention.reason = 'topic shifted locally';
+  console.log(`[TopicGoal] #${channelId.slice(-5)} shifted to ${lead.key}`);
+}
+
+function botReplyStreak(channelId: string): number {
+  const cutoff = Date.now() - BOT_REPLY_STREAK_WINDOW_MS;
+  return stmGet(channelId).filter(m => m.authorId === BOT_ID && m.ts >= cutoff).length;
+}
+
+function ownershipContextLine(content: string, sender: string, thread?: string): string {
+  const mentionedNames = [...content.matchAll(/@([A-Za-z0-9_()[\]\-.]+)/g)].map(m => m[1]).slice(0, 3);
+  const possessive = content.match(/\b([A-Za-z0-9_()[\]\-.]+)'?s\s+([a-z0-9][a-z0-9\s-]{2,40})/i);
+  const lines: string[] = [];
+  if (mentionedNames.length) lines.push(`named people in trigger: ${mentionedNames.join(', ')}. don't convert their traits/projects into yours.`);
+  if (possessive) lines.push(`ownership cue: "${possessive[0]}" belongs to ${possessive[1]}, not ${BOT_NAME}.`);
+  if (/\b(he|she|they|his|her|their)\b/i.test(content) && thread) lines.push('third-person pronouns likely refer to the person/topic in the reply thread, not the bot.');
+  if (/\b(my|mine|i|im|i'm)\b/i.test(content)) lines.push(`first-person words are ${sender}'s, not the bot's.`);
+  return lines.join('\n');
+}
+
 function selectTopicGoal(channelId: string, reason: string, content: string, thread?: string): TopicGoal | undefined {
   const now = Date.now();
   const topics = (topicCandidates.get(channelId) ?? [])
@@ -728,7 +779,13 @@ function selectTopicGoal(channelId: string, reason: string, content: string, thr
 function activateAttention(channelId: string, intensity: ChatIntensity, explicit: boolean, reason: string, content: string, thread?: string): AttentionState {
   const now = Date.now();
   const existing = getAttention(channelId);
-  const duration = attentionDuration(intensity, explicit);
+  const streak = botReplyStreak(channelId);
+  const baseDuration = attentionDuration(intensity, explicit);
+  const duration = streak >= 2 && !explicit
+    ? Math.min(baseDuration, 90_000)
+    : streak >= 1 && !explicit
+      ? Math.min(baseDuration, 150_000)
+      : baseDuration;
   const topicGoal = existing?.topicGoal ?? selectTopicGoal(channelId, reason, content, thread);
   const next: AttentionState = {
     activeUntil: now + duration,
@@ -834,17 +891,21 @@ function evaluateEngagementCandidate(opts: {
   const adjacentSameAuthor = !!lastHuman && lastHuman.authorId === opts.authorId && recentBot;
   const replyToOther = !!opts.replyAuthorId && opts.replyAuthorId !== BOT_ID && opts.replyAuthorId !== opts.authorId;
   const explicit = opts.mentioned || replyToBot || alias;
+  const botStreak = botReplyStreak(opts.channelId);
+  const directQuestion = /\?|\b(what|wht|why|how|do u|do you|are u|are you|can u|can you|think)\b/i.test(opts.content);
+  const veryShort = extractTopicWords(opts.content).length === 0 && opts.content.length < 24;
 
   if (opts.mentioned) { score += 0.95; reasons.push('direct mention'); }
   if (replyToBot) { score += 0.9; reasons.push('reply to bot'); }
   if (alias) { score += 0.55; reasons.push('bot name/alias'); }
-  if (secondPerson && recentBot) { score += 0.35; reasons.push('second-person after bot activity'); }
-  else if (secondPerson && attention) { score += 0.18; reasons.push('second-person while attentive'); }
-  if (recentBot) { score += 0.18; reasons.push('recent bot activity'); }
-  if (adjacentSameAuthor) { score += 0.18; reasons.push('same author continuing exchange'); }
-  if (attention) { score += intensity.level === 'busy' ? 0.1 : 0.22; reasons.push('attention active'); }
+  if (secondPerson && recentBot && directQuestion) { score += 0.28; reasons.push('second-person question after bot activity'); }
+  else if (secondPerson && recentBot) { score += 0.16; reasons.push('second-person after bot activity'); }
+  else if (secondPerson && attention && directQuestion) { score += 0.14; reasons.push('second-person question while attentive'); }
+  if (recentBot && directQuestion) { score += 0.1; reasons.push('recent bot activity'); }
+  if (adjacentSameAuthor && directQuestion) { score += 0.12; reasons.push('same author continuing exchange'); }
+  if (attention) { score += intensity.level === 'busy' ? 0.06 : 0.14; reasons.push('attention active'); }
   if (opts.threadCtx && !replyToOther) { score += 0.12; reasons.push('reply-chain context'); }
-  if (attention?.topicGoal && opts.content.toLowerCase().includes(attention.topicGoal.topic.split(' ')[0])) {
+  if (topicOverlap(attention?.topicGoal, opts.content)) {
     score += 0.12;
     reasons.push('matches active topic goal');
   }
@@ -854,6 +915,22 @@ function evaluateEngagementCandidate(opts: {
   if (intensity.level === 'quiet') { score += 0.1; reasons.push('quiet chat'); }
   const clk = activityClocks.get(opts.channelId);
   if (clk && clk.replies >= 2) { score -= 0.25; reasons.push('bot already spoke recently'); }
+  if (botStreak >= 2 && !explicit) { score -= 0.45; reasons.push('anti-monologue'); }
+  if (botStreak >= 3 && !explicit && !directQuestion) {
+    return {
+      allowAi: false,
+      probability: 0,
+      score,
+      threshold: 1,
+      reasons: [...reasons, 'local quiet after bot streak'],
+      intensity,
+      attention,
+      topicGoal: attention?.topicGoal,
+      explicit,
+      rateLimited: false,
+    };
+  }
+  if (veryShort && !explicit && recentBot) { score -= 0.25; reasons.push('short low-signal followup'); }
   if (opts.speakState.mode === 'paused' && !explicit) { score -= 0.6; reasons.push('self-paused'); }
 
   const rateReason = isAiGateRateLimited(opts.channelId, explicit);
@@ -894,6 +971,7 @@ function evaluateEngagementCandidate(opts: {
     ? activateAttention(opts.channelId, intensity, explicit, reasons[0] || 'local engagement', opts.content, opts.threadCtx)
     : attention;
 
+  maybeRefreshTopicGoal(opts.channelId, nextAttention, opts.content);
   if (nextAttention?.topicGoal) nextAttention.topicGoal.messagesLeft--;
 
   return {
@@ -1434,6 +1512,7 @@ identity: be known for rare callbacks, old jokes, nonsense debates, and occasion
 memory should feel alive: care more about people, recurring traits, unfinished business, and server lore than exact facts.
 if the message is directed at you, it may have pronouns: "ur", "you", "your" directed at you = about you. "my", "I", "me" from sender = about them.
 when YOU reply, flip those: their "ur/you/your" (about you) → "my/i/me" in your reply, and their "i/my/me" (about them) → "ur/you/your" in your reply. e.g. "ur brain is dumb" → you'd say something about "my brain", never echo "ur brain" back.
+ownership matters: if a named person or @mention owns a skill/project/trait, keep it attached to them. don't turn someone else's crochet, art, profile, drama, or opinion into yours unless they explicitly say it's yours.
 conversation ending: if context says ending_convo, reply once casually or ignore — never keep pulling them back.
 
 getting pinged or DMed does NOT mean you owe a reply — "ignore" and "react" are just as valid then. only "speak" if you'd actually say something.
@@ -1486,6 +1565,7 @@ async function brain(opts: {
   peopleCtx?:      string;
   summonCtx?:      string;
   pronounHint?:    string;
+  ownershipCtx?:   string;
   sessionSummary?: string;
   clock?:          string;
   vibe?:           SocialMood | null;
@@ -1521,6 +1601,7 @@ async function brain(opts: {
   if (opts.sessionSummary)  parts.push(`\nSESSION (earlier today):\n${opts.sessionSummary.slice(0, MAX_SUMMARY_CHARS)}`);
   if (opts.clock)           parts.push(`\nCLOCK: ${opts.clock}`);
   if (opts.engagementCtx)   parts.push(`\nLOCAL ENGAGEMENT FILTER:\n${opts.engagementCtx.slice(0, 500)}\nthis only means the message was worth considering. ignore/react are still valid.`);
+  if (opts.ownershipCtx)    parts.push(`\nOWNERSHIP / REFERENCE:\n${opts.ownershipCtx.slice(0, 350)}`);
   if (opts.pronounHint)     parts.push(`\nPRONOUN MAP: ${opts.pronounHint}`);
   if (opts.thread)          parts.push(`\nREPLY TO:\n${opts.thread}`);
   parts.push(`\nCHAT:\n${opts.transcript}`);
@@ -1975,7 +2056,7 @@ async function runProactive(client: Client) {
           ? `ask for a casual update on unresolved thing: ${pendingFollowUp.ownerName} / ${pendingFollowUp.topic}. do not ping unless truly earned`
           : ((localMem.openLoops.length || (localMem.owned ?? []).some(x => x.kind === 'openLoop')) && Math.random() < PROACTIVE_OPEN_LOOP_CHANCE)
           ? 'revive an open loop or unfinished story without being investigative'
-          : ['ask a dumb debate question', 'make a tiny poll', 'share an unsolicited thought', 'quietly observe server culture', 'continue a running bit'][Math.floor(Math.random() * 5)];
+          : ['quiet bored opener like "um hello?"', 'ask a dumb debate question', 'make a tiny poll', 'share an unsolicited thought', 'quietly observe server culture', 'continue a running bit'][Math.floor(Math.random() * 6)];
       const raw = await cerebras.call([
         { role: 'system', content: `you are ${BOT_NAME}, a server regular. send ONE short casual message to break silence, or skip. do not be needy. callbacks must be vague and non-private. polls can be one-line "quick poll: ...". lowercase. ONLY valid JSON.` },
         { role: 'user',   content: `mode: ${mode}\nchannel: ${pick.hint}\nmemories:\n${hints || '(none)'}\nrules: ${SOCIAL_MEMORY_RULES}\nJSON: {"skip":false,"msg":"..."}` },
@@ -1990,6 +2071,8 @@ async function runProactive(client: Client) {
       await sleep(Math.min(400 + text.length * 20, 2500));
       await ch.send(text);
       stmPush(pick.id, { ts: Date.now(), authorId: BOT_ID, author: '[me]', content: text });
+      goActive(pick.id, 4, 'self-started conversation');
+      activateAttention(pick.id, getChatIntensity(pick.id), true, 'self-started conversation', text);
       if (guildId && pendingFollowUp && text.includes('?')) {
         pendingFollowUp.lastAskedAt = new Date().toISOString();
         await addFollowUp(guildId, pendingFollowUp);
@@ -2072,6 +2155,7 @@ async function respondToDM(msg: Message) {
   ]);
   const peopleCtx = ownedMemoryLines(emptyServerMemory(), msg.author.id, sender);
   const pronounHint = pronounHintLine(sender, content);
+  const ownershipCtx = ownershipContextLine(content, sender, threadCtx);
 
   if (!cerebras.canCall(EST_TOKENS_PER_CALL)) {
     console.log(`[DM] skipped brain — Cerebras budget/rate tight`);
@@ -2089,6 +2173,7 @@ async function respondToDM(msg: Message) {
     socialCtx:    socialMemoryLines(userSocial, botSocial),
     peopleCtx,
     pronounHint,
+    ownershipCtx,
     mentioned:    true,
     isDM:         true,
     mood:         { mode: 'active', count: 0 },
@@ -2344,6 +2429,7 @@ async function handleMessage(msg: Message) {
         const peopleCtx = peopleContextLines(memory, tMsg.author.id, tSender, memberData, tChannel);
         const summonCtx = maybeSocialSummon(memory, tContent);
         const pronounHint = pronounHintLine(tSender, tContent);
+        const ownershipCtx = ownershipContextLine(tContent, tSender, threadCtx);
 
         const mood = getMood(tChannel);
         const vibe = maybeRollSocialMood(tChannel);
@@ -2380,6 +2466,7 @@ async function handleMessage(msg: Message) {
           clock,
           engagementCtx,
           pronounHint,
+          ownershipCtx,
           vibe,
           mentioned:      tMentioned,
           isDM:           false,
