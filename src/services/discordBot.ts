@@ -59,7 +59,7 @@ class GeminiManager {
             body: JSON.stringify({
               systemInstruction: { parts: [{ text: systemPrompt }] },
               contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
-              generationConfig: { temperature: temp, maxOutputTokens: maxTok },
+              generationConfig: { temperature: temp, responseMimeType: 'application/json' },
             }),
           }
         );
@@ -620,7 +620,7 @@ system will run the command and send you the result. you then give your actual r
 
 in transcripts: [me] = your own past messages
 
-OUTPUT ONLY valid JSON — no markdown, no extra text:
+CRITICAL OUTPUT RULE: respond with RAW JSON ONLY. first character must be "{", last character must be "}". no markdown fences, no bullet points, no reasoning, no "* User:" breakdowns, no commentary before or after. just the object:
 {
   "action": "speak|react|ignore",
   "reply": "your message here (empty if not speak)",
@@ -710,21 +710,33 @@ async function brain(opts: {
     `\nTRIGGER — ${opts.sender} (${bondLabel} bond ${opts.bond}/100):\n"${opts.message}"`,
     flags.length ? `context: ${flags.join(', ')}` : 'context: no direct ping',
     opts.isSecondPass ? '(second pass — you already decided to respond, just give the reply now. command must be "none")' : '',
-    `\nOutput ONLY the JSON object.`,
+    `\nOutput ONLY the JSON object. raw JSON, first char "{", last char "}", nothing else.`,
   );
 
-  try {
-    const raw = await gemini.call(SYSTEM_PROMPT, parts.filter(Boolean).join('\n'), 0.92, 500, BRAIN_MODEL);
-    console.log(`[Brain] raw: ${raw.slice(0, 200)}`);
-    const parsed = parseBrainJSON(raw);
-    if (!parsed) throw new Error('no valid JSON');
-    return parsed;
-  } catch (e: any) {
-    console.warn('[Brain] parse error:', e.message?.slice(0, 80));
-    return (opts.mentioned || opts.isDM)
-      ? { action: 'speak', reply: 'brain blipped', reaction: '', pause: 0, think: '', command: 'none', commandArgs: {} }
-      : { action: 'ignore', reply: '', reaction: '', pause: 0, think: '', command: 'none', commandArgs: {} };
+  const userPrompt = parts.filter(Boolean).join('\n');
+
+  // Try up to 2 times — Gemini occasionally rambles/truncates instead of emitting clean JSON.
+  for (let pass = 0; pass < 2; pass++) {
+    try {
+      const raw = await gemini.call(
+        SYSTEM_PROMPT,
+        pass === 0 ? userPrompt : `${userPrompt}\n\n(previous attempt failed to return valid JSON — output RAW JSON ONLY, nothing else)`,
+        0.92,
+        700,
+        BRAIN_MODEL,
+      );
+      console.log(`[Brain] raw: ${raw.slice(0, 200)}`);
+      const parsed = parseBrainJSON(raw);
+      if (parsed) return parsed;
+      console.warn(`[Brain] parse failed on pass ${pass + 1}`);
+    } catch (e: any) {
+      console.warn(`[Brain] call error on pass ${pass + 1}:`, e.message?.slice(0, 80));
+    }
   }
+
+  return (opts.mentioned || opts.isDM)
+    ? { action: 'speak', reply: 'brain blipped', reaction: '', pause: 0, think: '', command: 'none', commandArgs: {} }
+    : { action: 'ignore', reply: '', reaction: '', pause: 0, think: '', command: 'none', commandArgs: {} };
 }
 
 function sanitizeEmoji(raw: any): string {
