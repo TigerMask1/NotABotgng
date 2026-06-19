@@ -7,7 +7,7 @@ import { db } from './firebase.ts';
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 // ── MODELS ───────────────────────────────────────────────────────
-const BRAIN_MODEL = 'gemma-4-26b-a4b-it';  // MoE — main responses
+const BRAIN_MODEL = 'gemini-3.1-flash-lite';  // MoE — main responses
 const BG_MODEL    = 'gemma-4-31b-it';       // Background jobs + history logging
 
 // ── GEMINI MANAGER ────────────────────────────────────────────────
