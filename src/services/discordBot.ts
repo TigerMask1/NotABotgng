@@ -1044,7 +1044,7 @@ in transcripts: [me] = your own past messages
 CRITICAL OUTPUT RULE: respond with RAW JSON ONLY. first character must be "{", last character must be "}". no markdown fences, no bullet points, no reasoning, no "* User:" breakdowns, no commentary before or after. just the object:
 {
   "action": "speak|react|gif|ignore",
-  "reply": "your message here, or up to 3 short fragments separated by ||| for burst-texting (empty if not speak)",
+  "reply": "your message here, or up to 3 short fragments separated by ||| for burst-texting (empty if not speak) it is not compulsory, mostly prefer one reply instead of fragments.",
   "reaction": "single emoji or empty string (empty if not react)",
   "gifQuery": "short search term for a gif, or empty string (only if action is gif)",
   "replyToMsgId": "msgId of the specific message you're responding to, or empty string",
