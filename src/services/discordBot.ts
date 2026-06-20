@@ -409,13 +409,18 @@ interface ChannelState {
   lastActivityAt:              number;
   lastBotMsgAt:                number;   // 0 = hasn't spoken
   gotResponseSinceLastBotMsg:  boolean;
+  // how many UNPROMPTED messages in a row it's jumped in on — i.e. nobody
+  // pinged it, it's not mid-exchange with the sender, it just had a quip.
+  // any actual ignore resets this to 0. mentioned/DM/in-exchange replies
+  // don't touch it either way — being directly engaged isn't "talking too much."
+  consecutiveUnpromptedReplies: number;
 }
 const channelState = new Map<string, ChannelState>();
 
 function getChState(channelId: string): ChannelState {
   let s = channelState.get(channelId);
   if (!s) {
-    s = { mode: 'passive', goal: '', lastActivityAt: Date.now(), lastBotMsgAt: 0, gotResponseSinceLastBotMsg: true };
+    s = { mode: 'passive', goal: '', lastActivityAt: Date.now(), lastBotMsgAt: 0, gotResponseSinceLastBotMsg: true, consecutiveUnpromptedReplies: 0 };
     channelState.set(channelId, s);
   }
   if (s.mode === 'active' && Date.now() - s.lastActivityAt > ACTIVE_IDLE_REVERT_MS) {
@@ -435,7 +440,7 @@ function goActive(channelId: string, goal: string) {
 function revertToPassive(channelId: string, reason = '') {
   const s = getChState(channelId);
   if (s.mode === 'passive') return;
-  s.mode = 'passive'; s.goal = '';
+  s.mode = 'passive'; s.goal = ''; s.consecutiveUnpromptedReplies = 0;
   console.log(`[Mode] #${channelId.slice(-5)} passive${reason ? ` — ${reason}` : ''}`);
 }
 
@@ -1301,6 +1306,7 @@ interface BrainOpts {
   isSecondPass?:  boolean;
   videoCtx?:     { title: string; url: string };
   images?:       ImagePart[];   // live vision attachments for THIS call only, never persisted
+  consecutiveUnpromptedReplies?: number;
 }
 
 async function brain(opts: BrainOpts): Promise<BrainDecision> {
@@ -1317,7 +1323,11 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   if (opts.batchSize && opts.batchSize > 1)
     parts.push(`\n(${opts.batchSize} messages landed while you were thinking — all already in the chat above, below the marker. default is ignoring the whole pile, that's normal. only break that if something in there genuinely earns a reply or reaction. if so, set replyToMsgId, and flag unansweredMsgId if something else in there is a real question you're leaving for later.)`);
   if (opts.images?.length)
-    parts.push(`\n(an image is attached to the trigger message below — actually look at it, react to what's really in it, don't guess)`);
+    parts.push(`\n(an image is attached to the most recent message below — actually look at it, react to what's really in it, don't guess)`);
+  if (opts.consecutiveUnpromptedReplies && opts.consecutiveUnpromptedReplies >= 1) {
+    const n = opts.consecutiveUnpromptedReplies;
+    parts.push(`\n(for context: you've spoken up completely unprompted ${n} time${n > 1 ? 's' : ''} in a row now — nobody asked, you just had something to say each time)`);
+  }
   if (opts.selfNote) parts.push(`\nSELF-CHECK: ${opts.selfNote}`);
 
   if (opts.commandResult) {
@@ -1332,9 +1342,11 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   if (opts.endingConvo)  flags.push('they seem to be wrapping up');
 
   parts.push(
-    `\nTRIGGER — ${opts.sender} (${bondLabel} bond ${opts.bond}/100):\n"${opts.message}"`,
+    `\nmost recently — ${opts.sender} (${bondLabel} bond ${opts.bond}/100) said:\n"${opts.message}"`,
     flags.length ? `context: ${flags.join(', ')}` : 'context: no direct ping',
-    opts.isSecondPass ? '(second pass — you already decided to respond, just give the reply now. command must be "none")' : '',
+    opts.isSecondPass
+      ? '(second pass — you already decided to respond, just give the reply now. command must be "none")'
+      : `\nstop and think as NotABot for a second — not as something being handed a message and asked to generate a reply to it. that's not the question. the question is just: right now, looking at how this is actually flowing, do you feel like saying something, reacting, or sending a gif? or are you just watching this happen, same as most of the time? you are not obligated to respond to anything just because it's the most recent line — most lines in a real group chat get zero response from anyone, and that's normal.`,
     `\nOutput ONLY the JSON object. raw JSON, first char "{", last char "}", nothing else.`,
   );
 
@@ -2116,6 +2128,12 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
   const senderCount = recentMsgs.filter(m => m.authorId === last.author.id).length;
   const inExchange  = botReplied && senderCount >= 2;
   const endingConvo = /\b(bye|cya|gotta go|gtg|see ya|later|good night|gn|logging off|ttyl|im out)\b/i.test(tContent);
+  // "unprompted" = nobody pinged it, no @everyone, not mid back-and-forth with
+  // this specific sender — i.e. it would be volunteering a reply purely because
+  // it found something to say about someone else's message. that's exactly the
+  // pattern that reads as a bot replying to every single line instead of a
+  // person picking their moments.
+  const unprompted = !anyMentioned && !tEveryonePing && !inExchange;
 
   const statusLine = `mode: active (goal: ${state.goal || 'none set'}) | speak: ${speakState.mode} | server: ${tServerName} | channel: #${tChannelName}`;
 
@@ -2130,12 +2148,19 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
     everyonePing: tEveryonePing, endingConvo,
     goal: state.goal, batchSize: batch.length,
     images,
+    consecutiveUnpromptedReplies: state.consecutiveUnpromptedReplies,
   };
 
   let decision = await brain(brainOpts);
   console.log(`[Brain] ${tSender}: ${decision.action}${decision.reply ? ` — "${decision.reply.slice(0, 50)}"` : decision.reaction ? ` — ${decision.reaction}` : ''}`);
 
   decision = await executeBrainDecision({ decision, brainOpts, channel: last.channel, replyToMsg: last, channelId, guildId });
+
+  // bookkeeping only — NotABot's own call stands. this just keeps the "how
+  // many in a row have I volunteered" number accurate for the NEXT call's
+  // self-awareness framing, it never overrides what it actually decided here.
+  if (decision.action === 'ignore') state.consecutiveUnpromptedReplies = 0;
+  else if (unprompted) state.consecutiveUnpromptedReplies++;
 
   // resolve which message in this batch the model actually wants to reply/react to —
   // falls back to the last (trigger) message if replyToMsgId is empty/unrecognized.
