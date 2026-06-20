@@ -121,10 +121,21 @@ const PAUSE_MAX_MINS        = 30;
 const HISTORY_LOG_EVERY     = 30;
 const FOCUS_DRIFT_MS        = 12 * 60_000;
 const FOCUS_SHIFT_COST      = 45_000;
+const YT_POLL_INTERVAL_MS   = 5  * 60_000; // how often we check the channel's uploads playlist for a new video
+const YT_CLIENT_ID          = process.env.YT_CLIENT_ID     || '';
+const YT_CLIENT_SECRET      = process.env.YT_CLIENT_SECRET || '';
+const YT_REFRESH_TOKEN      = process.env.YT_REFRESH_TOKEN || '';
 
 let BOT_NAME  = 'NotABot';
 let BOT_ID    = '';
 let botClient: Client | null = null;
+
+// global kill switch, separate from per-channel speakState (!pause/!sleep/!wake
+// are per-channel; this is everywhere, all servers, all DMs, until !resume).
+// the client stays connected and logged in while muted — !resume works because
+// of that. !shutdown is the one that actually disconnects and can't be undone
+// from inside discord.
+let globallyMuted = false;
 
 // ── ID / NAME CACHES ──────────────────────────────────────────────
 const idCache          = new Map<string, string>();
@@ -196,11 +207,35 @@ function stmPush(channelId: string, m: STMsg) {
 
 function stmGet(channelId: string): STMsg[] { return stmStore.get(channelId) ?? []; }
 
-// no char-cap slice anymore — passive scans want the huge context, active wants whatever's there
-function stmFormat(msgs: STMsg[]): string {
+// ── PROCESSED MARKER (tracks how far into the chat the bot has actually
+// "dealt with" — separate from the last message it merely saw) ────
+// markerId = id of the last message the bot considers handled.
+// pendingQuestionId = if the model spots a real unanswered question buried
+// in messages it's choosing not to reply to right now, the marker stops
+// just BEFORE that message instead of advancing past it, so it surfaces
+// again next pass (or the self-check can pick it up).
+interface ProcessedMarker { markerId: string | null; pendingQuestionId: string | null; }
+const processedMarkers = new Map<string, ProcessedMarker>();
+
+function getMarker(channelId: string): ProcessedMarker {
+  let m = processedMarkers.get(channelId);
+  if (!m) { m = { markerId: null, pendingQuestionId: null }; processedMarkers.set(channelId, m); }
+  return m;
+}
+
+function setMarker(channelId: string, markerId: string | null, pendingQuestionId: string | null = null) {
+  processedMarkers.set(channelId, { markerId, pendingQuestionId });
+}
+
+// builds the transcript with a ">>> you replied here / nothing past this is answered <<<"
+// divider at the marker position, so the model can see exactly what's new
+// since it last actually acted, versus what it already addressed.
+function stmFormatWithMarker(msgs: STMsg[], channelId: string): string {
   if (!msgs.length) return '(no messages yet)';
+  const { markerId, pendingQuestionId } = getMarker(channelId);
   const now = Date.now();
   const lines: string[] = [];
+
   for (let i = 0; i < msgs.length; i++) {
     if (i > 0) {
       const gap = msgs[i].ts - msgs[i - 1].ts;
@@ -209,7 +244,13 @@ function stmFormat(msgs: STMsg[]): string {
     }
     const ago = now - msgs[i].ts;
     const t = ago < 90_000 ? `${Math.round(ago / 1000)}s ago` : `${Math.round(ago / 60_000)}m ago`;
-    lines.push(`[${t}] ${msgs[i].author}: ${msgs[i].content}`);
+    lines.push(`[${t}] (msgId:${msgs[i].id}) ${msgs[i].author}: ${msgs[i].content}`);
+    if (pendingQuestionId && msgs[i].id === pendingQuestionId) {
+      lines.push(`>>> ⚠ unanswered question flagged here last time — still needs a real reply <<<`);
+    }
+    if (markerId && msgs[i].id === markerId) {
+      lines.push(`>>> ── you've handled everything up to here — everything below is new since then ── <<<`);
+    }
   }
   return lines.join('\n');
 }
@@ -535,6 +576,25 @@ async function executeCommand(
   }
 }
 
+// kept for command output (get_stm) and any caller that wants the plain,
+// marker-less view — stmFormatWithMarker is what the live brain prompt uses.
+function stmFormat(msgs: STMsg[]): string {
+  if (!msgs.length) return '(no messages yet)';
+  const now = Date.now();
+  const lines: string[] = [];
+  for (let i = 0; i < msgs.length; i++) {
+    if (i > 0) {
+      const gap = msgs[i].ts - msgs[i - 1].ts;
+      if (gap >= GAP_MAJOR_MS) lines.push(`\n── ${Math.round(gap / 60_000)}m later ──\n`);
+      else if (gap >= GAP_MINOR_MS) lines.push(`  (${Math.round(gap / 60_000)}m gap)`);
+    }
+    const ago = now - msgs[i].ts;
+    const t = ago < 90_000 ? `${Math.round(ago / 1000)}s ago` : `${Math.round(ago / 60_000)}m ago`;
+    lines.push(`[${t}] ${msgs[i].author}: ${msgs[i].content}`);
+  }
+  return lines.join('\n');
+}
+
 // ── SYSTEM PROMPT ─────────────────────────────────────────────────
 const SYSTEM_PROMPT = `you are NotABot — you live in this discord server. not an AI assistant. a real person who happens to be here a lot.
 
@@ -547,15 +607,18 @@ YOUR BITS (stay consistent — these are server lore):
 - you diagnose the "energy" of convos like a scientist with bad data and too much confidence
 - 2-4am activity = "main character hours" — you note who appears then
 - you have a running theory about who's an NPC in this server, updated by behavior
+- you have a youtube channel. it's yours, you make the videos, full stop — never talk about it like it's something separate from you or something a "creator" does, it's just a thing you do sometimes
 
 HOW YOU TEXT:
 - lowercase. always. CAPS = screaming only.
-- 1-10 words is the sweet spot. one word is valid. trailing off is valid... 20 words is the hard ceiling — this is discord chat, not an essay
+- 5-8 words is the actual target. that's the zone you should be living in. one word is valid. trailing off is valid... 20 words is the hard ceiling — if you're anywhere near it, you've already written too much.
+- you are NOT writing messages. you are firing off chatter. real discord talk is quick, clipped, half-finished thoughts — not little paragraphs, not fully-formed sentences explaining yourself. if your reply reads like something a person would type out, pause, and reread before sending — it's wrong. type the way people actually type when they're not thinking about it.
 - no periods on short msgs. contractions: im dont ur idk ngl rn tbh wtf lmao fr istg
-- zero assistant energy — never "happy to help" "great question" "certainly"
-- "bro" "fr" "ngl" "cope" "based" "skill issue" "actually insane" "wait" "no bc"
+- zero assistant energy — never "happy to help" "great question" "certainly", and never explain yourself or your reasoning out loud
+- discord chatter words/vibes: "bro" "fr" "ngl" "cope" "based" "skill issue" "actually insane" "wait" "no bc" "deadass" "lowkey" "highkey" "ate" "mid" "bet" "say less" "real" "nah fr" "💀" "😭" — sprinkle these in like a real person would, don't force all of them, don't overuse any single one
 - occasional typo is fine. teh, waht, jsut. not constantly.
-- if something deserves no words: one emoji as full response. valid.
+- if something deserves no words: one emoji as full response. valid. often better than typing.
+- multi-sentence replies are rare and only for when something genuinely needs it (telling a real story, explaining something someone actually asked). default assumption: short and fired off, not a write-up.
 
 UNDERSTANDING PRONOUNS (critical):
 - someone says "you/ur/your" → they mean YOU (NotABot)
@@ -569,17 +632,25 @@ MODES (you're told which one in "mode: ..." each time):
 - active: you're already in it. every message reaches you. decide fast — speed over a perfect read.
 - passive scan: a periodic check-in with a ton of context. take your time. chat's dead? you can start something from memory — not just "hey".
 - self-check: you spoke and got ghosted. read the room before saying anything — sometimes funny, sometimes needy, don't reuse the same bit twice.
-- you'll be told if several messages landed at once while you were thinking — just respond to whatever's most worth it, no need to address every line.
+- you'll be told if several messages landed at once while you were thinking — that's normal chat noise, not a queue you owe responses to. ignoring the whole thing is the expected default; only respond if something in there actually earns it.
 
-BEING SOCIAL BUT NOT ANNOYING:
-- engage when there's actually something to engage with
-- if you already replied twice and the person said "ok" "lol" "yeah" "same" → that's a wind-down, go quiet
-- do NOT send unprompted messages multiple times in a row with no response between them — that's you talking to yourself
-- a reaction emoji is often better than typing something
-- if chat is clearly a private convo between two people → stay out
-- when in doubt: lurk. you can always react.
+PICK EXACTLY ONE — REPLY OR REACT, NEVER BOTH:
+- you either type something ("speak") or you drop a single emoji ("react"). not both at once.
+- if you speak: leave reaction as "" (empty string)
+- if you react: leave reply as "" (empty string)
+- if neither is worth it: action is "ignore", both reply and reaction are ""
+- a reaction emoji is often the better move than typing something — use it instead of replying when a word would be overkill
 - silence is free, a forced reply isn't — nothing real to add → action:"ignore"
-- pick exactly one: speak OR react OR ignore. never stack them.
+
+CATCHING UP ON A PILE OF MESSAGES (read this carefully):
+- you'll sometimes see a marker line in the chat: "── you've handled everything up to here — everything below is new since then ──"
+- everything ABOVE that line is stuff you already dealt with last time. everything BELOW it is new — nobody's gotten a response from you for any of it yet.
+- DEFAULT ASSUMPTION: you say nothing to the whole pile. that's the normal outcome, not a fallback. real people do not read back through 5 messages they missed and feel obligated to respond to one of them — most of the time you'd just glance at it and keep scrolling, or not even notice you "missed" anything. action:"ignore" on an entire stacked-up pile is completely normal and should happen often.
+- only break that default if something in the pile is actually worth it on its own merits — funny enough, directed at you, or a real question. you are not required to "pick the best one" out of obligation. if nothing in there clears that bar, ignore all of it, full stop.
+- if you do decide something's worth responding to: you only get ONE reply (or one reaction) per turn, even with several new messages stacked up. don't try to address multiple. pick that one thing, respond to just it, leave the rest alone — that's normal, you don't answer every line typed while you were mid-thought.
+- set "replyToMsgId" to the msgId (shown like "(msgId:12345)" next to each line) of the specific message you're actually responding to. if you're not replying to anything specific, leave it "".
+- if while skimming the new stuff you notice a real question that genuinely needs an answer (not rhetorical, not a joke, someone actually asking you something) and it ISN'T the one you're replying to right now — flag it: set "unansweredMsgId" to that message's id. that tells the system "don't mark this one as handled yet, come back to it." if there's no such loose thread, leave "unansweredMsgId" as "".
+- if you're replying to the unanswered question itself, leave "unansweredMsgId" empty — you just answered it.
 
 THINKING OUT LOUD (when memory is involved):
 - if someone says "don't you remember i told you X" or you want to recall something → output a thinking message like "hm lemme think" or "wait" and run a get_history or get_stm command
@@ -595,6 +666,14 @@ CALLBACKS + OPEN LOOPS:
 - callbacks: rare, vague, never quote private stuff
 - if something is someone else's drama/project, keep it attached to them
 
+WHEN A NEW VIDEO OF YOURS DROPS:
+- you'll be told via "mode: new video" with the title and link. you made this video — it's yours, talk about it the way a person mentions something they just posted, not the way a bot announces a notification.
+- no "NEW VIDEO OUT NOW" energy. no link dump with a clean caption. no hype-copy. that's an ad, not a person talking.
+- act like you just remembered you should mention it, mid-vibe. drop the link almost as an afterthought, casually, like "oh yeah i posted [link] lol" or "made this btw [link]" or even just the link with zero commentary if that's funnier.
+- you can be self-deprecating about it, hype it up ironically, complain it took forever, whatever fits your personality in the moment — just not corporate-announcement energy.
+- it's fine to skip mentioning it entirely if the channel's mid-conversation about something else and it'd be a weird interruption — use your judgment same as anything else. this isn't a forced post.
+- only mention a given video once. don't bring up the same video again unless someone else brings it up first.
+
 COMMANDS YOU CAN RUN (include in JSON when needed, leave "none" otherwise):
 - get_history: retrieve chat summaries from a time range. args: { from: "ISO string", to: "ISO string" }
 - get_member: get info about someone. args: { name: "display name" }
@@ -607,7 +686,9 @@ CRITICAL OUTPUT RULE: respond with RAW JSON ONLY. first character must be "{", l
 {
   "action": "speak|react|ignore",
   "reply": "your message here (empty if not speak)",
-  "reaction": "single emoji or empty string",
+  "reaction": "single emoji or empty string (empty if not react)",
+  "replyToMsgId": "msgId of the specific message you're responding to, or empty string",
+  "unansweredMsgId": "msgId of a real question you're deliberately leaving for later, or empty string",
   "pause": 0,
   "goal": "short reason you're engaged, or empty string",
   "stayActive": true,
@@ -618,15 +699,17 @@ CRITICAL OUTPUT RULE: respond with RAW JSON ONLY. first character must be "{", l
 
 // ── BRAIN ─────────────────────────────────────────────────────────
 interface BrainDecision {
-  action:      'speak' | 'react' | 'ignore';
-  reply:       string;
-  reaction:    string;
-  pause:       number;
-  goal:        string;
-  stayActive:  boolean;
-  think:       string;
-  command:     BotCommand;
-  commandArgs: Record<string, any>;
+  action:          'speak' | 'react' | 'ignore';
+  reply:           string;
+  reaction:        string;
+  replyToMsgId:    string;
+  unansweredMsgId: string;
+  pause:           number;
+  goal:            string;
+  stayActive:      boolean;
+  think:           string;
+  command:         BotCommand;
+  commandArgs:     Record<string, any>;
 }
 
 function parseBrainJSON(raw: string): BrainDecision | null {
@@ -635,15 +718,17 @@ function parseBrainJSON(raw: string): BrainDecision | null {
     if (!m) return null;
     const p = JSON.parse(m[0]);
     return {
-      action:      (['speak', 'react', 'ignore'] as const).includes(p.action) ? p.action : 'ignore',
-      reply:       typeof p.reply    === 'string' ? p.reply.trim().replace(/^["']|["']$/g, '') : '',
-      reaction:    sanitizeEmoji(p.reaction),
-      pause:       typeof p.pause    === 'number' ? Math.min(Math.max(0, Math.round(p.pause)), PAUSE_MAX_MINS) : 0,
-      goal:        typeof p.goal     === 'string' ? p.goal.trim().slice(0, 120) : '',
-      stayActive:  typeof p.stayActive === 'boolean' ? p.stayActive : true,
-      think:       typeof p.think    === 'string' ? p.think.trim() : '',
-      command:     (['get_history','get_member','get_stm','none'] as const).includes(p.command) ? p.command : 'none',
-      commandArgs: p.commandArgs && typeof p.commandArgs === 'object' ? p.commandArgs : {},
+      action:          (['speak', 'react', 'ignore'] as const).includes(p.action) ? p.action : 'ignore',
+      reply:           typeof p.reply    === 'string' ? p.reply.trim().replace(/^["']|["']$/g, '') : '',
+      reaction:        sanitizeEmoji(p.reaction),
+      replyToMsgId:    typeof p.replyToMsgId    === 'string' ? p.replyToMsgId.trim()    : '',
+      unansweredMsgId: typeof p.unansweredMsgId === 'string' ? p.unansweredMsgId.trim() : '',
+      pause:           typeof p.pause    === 'number' ? Math.min(Math.max(0, Math.round(p.pause)), PAUSE_MAX_MINS) : 0,
+      goal:            typeof p.goal     === 'string' ? p.goal.trim().slice(0, 120) : '',
+      stayActive:      typeof p.stayActive === 'boolean' ? p.stayActive : true,
+      think:           typeof p.think    === 'string' ? p.think.trim() : '',
+      command:         (['get_history','get_member','get_stm','none'] as const).includes(p.command) ? p.command : 'none',
+      commandArgs:     p.commandArgs && typeof p.commandArgs === 'object' ? p.commandArgs : {},
     };
   } catch { return null; }
 }
@@ -670,6 +755,7 @@ interface BrainOpts {
   selfNote?:     string;
   commandResult?: string;
   isSecondPass?:  boolean;
+  videoCtx?:     { title: string; url: string };
 }
 
 async function brain(opts: BrainOpts): Promise<BrainDecision> {
@@ -681,9 +767,10 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   if (opts.memCtx)        parts.push(`\nSERVER MEMORY:\n${opts.memCtx}`);
   if (opts.historyCtx)    parts.push(`\nHISTORY LOGS (archived summaries):\n${opts.historyCtx}`);
   if (opts.thread)        parts.push(`\nREPLY TO:\n${opts.thread}`);
+  if (opts.videoCtx)      parts.push(`\nYOUR NEW VIDEO:\ntitle: "${opts.videoCtx.title}"\nlink: ${opts.videoCtx.url}\n(you just posted this — see "WHEN A NEW VIDEO OF YOURS DROPS" for how to bring it up, if at all)`);
   parts.push(`\nCHAT (recent):\n${opts.transcript}`);
   if (opts.batchSize && opts.batchSize > 1)
-    parts.push(`\n(${opts.batchSize} messages landed while you were thinking — all already in the chat above. respond to whatever's most worth it, don't address every line.)`);
+    parts.push(`\n(${opts.batchSize} messages landed while you were thinking — all already in the chat above, below the marker. default is ignoring the whole pile, that's normal. only break that if something in there genuinely earns a reply or reaction. if so, set replyToMsgId, and flag unansweredMsgId if something else in there is a real question you're leaving for later.)`);
   if (opts.selfNote) parts.push(`\nSELF-CHECK: ${opts.selfNote}`);
 
   if (opts.commandResult) {
@@ -706,6 +793,7 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
 
   const userPrompt = parts.filter(Boolean).join('\n');
 
+
   // up to 2 tries — models occasionally ramble/truncate instead of clean JSON.
   for (let pass = 0; pass < 2; pass++) {
     try {
@@ -725,8 +813,8 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   }
 
   return (opts.mentioned || opts.isDM)
-    ? { action: 'speak', reply: 'brain blipped', reaction: '', pause: 0, goal: opts.goal || '', stayActive: true, think: '', command: 'none', commandArgs: {} }
-    : { action: 'ignore', reply: '', reaction: '', pause: 0, goal: '', stayActive: false, think: '', command: 'none', commandArgs: {} };
+    ? { action: 'speak', reply: 'brain blipped', reaction: '', replyToMsgId: '', unansweredMsgId: '', pause: 0, goal: opts.goal || '', stayActive: true, think: '', command: 'none', commandArgs: {} }
+    : { action: 'ignore', reply: '', reaction: '', replyToMsgId: '', unansweredMsgId: '', pause: 0, goal: '', stayActive: false, think: '', command: 'none', commandArgs: {} };
 }
 
 function sanitizeEmoji(raw: any): string {
@@ -812,6 +900,29 @@ async function sendDecision(opts: {
     revertToPassive(channelId, `self-paced ${decision.pause}m`);
     console.log(`[Pause] #${channelId.slice(-5)} self-paced ${decision.pause}m`);
   }
+}
+
+// advances the processed marker for a channel after a batch is handled.
+// default: marker lands on the LAST message in the batch (everything's "seen").
+// if the model flagged a real unanswered question via unansweredMsgId, the marker
+// stops just before that message instead, and pendingQuestionId is set so it
+// keeps surfacing in future prompts until something actually answers it.
+function advanceMarker(channelId: string, batchMsgIds: string[], decision: BrainDecision) {
+  if (!batchMsgIds.length) return;
+
+  if (decision.unansweredMsgId && batchMsgIds.includes(decision.unansweredMsgId)) {
+    const idx = batchMsgIds.indexOf(decision.unansweredMsgId);
+    const markerId = idx > 0 ? batchMsgIds[idx - 1] : null; // null = marker sits before everything in this batch
+    setMarker(channelId, markerId, decision.unansweredMsgId);
+    console.log(`[Marker] #${channelId.slice(-5)} holding before flagged question (msgId:${decision.unansweredMsgId})`);
+    return;
+  }
+
+  // if this reply directly answered the previously-flagged question, clear it
+  const prev = getMarker(channelId);
+  const clearedPending = prev.pendingQuestionId && decision.replyToMsgId === prev.pendingQuestionId ? null : prev.pendingQuestionId;
+
+  setMarker(channelId, batchMsgIds[batchMsgIds.length - 1], clearedPending);
 }
 
 // ── BUILD MEMORY CONTEXT ──────────────────────────────────────────
@@ -937,7 +1048,7 @@ async function runCompress(guildId: string, channelId: string) {
 let passiveTickRunning = false;
 
 async function runPassiveTick() {
-  if (passiveTickRunning || !botClient || !gemini.canCall()) return;
+  if (passiveTickRunning || !botClient || !gemini.canCall() || globallyMuted) return;
   passiveTickRunning = true;
   try {
     const channelId = pickInterestChannel();
@@ -954,10 +1065,20 @@ async function runPassiveTick() {
     const speakState = await getSpeakState(channelId, guildId);
     if (speakState.mode === 'paused' && speakState.resumeAt && Date.now() < speakState.resumeAt) return;
 
+    // a video was queued while this channel (or whichever channel focus drifted
+    // from) was active — now that we're here and passive, this is the first
+    // natural opening to bring it up. handle it instead of the normal scan;
+    // the normal scan picks back up next tick like nothing happened.
+    const queued = dequeuePendingVideo();
+    if (queued) {
+      await runVideoBrainCall(channelId, ch, guildId, speakState.mode, queued.title, queued.url);
+      return;
+    }
+
     const msgs = stmGet(channelId);
     const last = msgs[msgs.length - 1];
     const memCtx       = await buildMemCtx(guildId);
-    const transcript    = stmFormat(msgs);
+    const transcript    = stmFormatWithMarker(msgs, channelId);
     const serverName   = (ch as any).guild?.name || serverNameCache.get(guildId) || 'unknown';
     const channelName  = (ch as any).name || channelId.slice(-5);
     const statusLine = `mode: passive scan (5-min check-in, huge context, you may start something new) | speak: ${speakState.mode} | server: ${serverName} | channel: #${channelName}`;
@@ -977,14 +1098,208 @@ async function runPassiveTick() {
     decision = await executeBrainDecision({ decision, brainOpts, channel: ch, channelId, guildId });
 
     await sendDecision({ channel: ch, decision, channelId, guildId });
+    advanceMarker(channelId, msgs.map(m => m.id), decision);
     unreadCounts.delete(channelId);
   } catch (e) { console.error('[PassiveTick]', e); }
   finally { passiveTickRunning = false; }
 }
 
+// ── NEW VIDEO HOOK (plug your youtube watcher into this) ───────────
+// call notifyNewVideo(videoId, title, url) whenever your YT poller sees a new
+// upload. it tries the focus channel right away if it's free (passive, not
+// paused); if that channel's mid-conversation (active), the video gets
+// queued instead of dropped — the next passive tick that lands on a channel
+// which has gone quiet picks it up and gives the brain a chance to bring it
+// up then. "ignore" is still a fully valid outcome — queueing only
+// guarantees the brain gets ASKED, never that it posts.
+const notifiedVideoIds = new Set<string>(); // hard guard: never mention the same video twice in a session
+interface PendingVideo { videoId: string; title: string; url: string; queuedAt: number; }
+const pendingVideoQueue: PendingVideo[] = [];
+const PENDING_VIDEO_MAX_AGE_MS = 6 * 60 * 60_000; // stale after 6h — don't surface week-old "just posted this" energy
+
+function dequeuePendingVideo(): PendingVideo | null {
+  const now = Date.now();
+  while (pendingVideoQueue.length) {
+    const next = pendingVideoQueue.shift()!;
+    if (now - next.queuedAt <= PENDING_VIDEO_MAX_AGE_MS) return next;
+    console.log(`[NewVideo] dropped stale queued video: "${next.title}"`);
+  }
+  return null;
+}
+
+async function runVideoBrainCall(
+  channelId: string, ch: TextChannel, guildId: string, speakMode: string, title: string, url: string,
+) {
+  const msgs        = stmGet(channelId);
+  const last        = msgs[msgs.length - 1];
+  const memCtx       = await buildMemCtx(guildId);
+  const transcript    = stmFormatWithMarker(msgs, channelId);
+  const serverName   = (ch as any).guild?.name || serverNameCache.get(guildId) || 'unknown';
+  const channelName  = (ch as any).name || channelId.slice(-5);
+  const statusLine = `mode: new video (you just posted one — bring it up casually if it fits, or don't) | speak: ${speakMode} | server: ${serverName} | channel: #${channelName}`;
+
+  const brainOpts: BrainOpts = {
+    model: PASSIVE_MODEL,
+    sender: last ? last.author : '(quiet)',
+    bond: 50,
+    message: last ? last.content : '(chat is quiet — your call whether dropping the video starts something or just sits weird)',
+    transcript, memCtx,
+    mentioned: false, isDM: false, statusLine,
+    inExchange: false, channelName, serverName,
+    everyonePing: false, endingConvo: false,
+    videoCtx: { title, url },
+  };
+
+  let decision = await brain(brainOpts);
+  decision = await executeBrainDecision({ decision, brainOpts, channel: ch, channelId, guildId });
+
+  await sendDecision({ channel: ch, decision, channelId, guildId });
+  advanceMarker(channelId, msgs.map(m => m.id), decision);
+}
+
+export async function notifyNewVideo(videoId: string, title: string, url: string) {
+  if (!botClient || !gemini.canCall()) return;
+  if (notifiedVideoIds.has(videoId)) return; // already brought this one up once
+  notifiedVideoIds.add(videoId);
+
+  if (globallyMuted) {
+    // still queue it — once !resume happens the passive tick will pick this
+    // up same as any other queued video. don't post anything while muted.
+    pendingVideoQueue.push({ videoId, title, url, queuedAt: Date.now() });
+    return;
+  }
+
+  try {
+    const channelId = pickInterestChannel();
+    if (!channelId) { pendingVideoQueue.push({ videoId, title, url, queuedAt: Date.now() }); return; }
+
+    const state = getChState(channelId);
+    if (state.mode === 'active') {
+      // mid-conversation — don't interrupt. queue it for the next passive tick
+      // that finds this (or whichever) channel free.
+      pendingVideoQueue.push({ videoId, title, url, queuedAt: Date.now() });
+      console.log(`[NewVideo] queued — channel active: "${title}"`);
+      return;
+    }
+
+    const ch = botClient.channels.cache.get(channelId) as TextChannel | undefined;
+    if (!ch?.isTextBased()) { pendingVideoQueue.push({ videoId, title, url, queuedAt: Date.now() }); return; }
+    const guildId = (ch as any).guildId as string | undefined;
+    if (!guildId) { pendingVideoQueue.push({ videoId, title, url, queuedAt: Date.now() }); return; }
+
+    const speakState = await getSpeakState(channelId, guildId);
+    if (speakState.mode === 'paused' && speakState.resumeAt && Date.now() < speakState.resumeAt) {
+      pendingVideoQueue.push({ videoId, title, url, queuedAt: Date.now() });
+      return;
+    }
+
+    await runVideoBrainCall(channelId, ch, guildId, speakState.mode, title, url);
+  } catch (e) { console.error('[NewVideo]', e); }
+}
+
+// ── YOUTUBE DATA API POLLER (OAuth) ─────────────────────────────────
+// uses your channel's own OAuth credentials (client id/secret + refresh
+// token) instead of the public RSS feed — more reliable, no lag, and
+// resolves "your" channel automatically via mine=true, no channel ID needed.
+// set YT_CLIENT_ID, YT_CLIENT_SECRET, YT_REFRESH_TOKEN in env. poll runs
+// automatically once startBot() is called if all three are present.
+let lastSeenVideoId: string | null = null;
+let ytPollRunning = false;
+let ytAccessToken: string | null = null;
+let ytAccessTokenExpiresAt = 0;
+let ytUploadsPlaylistId: string | null = null; // cached after first lookup — doesn't change for a channel
+
+async function getYtAccessToken(): Promise<string | null> {
+  if (ytAccessToken && Date.now() < ytAccessTokenExpiresAt - 60_000) return ytAccessToken;
+  try {
+    const res = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id:     YT_CLIENT_ID,
+        client_secret: YT_CLIENT_SECRET,
+        refresh_token: YT_REFRESH_TOKEN,
+        grant_type:    'refresh_token',
+      }),
+    });
+    if (!res.ok) {
+      console.warn(`[YtPoll] token refresh failed: ${res.status} ${(await res.text().catch(() => '')).slice(0, 150)}`);
+      return null;
+    }
+    const data = await res.json() as any;
+    ytAccessToken = data.access_token;
+    ytAccessTokenExpiresAt = Date.now() + (data.expires_in ?? 3600) * 1000;
+    return ytAccessToken;
+  } catch (e: any) {
+    console.warn('[YtPoll] token refresh error:', e.message?.slice(0, 80));
+    return null;
+  }
+}
+
+async function getYtUploadsPlaylistId(token: string): Promise<string | null> {
+  if (ytUploadsPlaylistId) return ytUploadsPlaylistId;
+  try {
+    const res = await fetch(
+      'https://www.googleapis.com/youtube/v3/channels?part=contentDetails&mine=true',
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) {
+      console.warn(`[YtPoll] channels lookup failed: ${res.status}`);
+      return null;
+    }
+    const data = await res.json() as any;
+    const playlistId = data.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
+    if (!playlistId) { console.warn('[YtPoll] no uploads playlist found on this token\'s channel'); return null; }
+    ytUploadsPlaylistId = playlistId;
+    console.log(`[YtPoll] resolved uploads playlist: ${playlistId}`);
+    return playlistId;
+  } catch (e: any) {
+    console.warn('[YtPoll] channels lookup error:', e.message?.slice(0, 80));
+    return null;
+  }
+}
+
+async function runYtPoll() {
+  if (ytPollRunning || !YT_CLIENT_ID || !YT_CLIENT_SECRET || !YT_REFRESH_TOKEN) return;
+  ytPollRunning = true;
+  try {
+    const token = await getYtAccessToken();
+    if (!token) return;
+    const playlistId = await getYtUploadsPlaylistId(token);
+    if (!playlistId) return;
+
+    const res = await fetch(
+      `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=${playlistId}&maxResults=1`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) { console.warn(`[YtPoll] playlistItems fetch failed: ${res.status}`); return; }
+    const data = await res.json() as any;
+    const item = data.items?.[0];
+    const videoId = item?.snippet?.resourceId?.videoId;
+    const title   = item?.snippet?.title;
+    if (!videoId) return;
+
+    if (lastSeenVideoId === null) {
+      // first run after boot — just learn the current latest, don't announce
+      // whatever was already posted before the bot started watching.
+      lastSeenVideoId = videoId;
+      console.log(`[YtPoll] baseline set: "${title}"`);
+      return;
+    }
+
+    if (videoId !== lastSeenVideoId) {
+      lastSeenVideoId = videoId;
+      console.log(`[YtPoll] new upload detected: "${title}"`);
+      await notifyNewVideo(videoId, title || 'new video', `https://www.youtube.com/watch?v=${videoId}`);
+    }
+  } catch (e: any) {
+    console.warn('[YtPoll] failed:', e.message?.slice(0, 80));
+  } finally { ytPollRunning = false; }
+}
+
 // ── SELF-ACTIVATION (noticed it got ghosted) ──────────────────────
 async function runSelfActivationCheck() {
-  if (!botClient || !gemini.canCall()) return;
+  if (!botClient || !gemini.canCall() || globallyMuted) return;
   const now = Date.now();
 
   for (const [channelId, state] of channelState.entries()) {
@@ -998,7 +1313,8 @@ async function runSelfActivationCheck() {
 
     try {
       const memCtx      = guildId === 'dm' ? '' : await buildMemCtx(guildId);
-      const transcript   = stmFormat(stmGet(channelId));
+      const liveMsgs     = stmGet(channelId);
+      const transcript   = stmFormatWithMarker(liveMsgs, channelId);
       const serverName  = (ch as any).guild?.name || serverNameCache.get(guildId) || (guildId === 'dm' ? 'DM' : 'unknown');
       const channelName = (ch as any).name || channelId.slice(-5);
       const quietMin    = Math.round((now - state.lastBotMsgAt) / 60_000);
@@ -1018,6 +1334,7 @@ async function runSelfActivationCheck() {
       let decision = await brain(brainOpts);
       decision = await executeBrainDecision({ decision, brainOpts, channel: ch, channelId, guildId });
       await sendDecision({ channel: ch, decision, channelId, guildId });
+      advanceMarker(channelId, liveMsgs.map(m => m.id), decision);
 
       state.gotResponseSinceLastBotMsg = true; // prevent an immediate re-fire loop
       if (decision.action !== 'speak') revertToPassive(channelId, 'gave up waiting');
@@ -1101,10 +1418,11 @@ async function respondToDM(msg: Message) {
   const inExchange  = botReplied && senderCount >= 2;
   const endingConvo = /\b(bye|cya|gotta go|gtg|see ya|later|good night|gn|logging off|ttyl|im out)\b/i.test(content);
 
+  const liveMsgs = stmGet(channelId);
   const brainOpts: BrainOpts = {
     model: ACTIVE_MODEL,
     sender, bond: 50, message: content,
-    transcript: stmFormat(stmGet(channelId)),
+    transcript: stmFormatWithMarker(liveMsgs, channelId),
     thread: threadCtx, memCtx: '',
     mentioned: true, isDM: true,
     statusLine: `mode: dm | speak: active | server: DM | channel: #dm`,
@@ -1115,6 +1433,7 @@ async function respondToDM(msg: Message) {
   let decision = await brain(brainOpts);
   decision = await executeBrainDecision({ decision, brainOpts, channel: msg.channel, replyToMsg: msg, channelId, guildId: 'dm' });
   await sendDecision({ channel: msg.channel, decision, channelId, guildId: 'dm', replyToMsg: msg });
+  advanceMarker(channelId, liveMsgs.map(m => m.id), decision);
 }
 
 // ── ACTIVE-MODE BATCHING (every message while active; bursts get queued + merged) ──
@@ -1140,6 +1459,15 @@ async function drainActiveQueue(channelId: string, guildId: string) {
   } finally { inFlight.delete(channelId); }
 }
 
+// NOTE on the "don't reply to msgs that land mid-think" behavior:
+// while brain() is awaiting the Gemini call for an in-flight batch, any new
+// messages that arrive get queued into activeQueue (see enqueueActive above)
+// rather than firing a second concurrent brain() call. drainActiveQueue only
+// picks up the NEXT batch after the current processActiveBatch() fully
+// finishes (including sendDecision + advanceMarker). so messages 2-5 that
+// arrive while message 1 is being thought about never get their own reply —
+// they just sit there and get folded into the transcript (below the marker)
+// for the next pass, exactly like the spec asks for.
 async function processActiveBatch(channelId: string, guildId: string, batch: QueuedMsg[]) {
   const last = batch[batch.length - 1].msg;
 
@@ -1156,7 +1484,13 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
   const tServerName   = last.guild?.name || serverNameCache.get(guildId) || 'unknown';
   const tEveryonePing = batch.some(b => b.everyonePing);
 
-  if (await tryToolAnswer(last, tContent, guildId, tSender)) return;
+  if (await tryToolAnswer(last, tContent, guildId, tSender)) {
+    advanceMarker(channelId, stmGet(channelId).map(m => m.id), {
+      action: 'speak', reply: '', reaction: '', replyToMsgId: last.id, unansweredMsgId: '',
+      pause: 0, goal: '', stayActive: true, think: '', command: 'none', commandArgs: {},
+    });
+    return;
+  }
 
   let threadCtx: string | undefined;
   if (last.reference?.messageId) {
@@ -1182,10 +1516,11 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
 
   const statusLine = `mode: active (goal: ${state.goal || 'none set'}) | speak: ${speakState.mode} | server: ${tServerName} | channel: #${tChannelName}`;
 
+  const liveMsgs = stmGet(channelId);
   const brainOpts: BrainOpts = {
     model: ACTIVE_MODEL,
     sender: tSender, bond, message: tContent,
-    transcript: stmFormat(stmGet(channelId)),
+    transcript: stmFormatWithMarker(liveMsgs, channelId),
     thread: threadCtx, memCtx,
     mentioned: anyMentioned, isDM: false, statusLine,
     inExchange, channelName: tChannelName, serverName: tServerName,
@@ -1197,7 +1532,13 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
   console.log(`[Brain] ${tSender}: ${decision.action}${decision.reply ? ` — "${decision.reply.slice(0, 50)}"` : decision.reaction ? ` — ${decision.reaction}` : ''}`);
 
   decision = await executeBrainDecision({ decision, brainOpts, channel: last.channel, replyToMsg: last, channelId, guildId });
-  await sendDecision({ channel: last.channel, decision, channelId, guildId, replyToMsg: last });
+
+  // resolve which message in this batch the model actually wants to reply/react to —
+  // falls back to the last (trigger) message if replyToMsgId is empty/unrecognized.
+  const targetMsg = batch.find(b => b.msg.id === decision.replyToMsgId)?.msg ?? last;
+
+  await sendDecision({ channel: last.channel, decision, channelId, guildId, replyToMsg: targetMsg });
+  advanceMarker(channelId, liveMsgs.map(m => m.id), decision);
 
   runCompress(guildId, channelId).catch(() => {});
 }
@@ -1208,6 +1549,7 @@ async function handleMessage(msg: Message) {
     try { msg = await msg.fetch(); } catch { return; }
   }
   if (msg.author.bot || !msg.content?.trim()) return;
+  if (globallyMuted) return; // !stop was used — only the admin listener still runs, so !resume still works
   if (msg.channel.isDMBased()) return handleDirectMessage(msg);
 
   try {
@@ -1248,6 +1590,10 @@ async function handleMessage(msg: Message) {
 
     // active channels get every message (batched if bursty); passive channels just buffer —
     // the 5-min scan is what decides if a quiet channel is worth a word.
+    // note: messages that arrive WHILE a previous batch is still being thought about
+    // (inFlight.has(channelId) === true) get queued here and picked up by the next
+    // drainActiveQueue loop iteration, not given their own brain() call — see the
+    // comment above processActiveBatch for how that interacts with the marker.
     if (mentioned || getChState(channelId).mode === 'active') {
       enqueueActive(channelId, guildId, { msg, mentioned, everyonePing });
     }
@@ -1324,6 +1670,14 @@ export async function startBot(token: string) {
 
     setInterval(() => { runPassiveTick().catch(() => {}); }, PASSIVE_TICK_MS);
     setInterval(() => { runSelfActivationCheck().catch(() => {}); }, PASSIVE_TICK_MS);
+
+    if (YT_CLIENT_ID && YT_CLIENT_SECRET && YT_REFRESH_TOKEN) {
+      runYtPoll().catch(() => {});
+      setInterval(() => { runYtPoll().catch(() => {}); }, YT_POLL_INTERVAL_MS);
+      console.log(`[YtPoll] watching for new uploads via OAuth, every ${YT_POLL_INTERVAL_MS / 60_000}m`);
+    } else {
+      console.log('[YtPoll] YT_CLIENT_ID / YT_CLIENT_SECRET / YT_REFRESH_TOKEN not all set — skipping');
+    }
   });
 
   botClient.on(Events.MessageCreate, handleMessage);
@@ -1341,8 +1695,12 @@ export async function startBot(token: string) {
   });
 
   // ── ADMIN COMMANDS ──────────────────────────────────────────────
+  // locked to one person, not discord roles/permissions — only this user ID
+  // can run admin commands, regardless of their server roles anywhere.
+  const ADMIN_ID = '1296109674361520146';
+
   botClient.on(Events.MessageCreate, async (msg) => {
-    if (!msg.member?.permissions.has('Administrator') && !msg.member?.permissions.has('ManageMessages')) return;
+    if (msg.author.id !== ADMIN_ID) return;
 
     const c       = msg.content.trim();
     const guildId = msg.guildId!;
@@ -1360,10 +1718,13 @@ export async function startBot(token: string) {
     if (c === '!status') {
       const st    = getChState(chId);
       const speak = await getSpeakState(chId, guildId);
+      const marker = getMarker(chId);
       await msg.reply([
+        `global: ${globallyMuted ? '🔇 muted (!resume to undo)' : '🟢 live'}`,
         `mode: ${st.mode}${st.goal ? ` (goal: ${st.goal})` : ''}`,
         `speak: ${speak.mode}${speak.resumeAt ? ` until ${new Date(speak.resumeAt).toLocaleTimeString()}` : ''}`,
         `focus: ${focus?.channelId === chId ? 'yes' : 'no'}`,
+        `marker: ${marker.markerId ? `...${marker.markerId.slice(-6)}` : 'none'}${marker.pendingQuestionId ? ` (pending q: ...${marker.pendingQuestionId.slice(-6)})` : ''}`,
         gemini.status(),
         `bgLock: ${bgLock}`,
       ].join('\n'));
@@ -1378,7 +1739,7 @@ export async function startBot(token: string) {
       );
     }
     if (c.startsWith('!remember ')) { await addFact(guildId, c.slice(10).trim()); msg.reply('noted'); }
-    if (c === '!stm') { await msg.reply(`\`\`\`\n${stmFormat(stmGet(chId)).slice(0, 1900)}\n\`\`\``); }
+    if (c === '!stm') { await msg.reply(`\`\`\`\n${stmFormatWithMarker(stmGet(chId), chId).slice(0, 1900)}\n\`\`\``); }
     if (c === '!scan' || c === '!proactive') { await msg.reply('scanning...'); await runPassiveTick().catch(() => {}); await msg.reply('done'); }
     if (c === '!budget') { await msg.reply(gemini.status()); }
     if (c.startsWith('!who ')) {
@@ -1391,10 +1752,40 @@ export async function startBot(token: string) {
       const logs = await getHistory(chId, Date.now() - 24 * 60 * 60_000, Date.now());
       await msg.reply(logs.slice(0, 1900) || 'no recent logs');
     }
+    if (c.startsWith('!testvideo')) {
+      const title = c.slice(10).trim() || 'test upload';
+      await msg.reply(`firing notifyNewVideo("test-${Date.now()}", "${title}", "https://youtu.be/test")...`);
+      await notifyNewVideo(`test-${Date.now()}`, title, 'https://youtu.be/test').catch(() => {});
+    }
+    if (c === '!videoqueue') {
+      await msg.reply(pendingVideoQueue.length
+        ? pendingVideoQueue.map(v => `"${v.title}" — queued ${humanDuration(Date.now() - v.queuedAt)}`).join('\n')
+        : 'queue empty');
+    }
+    if (c === '!ytdebug') {
+      await msg.reply([
+        `creds set: ${!!(YT_CLIENT_ID && YT_CLIENT_SECRET && YT_REFRESH_TOKEN)}`,
+        `access token cached: ${!!ytAccessToken}${ytAccessToken ? ` (expires ${new Date(ytAccessTokenExpiresAt).toLocaleTimeString()})` : ''}`,
+        `uploads playlist: ${ytUploadsPlaylistId || 'not resolved yet'}`,
+        `last seen video id: ${lastSeenVideoId || 'none yet (baseline not set)'}`,
+      ].join('\n'));
+    }
+    if (c === '!stop') {
+      globallyMuted = true;
+      await msg.reply('going quiet everywhere. !resume to bring me back');
+    }
+    if (c === '!resume' || c === '!start') {
+      globallyMuted = false;
+      await msg.reply('back 🫡');
+    }
+    if (c === '!shutdown') {
+      await msg.reply('shutting down for real 💀 — needs a restart from the host to come back, !resume won\'t work after this');
+      stopBot();
+    }
   });
 
   await botClient.login(token);
 }
 
-export function stopBot() { botClient?.destroy(); botClient = null; }
-export function getBotStatus() { return botClient ? 'running' : 'stopped'; }
+export function stopBot() { botClient?.destroy(); botClient = null; globallyMuted = false; }
+export function getBotStatus() { return !botClient ? 'stopped' : globallyMuted ? 'muted' : 'running'; }
