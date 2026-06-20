@@ -726,8 +726,109 @@ async function getServerStats(guildId: string): Promise<string> {
   return lines.join(' | ');
 }
 
+// ── CROSS-SERVER LOOKUP (only if the bot is actually in more than one server) ──
+// only ever surfaces PRESENCE — "they're also in server X, bond Y" — never
+// server-specific facts/jokes/arcs. those stay scoped to buildMemCtx for the
+// current guild only, so server A's gossip about someone never leaks into
+// what the bot says about them in server B. if the bot's only in one
+// server, this command is pointless and says so instead of doing anything.
+async function getCrossServerInfo(currentGuildId: string, userId: string, name: string): Promise<string> {
+  if (!botClient || botClient.guilds.cache.size < 2) {
+    return 'only in one server right now — nothing to cross-reference';
+  }
+  const hits: string[] = [];
+  for (const guild of botClient.guilds.cache.values()) {
+    if (guild.id === currentGuildId) continue;
+    try {
+      const snap = await db.collection('servers').doc(guild.id).collection('members').doc(userId).get();
+      if (snap.exists) {
+        const m = snap.data() as MemberData;
+        hits.push(`${guild.name} (bond ${m.bond ?? 50})`);
+      }
+    } catch {}
+  }
+  if (!hits.length) return `no record of ${name} in any other server you're in`;
+  return `${name} is also known in: ${hits.join(', ')} — presence/bond only, no details carried over`;
+}
+
+// ── REMINDERS (in-memory setTimeout, same pattern as the existing pause/timer infra) ──
+// honest limitation: these live in memory only — a process restart loses
+// anything pending. fine for "remind me in an hour", not a real scheduling
+// system. capped count + duration so it can't be used to leak memory or
+// spam far-future timers.
+const REMINDER_MAX_MINS   = 24 * 60; // 1 day out, max
+const REMINDER_MAX_ACTIVE = 200;     // global cap across all channels
+let activeReminderCount = 0;
+
+function setReminder(channelId: string, guildId: string, mins: number, note: string, targetUserId?: string): string {
+  const clamped = Math.min(Math.max(1, Math.round(mins)), REMINDER_MAX_MINS);
+  if (activeReminderCount >= REMINDER_MAX_ACTIVE) return 'too many reminders pending right now, try again later';
+
+  activeReminderCount++;
+  setTimeout(async () => {
+    activeReminderCount--;
+    try {
+      const ch = botClient?.channels.cache.get(channelId) as TextChannel | undefined;
+      if (!ch?.isTextBased()) return;
+      const ping = targetUserId ? `<@${targetUserId}> ` : '';
+      const text = `${ping}${note || 'reminder'}`.slice(0, 250);
+      const sent = await ch.send(text);
+      stmPush(channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: text });
+    } catch (e: any) { console.warn('[Reminder] fire failed:', e.message?.slice(0, 80)); }
+  }, clamped * 60_000);
+
+  return `reminder set for ${clamped}m from now${note ? `: "${note.slice(0, 60)}"` : ''} (lost if the bot restarts before then)`;
+}
+
+// ── POLLS (native discord.js poll, not reaction-based) ──
+// uses discord's real poll message type. question max 300 chars, up to 10
+// answers max 55 chars each, duration in hours — these are DISCORD's own
+// hard limits, not something we're choosing, so we clamp to them rather
+// than let a bad call silently fail.
+async function createPoll(channelId: string, question: string, options: string[], durationHours = 1): Promise<string> {
+  const ch = botClient?.channels.cache.get(channelId) as TextChannel | undefined;
+  if (!ch?.isTextBased()) return 'channel not available to post a poll in';
+  const q = question.trim().slice(0, 300);
+  const answers = options.map(o => o.trim()).filter(Boolean).slice(0, 10);
+  if (!q || answers.length < 2) return 'need a question and at least 2 options to make a poll';
+  const duration = Math.min(Math.max(1, Math.round(durationHours)), 168); // discord max is 7 days (168h)
+
+  try {
+    const sent = await ch.send({
+      poll: {
+        question: { text: q },
+        answers: answers.map(text => ({ text: text.slice(0, 55) })),
+        duration,
+        allowMultiselect: false,
+      },
+    });
+    stmPush(channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: `[poll] ${q}` });
+    return `poll posted: "${q}" with ${answers.length} options, ${duration}h`;
+  } catch (e: any) {
+    return `poll failed: ${e.message?.slice(0, 80)}`;
+  }
+}
+
+// ── WIKIPEDIA LOOKUP (free, no key, always available — settles "wait is that real" arguments) ──
+async function wikiLookup(topic: string): Promise<string> {
+  if (!topic?.trim()) return 'no topic given';
+  try {
+    const url = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(topic.trim().replace(/\s+/g, '_'))}`;
+    const res = await fetch(url, { headers: { 'User-Agent': 'NotABot-discord/1.0' } });
+    if (res.status === 404) return `no wikipedia page found for "${topic}"`;
+    if (!res.ok) return `wiki lookup failed: ${res.status}`;
+    const data = await res.json() as any;
+    if (data.type === 'disambiguation') return `"${topic}" is ambiguous — multiple wikipedia pages match, be more specific`;
+    const extract = (data.extract || '').replace(/\s+/g, ' ').slice(0, 400);
+    if (!extract) return `found "${data.title || topic}" but no summary text available`;
+    return `${data.title || topic}: ${extract}`;
+  } catch (e: any) {
+    return `wiki lookup error: ${e.message?.slice(0, 60)}`;
+  }
+}
+
 // ── COMMAND EXECUTION ─────────────────────────────────────────────
-type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'get_channel_info' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'none';
+type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'get_channel_info' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'get_cross_server' | 'set_reminder' | 'create_poll' | 'wiki_lookup' | 'none';
 
 async function executeCommand(
   command: BotCommand,
@@ -789,6 +890,30 @@ async function executeCommand(
       if (!query) return 'no query given — pass commandArgs.query';
       return await webSearch(query);
     }
+    case 'get_cross_server': {
+      const name = String(args.name || '').trim();
+      if (!name) return 'no name given — pass commandArgs.name';
+      const uid = [...idCache.entries()].find(([, n]) => n.toLowerCase() === name.toLowerCase())?.[0];
+      if (!uid) return `no member found named "${name}"`;
+      return await getCrossServerInfo(guildId, uid, name);
+    }
+    case 'set_reminder': {
+      const mins = Number(args.minutes);
+      if (!mins || mins <= 0) return 'no valid minutes given — pass commandArgs.minutes';
+      const note = String(args.note || '').trim();
+      return setReminder(channelId, guildId, mins, note);
+    }
+    case 'create_poll': {
+      const question = String(args.question || '').trim();
+      const options = Array.isArray(args.options) ? args.options.map(String) : [];
+      const hours = args.hours ? Number(args.hours) : 1;
+      return await createPoll(channelId, question, options, hours);
+    }
+    case 'wiki_lookup': {
+      const topic = String(args.topic || '').trim();
+      if (!topic) return 'no topic given — pass commandArgs.topic';
+      return await wikiLookup(topic);
+    }
     default:
       return 'unknown command';
   }
@@ -840,6 +965,7 @@ HOW YOU TEXT:
 - occasional typo is fine. teh, waht, jsut. not constantly.
 - if something deserves no words: one emoji as full response. valid. often better than typing.
 - multi-sentence replies are rare and only for when something genuinely needs it (telling a real story, explaining something someone actually asked). default assumption: short and fired off, not a write-up.
+- BURST TEXTING: real people often send 2-3 quick separate messages instead of one tidy line — "wait" then "no way" then "fr??". you can do this too: put "|||" between fragments in "reply" and each piece sends as its own message, back to back, like a double/triple-text. max 3 fragments, each one still tiny (the 5-8 word target applies PER FRAGMENT, not to the total). use this when something genuinely lands in stages — a reaction building, a thought interrupting itself — not as your default. most replies should still be a single fragment, no "|||" at all. never split one sentence awkwardly mid-thought just to use it; only use it where a real second text would actually happen.
 
 UNDERSTANDING PRONOUNS (critical):
 - someone says "you/ur/your" → they mean YOU (NotABot)
@@ -907,6 +1033,10 @@ COMMANDS YOU CAN RUN (include in JSON when needed, leave "none" otherwise):
 - get_server_stats: member count, channel count, who you're closest with (bond leaderboard). args: {} (none needed). use if asked about the server itself or who you vibe with most.
 - get_time: current date/time. args: {} (none needed). use instead of guessing if someone asks what time it is, what day it is, etc.
 - web_search: look something up on the real internet. args: { query: "search terms" }. use when someone asks about something outside the server — current events, a fact you're unsure of, "did you hear about X". may come back saying it's not configured — if so just say you can't check right now, don't make something up.
+- get_cross_server: check if someone's also in another server you're in (just presence + bond, nothing else carries over). args: { name: "display name" }. only useful if you're actually in multiple servers — will tell you if not, don't be weird about it if so.
+- set_reminder: set a reminder that fires in this channel later. args: { minutes: 60, note: "what to remind about" }. note gets posted as-is when it fires, keep it short and in-character, not a formal reminder notice. these don't survive a restart — don't promise something will definitely happen, just set it and move on.
+- create_poll: post a real discord poll (not reactions — an actual native poll people vote on). args: { question: "...", options: ["a","b","c"], hours: 1 }. 2-10 options, question under 300 chars, options under 55 chars each. use when a real debate's happening and "let's just vote on it" would actually land.
+- wiki_lookup: get a real wikipedia summary on something. args: { topic: "subject" }. use to settle "wait is that actually true" arguments or quick facts — way more reliable than guessing, and you don't burn web_search's quota on it.
 system will run the command and send you the result. you then give your actual reply.
 
 in transcripts: [me] = your own past messages
@@ -914,7 +1044,7 @@ in transcripts: [me] = your own past messages
 CRITICAL OUTPUT RULE: respond with RAW JSON ONLY. first character must be "{", last character must be "}". no markdown fences, no bullet points, no reasoning, no "* User:" breakdowns, no commentary before or after. just the object:
 {
   "action": "speak|react|gif|ignore",
-  "reply": "your message here (empty if not speak)",
+  "reply": "your message here, or up to 3 short fragments separated by ||| for burst-texting (empty if not speak)",
   "reaction": "single emoji or empty string (empty if not react)",
   "gifQuery": "short search term for a gif, or empty string (only if action is gif)",
   "replyToMsgId": "msgId of the specific message you're responding to, or empty string",
@@ -923,7 +1053,7 @@ CRITICAL OUTPUT RULE: respond with RAW JSON ONLY. first character must be "{", l
   "goal": "short reason you're engaged, or empty string",
   "stayActive": true,
   "think": "short visible thinking message, or empty string — sent to chat BEFORE you run a command",
-  "command": "get_history|get_member|get_stm|get_video_status|get_channel_info|recall_memory|get_server_stats|get_time|web_search|none",
+  "command": "get_history|get_member|get_stm|get_video_status|get_channel_info|recall_memory|get_server_stats|get_time|web_search|get_cross_server|set_reminder|create_poll|wiki_lookup|none",
   "commandArgs": {}
 }`;
 
@@ -959,7 +1089,7 @@ function parseBrainJSON(raw: string): BrainDecision | null {
       goal:            typeof p.goal     === 'string' ? p.goal.trim().slice(0, 120) : '',
       stayActive:      typeof p.stayActive === 'boolean' ? p.stayActive : true,
       think:           typeof p.think    === 'string' ? p.think.trim() : '',
-      command:         (['get_history','get_member','get_stm','get_video_status','get_channel_info','recall_memory','get_server_stats','get_time','web_search','none'] as const).includes(p.command) ? p.command : 'none',
+      command:         (['get_history','get_member','get_stm','get_video_status','get_channel_info','recall_memory','get_server_stats','get_time','web_search','get_cross_server','set_reminder','create_poll','wiki_lookup','none'] as const).includes(p.command) ? p.command : 'none',
       commandArgs:     p.commandArgs && typeof p.commandArgs === 'object' ? p.commandArgs : {},
     };
   } catch { return null; }
@@ -1128,13 +1258,25 @@ async function sendDecision(opts: {
   }
 
   if (decision.action === 'speak' && decision.reply?.trim()) {
-    const text = decision.reply.trim().slice(0, 250);
-    try { await channel.sendTyping(); } catch {}
-    await sleep(Math.min(300 + text.length * 20, 2800));
-    const sent = replyToMsg
-      ? await replyToMsg.reply({ content: text, allowedMentions: { repliedUser: false } })
-      : await channel.send(text);
-    stmPush(channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: text });
+    // burst support: the model can separate up to 3 short fragments with "|||" to
+    // mimic how people actually text — multiple quick messages instead of one
+    // polished paragraph. each fragment gets its own typing pause; only the FIRST
+    // one threads as a reply to the trigger message, the rest land as normal
+    // follow-up sends (exactly like a real double/triple-text would look).
+    const fragments = decision.reply.split('|||').map(f => f.trim()).filter(Boolean).slice(0, 3);
+    let isFirst = true;
+    for (const frag of fragments) {
+      const text = frag.slice(0, 250);
+      try { await channel.sendTyping(); } catch {}
+      await sleep(Math.min(300 + text.length * 20, 2800));
+      const sent = (isFirst && replyToMsg)
+        ? await replyToMsg.reply({ content: text, allowedMentions: { repliedUser: false } })
+        : await channel.send(text);
+      stmPush(channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: text });
+      isFirst = false;
+      // small natural gap between burst fragments, on top of the typing-length delay above
+      if (frag !== fragments[fragments.length - 1]) await sleep(400 + Math.random() * 500);
+    }
     state.lastBotMsgAt = Date.now();
     state.gotResponseSinceLastBotMsg = false;
     if (guildId !== 'dm' && replyToMsg) updateBond(guildId, replyToMsg.author.id, 1).catch(() => {});
