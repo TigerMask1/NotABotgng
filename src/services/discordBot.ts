@@ -11,6 +11,11 @@ const ACTIVE_MODEL  = 'gemini-3.1-flash-lite'; // every msg while engaged + ping
 const PASSIVE_MODEL = 'gemma-4-26b-a4b-it';    // 5-min huge-context scan of the channel it's interested in — slower, thinks it through
 const BG_MODEL      = 'gemma-4-31b-it';        // profiler / compress / history-log utility jobs (unrelated to the convo loop)
 
+// ── VISION ───────────────────────────────────────────────────────
+// inline image data for a single Gemini multimodal call. base64 + mime type,
+// nothing persisted — fetched fresh per brain() call and thrown away after.
+interface ImagePart { mimeType: string; data: string; }
+
 // ── GEMINI MANAGER ────────────────────────────────────────────────
 class GeminiManager {
   private keys: string[];
@@ -41,14 +46,28 @@ class GeminiManager {
     return best;
   }
 
-  // no maxOutputTokens cap — let the model finish its thought. responseMimeType still
-  // forces JSON so it can't ramble into prose, that's the only constraint we keep.
+  // responseMimeType forces JSON on models that honor it. some smaller/open
+  // models (gemma) don't reliably honor it and will instead narrate prose
+  // about what it's going to do — maxOutputTokens cuts that off before it
+  // burns the whole generation on rambling instead of ever emitting "{".
   async call(
     systemPrompt: string,
     userPrompt: string,
     temp = 0.9,
     model = ACTIVE_MODEL,
+    images: ImagePart[] = [],
+    maxOutputTokens?: number,
   ): Promise<string> {
+    // images go BEFORE the text part — that's the order Gemini's multimodal
+    // input expects for best grounding (look at the picture, then read what's
+    // being asked about it, not the other way around).
+    const userParts = [
+      ...images.map(img => ({ inlineData: { mimeType: img.mimeType, data: img.data } })),
+      { text: userPrompt },
+    ];
+    const generationConfig: Record<string, any> = { temperature: temp, responseMimeType: 'application/json' };
+    if (maxOutputTokens) generationConfig.maxOutputTokens = maxOutputTokens;
+
     for (let attempt = 0; attempt < Math.max(this.keys.length, 1) * 2; attempt++) {
       const key = this.pickKey();
       if (!key) throw new Error('[Gemini] no keys available');
@@ -60,8 +79,8 @@ class GeminiManager {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               systemInstruction: { parts: [{ text: systemPrompt }] },
-              contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
-              generationConfig: { temperature: temp, responseMimeType: 'application/json' },
+              contents: [{ role: 'user', parts: userParts }],
+              generationConfig,
             }),
           }
         );
@@ -78,7 +97,15 @@ class GeminiManager {
         }
         const data = await res.json() as any;
         const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
-        console.log(`[Gemini:${model}] key=...${key.slice(-4)} | ${text.length}ch`);
+        const finishReason = data.candidates?.[0]?.finishReason ?? 'unknown';
+        console.log(`[Gemini:${model}] key=...${key.slice(-4)} | ${text.length}ch | finish=${finishReason}`);
+        // a 200 with no actual text (blocked candidate, safety trip, empty
+        // generation, etc.) is NOT a usable result — retry like any other
+        // failure instead of letting an empty string masquerade as success.
+        if (!text.trim()) {
+          console.warn(`[Gemini] ...${key.slice(-4)} returned empty text (finish=${finishReason}) — retrying`);
+          continue;
+        }
         return text;
       } catch (e: any) {
         if (e.message?.includes('429')) continue;
@@ -151,6 +178,63 @@ class EmbeddingManager {
 }
 
 const embedder = new EmbeddingManager();
+
+// ── VISION HELPERS (no extra API key — same Gemini endpoint already does multimodal) ──
+// only ever called for the LIVE trigger message(s) of a brain() call, never for
+// old STM history — refetching/re-sending images for every past message would
+// be expensive and pointless. older image messages just show as a text tag
+// ("[image attached]") in the transcript once they've scrolled past.
+const MAX_VISION_IMAGES_PER_CALL = 2;     // cap payload size + cost per call
+const MAX_IMAGE_FETCH_BYTES      = 4 * 1024 * 1024; // 4MB — sane ceiling for a meme/screenshot
+
+function extractImageUrls(msg: Message): string[] {
+  const urls: string[] = [];
+  for (const att of msg.attachments.values()) {
+    if ((att.contentType || '').startsWith('image/')) urls.push(att.url);
+  }
+  // opportunistic: covers raw image links Discord's already unfurled into an
+  // embed by the time we see the message. link unfurls that land via a later
+  // MessageUpdate (slow ones) are simply missed — not chasing that edge case.
+  for (const emb of msg.embeds) {
+    const u = emb.image?.url || emb.thumbnail?.url;
+    if (u && !urls.includes(u)) urls.push(u);
+  }
+  return urls;
+}
+
+async function fetchImageAsBase64(url: string): Promise<ImagePart | null> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const mimeType = (res.headers.get('content-type') || '').split(';')[0].trim();
+    if (!mimeType.startsWith('image/')) return null;
+    const lenHeader = res.headers.get('content-length');
+    if (lenHeader && Number(lenHeader) > MAX_IMAGE_FETCH_BYTES) return null;
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength > MAX_IMAGE_FETCH_BYTES) return null;
+    return { mimeType, data: Buffer.from(buf).toString('base64') };
+  } catch (e: any) {
+    console.warn('[Vision] image fetch failed:', e.message?.slice(0, 80));
+    return null;
+  }
+}
+
+// pulls images for the LAST message first (the one actually being reacted to),
+// then fills remaining slots from earlier messages in the same batch if room.
+async function collectVisionImages(msgs: Message[]): Promise<ImagePart[]> {
+  const urls: string[] = [];
+  for (const m of [...msgs].reverse()) {
+    for (const u of extractImageUrls(m)) {
+      if (urls.length < MAX_VISION_IMAGES_PER_CALL && !urls.includes(u)) urls.push(u);
+    }
+  }
+  if (!urls.length) return [];
+  const fetched = await Promise.all(urls.map(fetchImageAsBase64));
+  return fetched.filter((p): p is ImagePart => !!p);
+}
 
 // ── CONSTANTS ────────────────────────────────────────────────────
 // note: no DEBOUNCE_MS / PASSIVE_EVERY / VELOCITY / MONOPOLY / MIN_BRAIN_GAP anymore —
@@ -699,7 +783,93 @@ async function giphySearch(query: string): Promise<string | null> {
   }
 }
 
-// ── SERVER STATS (live guild data + Firestore member records combined) ──
+// ── GIF & LINK UNDERSTANDING (ambient, automatic, no extra API keys) ──
+// this is NOT the bot "browsing the web" — it's the same kind of glance a
+// person gives a link before deciding whether to react. two tiers:
+//  1. gif slug hint — free, no network call. tenor/giphy share links carry
+//     their own description in the URL slug ("tenor.com/view/confused-cat-
+//     blinking-23948572"), so we just read it off the URL.
+//  2. link preview — one lightweight fetch of the page's <title>/og:description,
+//     cached for a while so the same link posted twice doesn't refetch.
+function gifSlugHint(content: string): string | null {
+  let m = content.match(/tenor\.com\/view\/([a-z0-9-]+?)-\d{5,}/i);
+  if (m) return m[1].replace(/-/g, ' ').trim();
+  m = content.match(/giphy\.com\/(?:gifs|media)\/([a-z0-9-]+)/i);
+  if (m) {
+    const slug = m[1].replace(/-[a-zA-Z0-9]{6,}$/, ''); // strip trailing giphy id token
+    return slug.replace(/-/g, ' ').trim() || null;
+  }
+  return null;
+}
+
+function extractGenericUrl(content: string): string | null {
+  const m = content.match(/https?:\/\/[^\s<>]+/i);
+  if (!m) return null;
+  const url = m[0].replace(/[)\].,!?]+$/, ''); // strip trailing punctuation people leave on links
+  if (/\.(gif|png|jpe?g|webp|mp4|mov|webm)(\?|$)/i.test(url)) return null; // direct media, not a "page"
+  if (/tenor\.com|giphy\.com/i.test(url)) return null; // handled by gifSlugHint instead
+  return url;
+}
+
+const linkPreviewCache = new Map<string, { preview: string | null; ts: number }>();
+const LINK_PREVIEW_TTL_MS = 15 * 60_000;
+
+async function fetchLinkPreview(url: string): Promise<string | null> {
+  const cached = linkPreviewCache.get(url);
+  if (cached && Date.now() - cached.ts < LINK_PREVIEW_TTL_MS) return cached.preview;
+  let preview: string | null = null;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3500);
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NotABot-discord/1.0)' },
+    });
+    clearTimeout(timer);
+    const ct = res.headers.get('content-type') || '';
+    const lenHeader = res.headers.get('content-length');
+    if (res.ok && ct.includes('text/html') && !(lenHeader && Number(lenHeader) > 1_000_000)) {
+      const html  = (await res.text()).slice(0, 200_000);
+      const title = (html.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1] || '').trim();
+      const desc  = (html.match(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']*)["']/i)?.[1]
+                 || html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["']/i)?.[1] || '').trim();
+      preview = [title, desc].filter(Boolean).join(' — ').replace(/\s+/g, ' ').slice(0, 180) || null;
+    }
+  } catch (e: any) {
+    console.warn('[LinkPreview] failed:', e.message?.slice(0, 80));
+  }
+  linkPreviewCache.set(url, { preview, ts: Date.now() });
+  return preview;
+}
+
+// runs once per incoming message, tags the stored text with whatever it
+// noticed (image/gif attached, gif vibe from a tenor/giphy link, or a quick
+// page preview) — this is what makes its way into STM and the live prompt.
+async function buildEnrichedContent(msg: Message, rawContent: string): Promise<string> {
+  const tags: string[] = [];
+
+  const imgUrls = extractImageUrls(msg);
+  if (imgUrls.length) {
+    const isGif = [...msg.attachments.values()].some(a => a.contentType === 'image/gif')
+      || imgUrls.some(u => /\.gif(\?|$)/i.test(u));
+    tags.push(isGif ? '[gif attached]' : '[image attached]');
+  }
+
+  const slug = gifSlugHint(rawContent);
+  if (slug) {
+    tags.push(`[gif: ${slug}]`);
+  } else {
+    const url = extractGenericUrl(rawContent);
+    if (url) {
+      const preview = await fetchLinkPreview(url);
+      if (preview) tags.push(`(link → "${preview}")`);
+    }
+  }
+
+  return tags.length ? `${rawContent} ${tags.join(' ')}`.trim() : rawContent;
+}
+
+
 async function getServerStats(guildId: string): Promise<string> {
   if (guildId === 'dm') return 'no server stats in DMs';
   const guild = botClient?.guilds.cache.get(guildId);
@@ -987,6 +1157,7 @@ PICK EXACTLY ONE — SPEAK, REACT, GIF, OR IGNORE, NEVER MORE THAN ONE:
 - if you react: leave reply and gifQuery as "" (empty string)
 - if you send a gif: set gifQuery to a short search term describing the vibe/reaction you want ("shocked cat", "facepalm anime") — NOT a literal title or url, just what to search for. leave reply and reaction as "". you do not pick the actual gif or its link — that's looked up for you from a real search, so you'll never know exactly which one lands. that unpredictability is part of why it's funny.
 - a gif is for when a reaction emoji isn't enough but typing words would undersell it — peak reaction-image energy, not every other message. don't overuse it, it stops being funny if you do it constantly.
+- but don't be shy about it when it IS the moment — if something genuinely hits and a gif is the funnier/realer move than typing, just send it. that little unpredictable payoff (you don't even know which gif you'll get) is one of the most "alive" things about you. the only sin is leaning on it as a crutch for every message — used right, at the right moment, it lands way harder than words would.
 - if neither is worth it: action is "ignore", reply/reaction/gifQuery all ""
 - a reaction emoji is often the better move than typing something — use it instead of replying when a word would be overkill
 - silence is free, a forced reply isn't — nothing real to add → action:"ignore"
@@ -1009,6 +1180,17 @@ PACING YOURSELF:
 - after 2-3 replies in a row, judge if it wound down. if so: pause 5-15 (minutes) or stayActive:false to drop back to passive right now.
 - never set pause or stayActive:false out of obligation — only step back if it actually feels done.
 - goal: a few words on why you're engaged ("roasting X's take", "waiting to see if the joke lands"). set it when you jump in, update it if it shifts, leave empty if there isn't one.
+
+SEEING IMAGES, MEMES, AND GIFS:
+- you can actually see images now — screenshots, memes, photos, whatever's attached to the trigger message. when one's attached, actually look at it and react to what's REALLY in it, specific details, not a vague generic "lol nice pic." that specificity is the whole point.
+- never narrate that you're "looking at" or "analyzing" an image — no "I can see in this image..." assistant-speak, ever. you just saw it, same as anyone scrolling past it.
+- gifs people post: you'll sometimes see a rough hint of what one is ("[gif: confused cat]") in the chat — that's enough to riff on, don't overthink it or pretend you watched the whole thing frame by frame.
+
+LINKS PEOPLE POST:
+- if someone drops a link, you'll sometimes see a short auto-preview tacked onto their message — the page title/description. that's just you glancing at it for two seconds, NOT you "browsing the web" or fetching something on purpose.
+- react to what it actually is, in character — interested, dismissive, roasting it, whatever fits. don't summarize it like a search engine, don't say "according to the link" or "the page says."
+- this is different from web_search/wiki_lookup, which are you DELIBERATELY going to check something. a link preview is just ambient — like seeing a thumbnail go by. no preview showed up (didn't load, not a webpage, whatever)? then just don't acknowledge the link specifically, same as if you hadn't clicked it.
+- you are never anyone's research assistant, even with all this. you glance at things because you're a person sitting in the chat, not because someone asked you to look something up. only actually run a command to check something when it'd be a natural thing for YOU to want to know — never as a service to them.
 
 CALLBACKS + OPEN LOOPS:
 - if memory has someone's unfinished story, ask casually. not investigatively.
@@ -1118,6 +1300,7 @@ interface BrainOpts {
   commandResult?: string;
   isSecondPass?:  boolean;
   videoCtx?:     { title: string; url: string };
+  images?:       ImagePart[];   // live vision attachments for THIS call only, never persisted
 }
 
 async function brain(opts: BrainOpts): Promise<BrainDecision> {
@@ -1133,6 +1316,8 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   parts.push(`\nCHAT (recent):\n${opts.transcript}`);
   if (opts.batchSize && opts.batchSize > 1)
     parts.push(`\n(${opts.batchSize} messages landed while you were thinking — all already in the chat above, below the marker. default is ignoring the whole pile, that's normal. only break that if something in there genuinely earns a reply or reaction. if so, set replyToMsgId, and flag unansweredMsgId if something else in there is a real question you're leaving for later.)`);
+  if (opts.images?.length)
+    parts.push(`\n(an image is attached to the trigger message below — actually look at it, react to what's really in it, don't guess)`);
   if (opts.selfNote) parts.push(`\nSELF-CHECK: ${opts.selfNote}`);
 
   if (opts.commandResult) {
@@ -1156,14 +1341,24 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   const userPrompt = parts.filter(Boolean).join('\n');
 
 
-  // up to 2 tries — models occasionally ramble/truncate instead of clean JSON.
-  for (let pass = 0; pass < 2; pass++) {
+  // up to 3 tries — models occasionally ramble/truncate instead of clean JSON.
+  // gemma (passive/video-brain calls) is more prone to narrating its reasoning
+  // instead of emitting the object, so it gets a calmer temp + a tighter token
+  // cap — this is a small structured decision, not a place for it to think out
+  // loud. ACTIVE_MODEL keeps its higher temp since that's the chaotic-voice dial.
+  const temp           = opts.model === ACTIVE_MODEL ? 0.92 : 0.55;
+  const maxOutputTokens = 600; // plenty for the JSON schema + a 3-fragment reply; cuts off runaway prose before it eats the whole generation
+  for (let pass = 0; pass < 3; pass++) {
     try {
       const raw = await gemini.call(
         SYSTEM_PROMPT,
-        pass === 0 ? userPrompt : `${userPrompt}\n\n(previous attempt failed to return valid JSON — output RAW JSON ONLY, nothing else)`,
-        0.92,
+        pass === 0
+          ? userPrompt
+          : `${userPrompt}\n\n(previous attempt did not return valid JSON — stop reasoning out loud, output ONLY the raw JSON object now, nothing before or after it)`,
+        temp,
         opts.model,
+        opts.images,
+        maxOutputTokens,
       );
       console.log(`[Brain:${opts.model}] raw: ${raw.slice(0, 200)}`);
       const parsed = parseBrainJSON(raw);
@@ -1784,7 +1979,7 @@ const dmPending  = new Map<string, Message>();
 async function handleDirectMessage(msg: Message) {
   const channelId = msg.channelId;
   const sender    = msg.author.username;
-  const content   = cleanContent(msg.content);
+  const content   = await buildEnrichedContent(msg, cleanContent(msg.content));
 
   cacheId(msg.author.id, sender);
 
@@ -1815,7 +2010,8 @@ async function respondToDM(msg: Message) {
 
   const channelId = msg.channelId;
   const sender    = msg.author.username;
-  const content   = cleanContent(msg.content);
+  const content   = await buildEnrichedContent(msg, cleanContent(msg.content));
+  const images    = await collectVisionImages([msg]);
 
   let threadCtx: string | undefined;
   if (msg.reference?.messageId) {
@@ -1841,6 +2037,7 @@ async function respondToDM(msg: Message) {
     statusLine: `mode: dm | speak: active | server: DM | channel: #dm`,
     inExchange, channelName: 'DM', serverName: 'DM',
     everyonePing: false, endingConvo,
+    images,
   };
 
   let decision = await brain(brainOpts);
@@ -1850,7 +2047,7 @@ async function respondToDM(msg: Message) {
 }
 
 // ── ACTIVE-MODE BATCHING (every message while active; bursts get queued + merged) ──
-interface QueuedMsg { msg: Message; mentioned: boolean; everyonePing: boolean; }
+interface QueuedMsg { msg: Message; mentioned: boolean; everyonePing: boolean; content: string; }
 const inFlight     = new Set<string>();
 const activeQueue   = new Map<string, QueuedMsg[]>();
 
@@ -1892,10 +2089,11 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
   if (!gemini.canCall()) return;
 
   const tSender      = last.member?.displayName || last.author.username;
-  const tContent      = cleanContent(last.content);
+  const tContent      = batch[batch.length - 1].content; // already enriched (image/gif/link tags) in handleMessage
   const tChannelName  = (last.channel as any).name ?? 'unknown';
   const tServerName   = last.guild?.name || serverNameCache.get(guildId) || 'unknown';
   const tEveryonePing = batch.some(b => b.everyonePing);
+  const images        = await collectVisionImages(batch.map(b => b.msg));
 
   let threadCtx: string | undefined;
   if (last.reference?.messageId) {
@@ -1931,6 +2129,7 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
     inExchange, channelName: tChannelName, serverName: tServerName,
     everyonePing: tEveryonePing, endingConvo,
     goal: state.goal, batchSize: batch.length,
+    images,
   };
 
   let decision = await brain(brainOpts);
@@ -1983,7 +2182,8 @@ async function handleMessage(msg: Message) {
     const mentioned   = BOT_ID ? msg.mentions.has(BOT_ID) : false;
     const everyonePing = msg.mentions.everyone ?? false;
     const sender      = msg.member?.displayName || msg.author.username;
-    const content     = cleanContent(msg.content);
+    const rawContent  = cleanContent(msg.content);
+    const content     = await buildEnrichedContent(msg, rawContent);
     const channelName = (msg.channel as any).name ?? 'unknown';
 
     cacheId(msg.author.id, sender);
@@ -2018,7 +2218,7 @@ async function handleMessage(msg: Message) {
     // drainActiveQueue loop iteration, not given their own brain() call — see the
     // comment above processActiveBatch for how that interacts with the marker.
     if (mentioned || getChState(channelId).mode === 'active') {
-      enqueueActive(channelId, guildId, { msg, mentioned, everyonePing });
+      enqueueActive(channelId, guildId, { msg, mentioned, everyonePing, content });
     }
   } catch (e) { console.error('[Handler outer]', e); }
 }
@@ -2055,6 +2255,8 @@ export async function startBot(token: string) {
 ║  BG      : ${BG_MODEL}  (profiler / compress / history)
 ║  STATUS  : ${gemini.status()}
 ║  STM     : ${STM_MAX} msgs | passive tick: ${PASSIVE_TICK_MS/60000}m | self-check: ${SELF_CHECK_QUIET_MS/60000}m
+║  VISION  : image/gif attachments → ${ACTIVE_MODEL} (no extra key, max ${MAX_VISION_IMAGES_PER_CALL}/call)
+║  LINKS   : auto title/desc preview + gif slug hints (no key, free)
 ╚══════════════════════════════════════════════════════════╝\n`);
 
     botClient!.user!.setPresence({ status: 'online', activities: [{ name: 'the chat', type: 3 }] });
