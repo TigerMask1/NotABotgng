@@ -92,6 +92,10 @@ class GeminiManager {
 
   canCall(): boolean { return this.keys.length > 0; }
 
+  // public accessor so other managers (embeddings) can share the same key pool
+  // without reaching into the private rotation state directly.
+  getKey(): string | null { return this.pickKey(); }
+
   status(): string {
     const now = Date.now();
     const keys = this.keys.map(k =>
@@ -103,6 +107,50 @@ class GeminiManager {
 }
 
 const gemini = new GeminiManager();
+
+// ── EMBEDDING MANAGER (Google text-embedding-004, same key pool as Gemini) ──
+// used for semantic memory recall — turns facts/jokes/arcs into vectors so
+// "remember the thing about X" can match by MEANING, not exact substring.
+const EMBED_MODEL = 'text-embedding-004';
+
+class EmbeddingManager {
+  // reuses gemini's key list — same Google AI Studio keys work for both endpoints.
+  async embed(text: string): Promise<number[] | null> {
+    if (!gemini.canCall() || !text?.trim()) return null;
+    const key = gemini.getKey();
+    if (!key) return null;
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${EMBED_MODEL}:embedContent?key=${key}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: { parts: [{ text: text.slice(0, 2000) }] } }),
+        }
+      );
+      if (!res.ok) {
+        console.warn(`[Embed] ${res.status}: ${(await res.text().catch(() => '')).slice(0, 100)}`);
+        return null;
+      }
+      const data = await res.json() as any;
+      const vec = data?.embedding?.values;
+      return Array.isArray(vec) ? vec : null;
+    } catch (e: any) {
+      console.warn('[Embed] failed:', e.message?.slice(0, 80));
+      return null;
+    }
+  }
+
+  cosineSim(a: number[], b: number[]): number {
+    if (a.length !== b.length || !a.length) return 0;
+    let dot = 0, magA = 0, magB = 0;
+    for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; magA += a[i] ** 2; magB += b[i] ** 2; }
+    if (!magA || !magB) return 0;
+    return dot / (Math.sqrt(magA) * Math.sqrt(magB));
+  }
+}
+
+const embedder = new EmbeddingManager();
 
 // ── CONSTANTS ────────────────────────────────────────────────────
 // note: no DEBOUNCE_MS / PASSIVE_EVERY / VELOCITY / MONOPOLY / MIN_BRAIN_GAP anymore —
@@ -439,7 +487,64 @@ async function addFact(guildId: string, fact: string, bucket: keyof ServerMemory
   await db.collection('servers').doc(guildId).collection('memory').doc('global')
     .set({ [bucket]: m[bucket] }, { merge: true }).catch(() => {});
   console.log(`[Mem:${bucket}] "${fact.slice(0, 60)}"`);
+  embedFactAsync(guildId, fact.trim(), bucket); // fire-and-forget — never blocks the write above
 }
+
+// ── SEMANTIC MEMORY (embedding-backed recall, additive on top of the flat buckets above) ──
+// every fact written via addFact also gets embedded and stored in its own
+// subcollection, keyed by a stable hash of the text (so re-saving the same
+// fact never duplicates a vector). flat bucket arrays above remain the
+// source of truth for display/dedup; this index exists purely so the model
+// can ask "what do we know about X" and get a meaning-based match instead
+// of needing the exact wording.
+function simpleHash(s: string): string {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) | 0; }
+  return Math.abs(h).toString(36);
+}
+
+interface MemoryVector { text: string; bucket: string; vector: number[]; createdAt: string; }
+
+async function embedFactAsync(guildId: string, fact: string, bucket: keyof ServerMemory) {
+  try {
+    const vector = await embedder.embed(fact);
+    if (!vector) return; // embedding service unavailable — bucket write above already succeeded, nothing lost
+    const id = simpleHash(`${bucket}:${fact.toLowerCase()}`);
+    const entry: MemoryVector = { text: fact, bucket, vector, createdAt: new Date().toISOString() };
+    await db.collection('servers').doc(guildId).collection('memoryVectors').doc(id)
+      .set(entry, { merge: true }).catch(() => {});
+  } catch (e: any) {
+    console.warn('[Embed] fact embedding failed:', e.message?.slice(0, 80));
+  }
+}
+
+// semantic search across all stored memory vectors for a server. pulls the
+// whole small collection (servers stay in the dozens-to-low-hundreds of
+// facts range given the 30-per-bucket cap) and ranks by cosine similarity —
+// no vector DB needed at this scale.
+async function recallMemory(guildId: string, query: string, topK = 5): Promise<string> {
+  if (guildId === 'dm') return 'no shared memory in DMs';
+  const queryVec = await embedder.embed(query);
+  if (!queryVec) return 'semantic recall unavailable right now (embedding call failed) — try get_history or check memory facts directly';
+
+  try {
+    const snap = await db.collection('servers').doc(guildId).collection('memoryVectors').get();
+    if (snap.empty) return 'nothing stored in memory yet';
+
+    const scored = snap.docs
+      .map(d => d.data() as MemoryVector)
+      .filter(v => Array.isArray(v.vector) && v.vector.length)
+      .map(v => ({ text: v.text, bucket: v.bucket, score: embedder.cosineSim(queryVec, v.vector) }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, topK);
+
+    if (!scored.length) return 'nothing relevant found';
+    return scored.map(s => `[${s.bucket}] ${s.text} (match: ${Math.round(s.score * 100)}%)`).join('\n');
+  } catch (e: any) {
+    return `recall error: ${e.message?.slice(0, 60)}`;
+  }
+}
+
 
 async function getMember(guildId: string, userId: string): Promise<MemberData> {
   const key = `${guildId}:${userId}`;
@@ -540,8 +645,62 @@ async function getHistory(channelId: string, fromTs: number, toTs: number): Prom
   }
 }
 
+// ── WEB SEARCH (Google Custom Search JSON API — optional, env-gated) ──
+// set GOOGLE_CSE_API_KEY + GOOGLE_CSE_ID to enable. free tier is 100
+// queries/day. if unset, the command just tells the model it's offline
+// instead of throwing — never breaks the brain loop either way.
+const GOOGLE_CSE_API_KEY = process.env.GOOGLE_CSE_API_KEY || '';
+const GOOGLE_CSE_ID       = process.env.GOOGLE_CSE_ID       || '';
+
+async function webSearch(query: string): Promise<string> {
+  if (!query?.trim()) return 'no search query given';
+  if (!GOOGLE_CSE_API_KEY || !GOOGLE_CSE_ID) {
+    return 'web search not configured — needs GOOGLE_CSE_API_KEY and GOOGLE_CSE_ID set on the host';
+  }
+  try {
+    const url = `https://www.googleapis.com/customsearch/v1?key=${GOOGLE_CSE_API_KEY}&cx=${GOOGLE_CSE_ID}&num=4&q=${encodeURIComponent(query.slice(0, 200))}`;
+    const res = await fetch(url);
+    if (!res.ok) return `search failed: ${res.status}`;
+    const data = await res.json() as any;
+    const items = (data.items || []) as Array<{ title: string; snippet: string; link: string }>;
+    if (!items.length) return 'no results found';
+    return items.slice(0, 4)
+      .map(it => `${it.title} — ${(it.snippet || '').replace(/\s+/g, ' ').slice(0, 160)} (${it.link})`)
+      .join('\n');
+  } catch (e: any) {
+    return `search error: ${e.message?.slice(0, 60)}`;
+  }
+}
+
+// ── SERVER STATS (live guild data + Firestore member records combined) ──
+async function getServerStats(guildId: string): Promise<string> {
+  if (guildId === 'dm') return 'no server stats in DMs';
+  const guild = botClient?.guilds.cache.get(guildId);
+  if (!guild) return 'server not found in cache';
+
+  const lines = [
+    `server: ${guild.name}`,
+    `members: ${guild.memberCount}`,
+    `channels: ${guild.channels.cache.filter(c => c.isTextBased()).size} text`,
+  ];
+
+  try {
+    const snap = await db.collection('servers').doc(guildId).collection('members')
+      .orderBy('bond', 'desc').limit(5).get();
+    if (!snap.empty) {
+      const top = snap.docs.map(d => {
+        const m = d.data() as MemberData;
+        return `${m.displayName || d.id} (${m.bond ?? 50})`;
+      }).join(', ');
+      lines.push(`closest bonds: ${top}`);
+    }
+  } catch {}
+
+  return lines.join(' | ');
+}
+
 // ── COMMAND EXECUTION ─────────────────────────────────────────────
-type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'none';
+type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'none';
 
 async function executeCommand(
   command: BotCommand,
@@ -570,6 +729,33 @@ async function executeCommand(
     }
     case 'get_stm': {
       return stmFormat(stmGet(channelId));
+    }
+    case 'get_video_status': {
+      const queued = pendingVideoQueue.length
+        ? pendingVideoQueue
+            .map(v => `"${v.title}" (${v.url}) — queued ${humanDuration(Date.now() - v.queuedAt)}`)
+            .join(' | ')
+        : 'none queued';
+      const last = lastSeenVideoId
+        ? `last known upload id: ${lastSeenVideoId}`
+        : 'no upload tracked yet (baseline not set)';
+      return `${last} | pending mentions: ${queued}`;
+    }
+    case 'recall_memory': {
+      const query = String(args.query || '').trim();
+      if (!query) return 'no query given — pass commandArgs.query';
+      return await recallMemory(guildId, query);
+    }
+    case 'get_server_stats': {
+      return await getServerStats(guildId);
+    }
+    case 'get_time': {
+      return new Date().toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit', month: 'short', day: 'numeric' });
+    }
+    case 'web_search': {
+      const query = String(args.query || '').trim();
+      if (!query) return 'no query given — pass commandArgs.query';
+      return await webSearch(query);
     }
     default:
       return 'unknown command';
@@ -678,6 +864,11 @@ COMMANDS YOU CAN RUN (include in JSON when needed, leave "none" otherwise):
 - get_history: retrieve chat summaries from a time range. args: { from: "ISO string", to: "ISO string" }
 - get_member: get info about someone. args: { name: "display name" }
 - get_stm: get the full recent chat transcript
+- get_video_status: check your own youtube channel — last upload seen, anything queued to mention. args: {} (none needed). use this if someone asks "did you post anything" / "new video?" or you're wondering whether you have something to bring up.
+- recall_memory: search everything you remember about this server BY MEANING, not exact wording. args: { query: "what you're trying to recall" }. use this any time someone references something you should know but you're not sure of the exact phrasing — "didn't I tell you about my dog" → query: "their dog". way more natural than dumping all memory.
+- get_server_stats: member count, channel count, who you're closest with (bond leaderboard). args: {} (none needed). use if asked about the server itself or who you vibe with most.
+- get_time: current date/time. args: {} (none needed). use instead of guessing if someone asks what time it is, what day it is, etc.
+- web_search: look something up on the real internet. args: { query: "search terms" }. use when someone asks about something outside the server — current events, a fact you're unsure of, "did you hear about X". may come back saying it's not configured — if so just say you can't check right now, don't make something up.
 system will run the command and send you the result. you then give your actual reply.
 
 in transcripts: [me] = your own past messages
@@ -693,7 +884,7 @@ CRITICAL OUTPUT RULE: respond with RAW JSON ONLY. first character must be "{", l
   "goal": "short reason you're engaged, or empty string",
   "stayActive": true,
   "think": "short visible thinking message, or empty string — sent to chat BEFORE you run a command",
-  "command": "get_history|get_member|get_stm|none",
+  "command": "get_history|get_member|get_stm|get_video_status|recall_memory|get_server_stats|get_time|web_search|none",
   "commandArgs": {}
 }`;
 
@@ -727,7 +918,7 @@ function parseBrainJSON(raw: string): BrainDecision | null {
       goal:            typeof p.goal     === 'string' ? p.goal.trim().slice(0, 120) : '',
       stayActive:      typeof p.stayActive === 'boolean' ? p.stayActive : true,
       think:           typeof p.think    === 'string' ? p.think.trim() : '',
-      command:         (['get_history','get_member','get_stm','none'] as const).includes(p.command) ? p.command : 'none',
+      command:         (['get_history','get_member','get_stm','get_video_status','recall_memory','get_server_stats','get_time','web_search','none'] as const).includes(p.command) ? p.command : 'none',
       commandArgs:     p.commandArgs && typeof p.commandArgs === 'object' ? p.commandArgs : {},
     };
   } catch { return null; }
@@ -1342,28 +1533,6 @@ async function runSelfActivationCheck() {
   }
 }
 
-// ── TOOL ANSWERS (fast, no LLM needed — deterministic utilities, not judgment skips) ──
-async function tryToolAnswer(msg: Message, content: string, guildId: string, sender: string): Promise<boolean> {
-  const lower = content.toLowerCase();
-  let answer = '';
-
-  if (/\b(what time|time is it|current time)\b/i.test(lower)) {
-    answer = `${new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}. suspicious hour behavior`;
-  } else if (/\b(last seen|seen me|have you seen me|how long ago)\b/i.test(lower)) {
-    const uid = msg.mentions.users.first()?.id || msg.author.id;
-    const m = await getMember(guildId, uid);
-    const name = idCache.get(uid) || sender;
-    answer = m.lastSeenAt
-      ? `${name}: last seen ${humanDuration(Date.now() - Date.parse(m.lastSeenAt))}. ${m.seenCount ?? 1} sightings`
-      : `${name}: no clean sighting yet`;
-  }
-
-  if (!answer) return false;
-  await msg.reply({ content: answer.slice(0, 200), allowedMentions: { repliedUser: false } });
-  stmPush(msg.channelId, { ts: Date.now(), id: msg.id, authorId: BOT_ID, author: '[me]', content: answer.slice(0, 100) });
-  return true;
-}
-
 // ── DIRECT MESSAGES ───────────────────────────────────────────────
 const dmDebounce = new Map<string, NodeJS.Timeout>();
 const dmPending  = new Map<string, Message>();
@@ -1484,14 +1653,6 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
   const tServerName   = last.guild?.name || serverNameCache.get(guildId) || 'unknown';
   const tEveryonePing = batch.some(b => b.everyonePing);
 
-  if (await tryToolAnswer(last, tContent, guildId, tSender)) {
-    advanceMarker(channelId, stmGet(channelId).map(m => m.id), {
-      action: 'speak', reply: '', reaction: '', replyToMsgId: last.id, unansweredMsgId: '',
-      pause: 0, goal: '', stayActive: true, think: '', command: 'none', commandArgs: {},
-    });
-    return;
-  }
-
   let threadCtx: string | undefined;
   if (last.reference?.messageId) {
     try {
@@ -1572,8 +1733,6 @@ async function handleMessage(msg: Message) {
         seedSTM(channelId, ([...fetched.values()] as Message[]).reverse());
       } catch {}
     }
-
-    if (mentioned && await tryToolAnswer(msg, content, guildId, sender)) return;
 
     stmPush(channelId, {
       ts: msg.createdTimestamp, id: msg.id, authorId: msg.author.id, author: sender,
