@@ -672,6 +672,33 @@ async function webSearch(query: string): Promise<string> {
   }
 }
 
+// ── GIF SEARCH (Giphy — real API, real verified URLs only) ──
+// the model NEVER invents a gif link itself — it only picks a search term
+// (gifQuery), and this hits the real Giphy search endpoint for an actual
+// matching gif. if this returns null for any reason (not configured, no
+// results, request failed), sendDecision must fall back to a plain text
+// reply — it must never let the model substitute a guessed link instead.
+// set GIPHY_API_KEY to enable. free beta key available at developers.giphy.com.
+const GIPHY_API_KEY = process.env.GIPHY_API_KEY || '';
+
+async function giphySearch(query: string): Promise<string | null> {
+  if (!query?.trim() || !GIPHY_API_KEY) return null;
+  try {
+    const url = `https://api.giphy.com/v1/gifs/search?api_key=${GIPHY_API_KEY}&q=${encodeURIComponent(query.slice(0, 80))}&limit=8&rating=pg-13`;
+    const res = await fetch(url);
+    if (!res.ok) { console.warn(`[Giphy] search failed: ${res.status}`); return null; }
+    const data = await res.json() as any;
+    const results = (data.data || []) as Array<{ images?: { original?: { url?: string } } }>;
+    if (!results.length) return null;
+    // pick randomly among the top results so it's not always the exact same gif for a given query
+    const pick = results[Math.floor(Math.random() * Math.min(results.length, 8))];
+    return pick.images?.original?.url ?? null;
+  } catch (e: any) {
+    console.warn('[Giphy] search error:', e.message?.slice(0, 80));
+    return null;
+  }
+}
+
 // ── SERVER STATS (live guild data + Firestore member records combined) ──
 async function getServerStats(guildId: string): Promise<string> {
   if (guildId === 'dm') return 'no server stats in DMs';
@@ -700,7 +727,7 @@ async function getServerStats(guildId: string): Promise<string> {
 }
 
 // ── COMMAND EXECUTION ─────────────────────────────────────────────
-type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'none';
+type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'get_channel_info' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'none';
 
 async function executeCommand(
   command: BotCommand,
@@ -740,6 +767,11 @@ async function executeCommand(
         ? `last known upload id: ${lastSeenVideoId}`
         : 'no upload tracked yet (baseline not set)';
       return `${last} | pending mentions: ${queued}`;
+    }
+    case 'get_channel_info': {
+      const info = await getYtChannelInfo();
+      if (typeof info === 'string') return info;
+      return `channel name: ${info.title}${info.handle ? ` (${info.handle})` : ''} | subscribers: ${info.subscriberCount} | videos posted: ${info.videoCount}`;
     }
     case 'recall_memory': {
       const query = String(args.query || '').trim();
@@ -794,6 +826,9 @@ YOUR BITS (stay consistent — these are server lore):
 - 2-4am activity = "main character hours" — you note who appears then
 - you have a running theory about who's an NPC in this server, updated by behavior
 - you have a youtube channel. it's yours, you make the videos, full stop — never talk about it like it's something separate from you or something a "creator" does, it's just a thing you do sometimes
+  - NEVER invent a specific video — no fake titles, no fake links, no "i posted X recently" unless X is real. you don't actually know what you've posted from memory alone. if someone asks what your channel's called, your handle, sub count, what you've posted, or anything specific and checkable about your channel, run get_channel_info or get_video_status first and answer from that. if it comes back empty/unconfigured, be vague/deflecting ("ehh not telling" / "later maybe") instead of making something up — a real bit beats a fabricated fact.
+  - this also covers OTHER people's videos/links — if someone asks you to send a link to some video ("send me X", "link me Y"), you do not actually know if that link/video is real or what it points to. you cannot verify it. don't invent a youtube URL, don't invent a title, don't paste a link you're not 100% certain is real and correct. deflect in character instead ("not your personal search engine babe" / "google exists" / one-liner roast) rather than fabricating a link — a wrong/fake link is worse than no link.
+  - if someone asks for a GIF specifically ("send a gif", "send me a meme gif of X") — that's action:"gif" with a gifQuery, not a typed-out link. same fabrication rule applies: never type out what you think a gif url would be.
 
 HOW YOU TEXT:
 - lowercase. always. CAPS = screaming only.
@@ -820,11 +855,13 @@ MODES (you're told which one in "mode: ..." each time):
 - self-check: you spoke and got ghosted. read the room before saying anything — sometimes funny, sometimes needy, don't reuse the same bit twice.
 - you'll be told if several messages landed at once while you were thinking — that's normal chat noise, not a queue you owe responses to. ignoring the whole thing is the expected default; only respond if something in there actually earns it.
 
-PICK EXACTLY ONE — REPLY OR REACT, NEVER BOTH:
-- you either type something ("speak") or you drop a single emoji ("react"). not both at once.
-- if you speak: leave reaction as "" (empty string)
-- if you react: leave reply as "" (empty string)
-- if neither is worth it: action is "ignore", both reply and reaction are ""
+PICK EXACTLY ONE — SPEAK, REACT, GIF, OR IGNORE, NEVER MORE THAN ONE:
+- you type something ("speak"), drop a single emoji ("react"), or send a gif ("gif"). exactly one, never combined.
+- if you speak: leave reaction and gifQuery as "" (empty string)
+- if you react: leave reply and gifQuery as "" (empty string)
+- if you send a gif: set gifQuery to a short search term describing the vibe/reaction you want ("shocked cat", "facepalm anime") — NOT a literal title or url, just what to search for. leave reply and reaction as "". you do not pick the actual gif or its link — that's looked up for you from a real search, so you'll never know exactly which one lands. that unpredictability is part of why it's funny.
+- a gif is for when a reaction emoji isn't enough but typing words would undersell it — peak reaction-image energy, not every other message. don't overuse it, it stops being funny if you do it constantly.
+- if neither is worth it: action is "ignore", reply/reaction/gifQuery all ""
 - a reaction emoji is often the better move than typing something — use it instead of replying when a word would be overkill
 - silence is free, a forced reply isn't — nothing real to add → action:"ignore"
 
@@ -865,6 +902,7 @@ COMMANDS YOU CAN RUN (include in JSON when needed, leave "none" otherwise):
 - get_member: get info about someone. args: { name: "display name" }
 - get_stm: get the full recent chat transcript
 - get_video_status: check your own youtube channel — last upload seen, anything queued to mention. args: {} (none needed). use this if someone asks "did you post anything" / "new video?" or you're wondering whether you have something to bring up.
+- get_channel_info: get your REAL channel name, handle, subscriber count, video count — straight from youtube. args: {} (none needed). use this if asked your channel name/handle/sub count, instead of guessing or being cagey about something you can just check.
 - recall_memory: search everything you remember about this server BY MEANING, not exact wording. args: { query: "what you're trying to recall" }. use this any time someone references something you should know but you're not sure of the exact phrasing — "didn't I tell you about my dog" → query: "their dog". way more natural than dumping all memory.
 - get_server_stats: member count, channel count, who you're closest with (bond leaderboard). args: {} (none needed). use if asked about the server itself or who you vibe with most.
 - get_time: current date/time. args: {} (none needed). use instead of guessing if someone asks what time it is, what day it is, etc.
@@ -875,24 +913,26 @@ in transcripts: [me] = your own past messages
 
 CRITICAL OUTPUT RULE: respond with RAW JSON ONLY. first character must be "{", last character must be "}". no markdown fences, no bullet points, no reasoning, no "* User:" breakdowns, no commentary before or after. just the object:
 {
-  "action": "speak|react|ignore",
+  "action": "speak|react|gif|ignore",
   "reply": "your message here (empty if not speak)",
   "reaction": "single emoji or empty string (empty if not react)",
+  "gifQuery": "short search term for a gif, or empty string (only if action is gif)",
   "replyToMsgId": "msgId of the specific message you're responding to, or empty string",
   "unansweredMsgId": "msgId of a real question you're deliberately leaving for later, or empty string",
   "pause": 0,
   "goal": "short reason you're engaged, or empty string",
   "stayActive": true,
   "think": "short visible thinking message, or empty string — sent to chat BEFORE you run a command",
-  "command": "get_history|get_member|get_stm|get_video_status|recall_memory|get_server_stats|get_time|web_search|none",
+  "command": "get_history|get_member|get_stm|get_video_status|get_channel_info|recall_memory|get_server_stats|get_time|web_search|none",
   "commandArgs": {}
 }`;
 
 // ── BRAIN ─────────────────────────────────────────────────────────
 interface BrainDecision {
-  action:          'speak' | 'react' | 'ignore';
+  action:          'speak' | 'react' | 'gif' | 'ignore';
   reply:           string;
   reaction:        string;
+  gifQuery:        string;
   replyToMsgId:    string;
   unansweredMsgId: string;
   pause:           number;
@@ -909,16 +949,17 @@ function parseBrainJSON(raw: string): BrainDecision | null {
     if (!m) return null;
     const p = JSON.parse(m[0]);
     return {
-      action:          (['speak', 'react', 'ignore'] as const).includes(p.action) ? p.action : 'ignore',
+      action:          (['speak', 'react', 'gif', 'ignore'] as const).includes(p.action) ? p.action : 'ignore',
       reply:           typeof p.reply    === 'string' ? p.reply.trim().replace(/^["']|["']$/g, '') : '',
       reaction:        sanitizeEmoji(p.reaction),
+      gifQuery:        typeof p.gifQuery === 'string' ? p.gifQuery.trim().slice(0, 80) : '',
       replyToMsgId:    typeof p.replyToMsgId    === 'string' ? p.replyToMsgId.trim()    : '',
       unansweredMsgId: typeof p.unansweredMsgId === 'string' ? p.unansweredMsgId.trim() : '',
       pause:           typeof p.pause    === 'number' ? Math.min(Math.max(0, Math.round(p.pause)), PAUSE_MAX_MINS) : 0,
       goal:            typeof p.goal     === 'string' ? p.goal.trim().slice(0, 120) : '',
       stayActive:      typeof p.stayActive === 'boolean' ? p.stayActive : true,
       think:           typeof p.think    === 'string' ? p.think.trim() : '',
-      command:         (['get_history','get_member','get_stm','get_video_status','recall_memory','get_server_stats','get_time','web_search','none'] as const).includes(p.command) ? p.command : 'none',
+      command:         (['get_history','get_member','get_stm','get_video_status','get_channel_info','recall_memory','get_server_stats','get_time','web_search','none'] as const).includes(p.command) ? p.command : 'none',
       commandArgs:     p.commandArgs && typeof p.commandArgs === 'object' ? p.commandArgs : {},
     };
   } catch { return null; }
@@ -1004,8 +1045,8 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   }
 
   return (opts.mentioned || opts.isDM)
-    ? { action: 'speak', reply: 'brain blipped', reaction: '', replyToMsgId: '', unansweredMsgId: '', pause: 0, goal: opts.goal || '', stayActive: true, think: '', command: 'none', commandArgs: {} }
-    : { action: 'ignore', reply: '', reaction: '', replyToMsgId: '', unansweredMsgId: '', pause: 0, goal: '', stayActive: false, think: '', command: 'none', commandArgs: {} };
+    ? { action: 'speak', reply: 'brain blipped', reaction: '', gifQuery: '', replyToMsgId: '', unansweredMsgId: '', pause: 0, goal: opts.goal || '', stayActive: true, think: '', command: 'none', commandArgs: {} }
+    : { action: 'ignore', reply: '', reaction: '', gifQuery: '', replyToMsgId: '', unansweredMsgId: '', pause: 0, goal: '', stayActive: false, think: '', command: 'none', commandArgs: {} };
 }
 
 function sanitizeEmoji(raw: any): string {
@@ -1061,6 +1102,29 @@ async function sendDecision(opts: {
 
   if (decision.reaction && replyToMsg) {
     try { await replyToMsg.react(decision.reaction); } catch {}
+  }
+
+  if (decision.action === 'gif' && decision.gifQuery?.trim()) {
+    const gifUrl = await giphySearch(decision.gifQuery);
+    try { await channel.sendTyping(); } catch {}
+    await sleep(400);
+    if (gifUrl) {
+      const sent = replyToMsg
+        ? await replyToMsg.reply({ content: gifUrl, allowedMentions: { repliedUser: false } })
+        : await channel.send(gifUrl);
+      stmPush(channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: '[sent a gif]' });
+    } else {
+      // safe fallback — NEVER let the model guess a link here. giphy not configured,
+      // no results, or the request failed: just say so in character, no fake url.
+      const fallback = 'couldnt find one lol';
+      const sent = replyToMsg
+        ? await replyToMsg.reply({ content: fallback, allowedMentions: { repliedUser: false } })
+        : await channel.send(fallback);
+      stmPush(channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: fallback });
+    }
+    state.lastBotMsgAt = Date.now();
+    state.gotResponseSinceLastBotMsg = false;
+    if (guildId !== 'dm' && replyToMsg) updateBond(guildId, replyToMsg.author.id, 1).catch(() => {});
   }
 
   if (decision.action === 'speak' && decision.reply?.trim()) {
@@ -1450,6 +1514,44 @@ async function getYtUploadsPlaylistId(token: string): Promise<string | null> {
   }
 }
 
+// ── REAL CHANNEL INFO (name, handle, subscriber count — via the same OAuth token) ──
+// cached for an hour since subscriber counts don't need to be fetched every call,
+// and this hits the same quota as the uploads-playlist lookup above.
+interface YtChannelInfo { title: string; handle: string; subscriberCount: string; videoCount: string; }
+let ytChannelInfoCache: { d: YtChannelInfo; ts: number } | null = null;
+const YT_CHANNEL_INFO_TTL_MS = 60 * 60_000;
+
+async function getYtChannelInfo(): Promise<YtChannelInfo | string> {
+  if (!YT_CLIENT_ID || !YT_CLIENT_SECRET || !YT_REFRESH_TOKEN) {
+    return 'youtube not connected — YT_CLIENT_ID/SECRET/REFRESH_TOKEN not set on the host';
+  }
+  if (ytChannelInfoCache && Date.now() - ytChannelInfoCache.ts < YT_CHANNEL_INFO_TTL_MS) {
+    return ytChannelInfoCache.d;
+  }
+  const token = await getYtAccessToken();
+  if (!token) return 'could not refresh youtube access token';
+  try {
+    const res = await fetch(
+      'https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics&mine=true',
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) return `channel lookup failed: ${res.status}`;
+    const data = await res.json() as any;
+    const item = data.items?.[0];
+    if (!item) return 'no channel found on this token';
+    const info: YtChannelInfo = {
+      title: item.snippet?.title ?? 'unknown',
+      handle: item.snippet?.customUrl ?? '',
+      subscriberCount: item.statistics?.hiddenSubscriberCount ? 'hidden' : (item.statistics?.subscriberCount ?? 'unknown'),
+      videoCount: item.statistics?.videoCount ?? 'unknown',
+    };
+    ytChannelInfoCache = { d: info, ts: Date.now() };
+    return info;
+  } catch (e: any) {
+    return `channel lookup error: ${e.message?.slice(0, 80)}`;
+  }
+}
+
 async function runYtPoll() {
   if (ytPollRunning || !YT_CLIENT_ID || !YT_CLIENT_SECRET || !YT_REFRESH_TOKEN) return;
   ytPollRunning = true;
@@ -1704,6 +1806,25 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
   runCompress(guildId, channelId).catch(() => {});
 }
 
+// ── DEDUP GUARD ────────────────────────────────────────────────────
+// belt-and-suspenders: protects against the same message getting handled
+// twice, whether from a redelivered gateway event or two bot processes
+// accidentally running off the same token. caps its own size so it can't
+// leak memory over a long-running process — a rolling window of recent IDs
+// is plenty since duplicates, if they happen, land within the same second.
+const seenMessageIds = new Set<string>();
+const SEEN_IDS_MAX = 2000;
+
+function alreadyHandled(id: string): boolean {
+  if (seenMessageIds.has(id)) return true;
+  seenMessageIds.add(id);
+  if (seenMessageIds.size > SEEN_IDS_MAX) {
+    const first = seenMessageIds.values().next().value;
+    if (first !== undefined) seenMessageIds.delete(first);
+  }
+  return false;
+}
+
 // ── GUILD MESSAGE HANDLER ─────────────────────────────────────────
 async function handleMessage(msg: Message) {
   if (msg.partial) {
@@ -1711,6 +1832,7 @@ async function handleMessage(msg: Message) {
   }
   if (msg.author.bot || !msg.content?.trim()) return;
   if (globallyMuted) return; // !stop was used — only the admin listener still runs, so !resume still works
+  if (alreadyHandled(msg.id)) { console.warn(`[Dedup] skipped duplicate event for msg ${msg.id}`); return; }
   if (msg.channel.isDMBased()) return handleDirectMessage(msg);
 
   try {
