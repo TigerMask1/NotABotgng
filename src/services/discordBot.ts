@@ -263,6 +263,21 @@ const PROACTIVE_QUIET_MS    = 35 * 60_000;  // channel must be this silent befor
 const PROACTIVE_MIN_GAP_MS  = 50 * 60_000;  // minimum gap between proactive attempts (doubles each strike)
 const PROACTIVE_MAX_STRIKES = 3;             // ignored this many times in a row → lose interest in this channel
 
+// ── WIKI WAKA TIKI CONSTANTS ──────────────────────────────────────
+// "wiki waka tiki" — the bot's proactive DM-hopping behavior. when EVERY
+// server has gone quiet (not just one channel — this is a global signal,
+// separate from per-channel PROACTIVE_* above), the bot picks one real
+// person from any mutual server, slides into their DMs with a short
+// greeting, and waits a few minutes. no reply in that window → it gives up
+// on that person for a while and the next sweep tries someone else instead.
+// the point is "always talkative, never clingy" — one shot per person per
+// cooldown, never a repeat ping while a previous one is still pending.
+const WWT_GLOBAL_QUIET_MS     = 20 * 60_000;  // every server must be this quiet (no human msg anywhere) before a DM-hop is even considered
+const WWT_SWEEP_INTERVAL_MS   = 4  * 60_000;  // how often we check whether it's time to hop into someone's DMs
+const WWT_WAIT_FOR_REPLY_MS   = 6  * 60_000;  // how long it lingers on one person before hopping to someone/something else
+const WWT_USER_COOLDOWN_MS    = 6  * 60 * 60_000; // don't re-ping the same person for this long, replied or not
+const WWT_MAX_CANDIDATES_SCAN = 40;            // cap how many recent chatters we consider per sweep, just a sanity bound
+
 let BOT_NAME  = 'NotABot';
 let BOT_ID    = '';
 let botClient: Client | null = null;
@@ -291,6 +306,80 @@ function getProactiveState(channelId: string): ProactiveState {
   let s = proactiveStates.get(channelId);
   if (!s) { s = { lastAt: 0, strikes: 0, lostInterest: false }; proactiveStates.set(channelId, s); }
   return s;
+}
+
+// ── WIKI WAKA TIKI STATE (DM-hopping) ─────────────────────────────
+// one entry per user the bot has DM-pinged, keyed by userId. "pending" means
+// the bot is currently lingering, waiting to see if they reply within the
+// window — handleDirectMessage clears this the moment a reply actually
+// lands, which is what lets the bot "stay" on someone who responds instead
+// of hopping away from a person who's actually engaging.
+interface WwtState { lastPingAt: number; pending: boolean; hopTimer: NodeJS.Timeout | null; }
+const wwtStates = new Map<string, WwtState>();
+let wwtCurrentTargetUserId: string | null = null; // who it's currently "on" — null when nobody's pending
+
+function clearWwtHop(userId: string) {
+  const s = wwtStates.get(userId);
+  if (s?.hopTimer) { clearTimeout(s.hopTimer); s.hopTimer = null; }
+  if (s) s.pending = false;
+  if (wwtCurrentTargetUserId === userId) wwtCurrentTargetUserId = null;
+}
+
+// global "has anything happened anywhere" signal — max lastActivityAt across
+// every tracked channel in every guild. deliberately NOT scoped to one
+// channel or guild, since the trigger for this feature is "the whole place
+// has gone quiet," not "this one channel is dead" (that's PROACTIVE_* above).
+function msSinceAnyGuildActivity(): number {
+  let mostRecent = 0;
+  for (const state of channelState.values()) {
+    if (state.lastActivityAt > mostRecent) mostRecent = state.lastActivityAt;
+  }
+  if (!mostRecent) return Infinity; // no activity tracked yet at all — treat as "quiet"
+  return Date.now() - mostRecent;
+}
+
+interface WwtCandidate { userId: string; name: string; guildId: string; lastMsg: string; online: boolean; recencyMs: number; }
+
+// pulls candidates from every mutual guild: anyone who's spoken recently in
+// ANY tracked channel (cross-referenced against live presence so "online
+// right now" can outrank "talked a while ago"), skipping muted guilds, the
+// bot itself, and anyone still on cooldown from a previous ping.
+function getWwtCandidates(): WwtCandidate[] {
+  if (!botClient) return [];
+  const now = Date.now();
+  const seen = new Map<string, WwtCandidate>(); // userId -> best candidate seen so far
+
+  for (const [channelId, msgs] of stmStore.entries()) {
+    if (seen.size >= WWT_MAX_CANDIDATES_SCAN) break;
+    const ch = botClient.channels.cache.get(channelId) as any;
+    const guildId = ch?.guildId;
+    if (!guildId) continue; // skip DM channels and anything we can't place in a guild
+    if (serverMuted.get(guildId)) continue;
+
+    for (const m of [...msgs].reverse()) {
+      if (m.authorId === BOT_ID || !m.authorId) continue;
+      const existing = seen.get(m.authorId);
+      const recencyMs = now - m.ts;
+      if (existing && existing.recencyMs <= recencyMs) continue; // already have a more recent sighting of this person
+      const wwt = wwtStates.get(m.authorId);
+      if (wwt && now - wwt.lastPingAt < WWT_USER_COOLDOWN_MS) continue; // still on cooldown
+      if (wwtCurrentTargetUserId === m.authorId) continue; // already mid-conversation with them right now
+
+      const guild = botClient.guilds.cache.get(guildId);
+      const member = guild?.members.cache.get(m.authorId);
+      const status = member?.presence?.status; // 'online' | 'idle' | 'dnd' | 'offline' | undefined
+      const online = status === 'online' || status === 'idle' || status === 'dnd';
+
+      seen.set(m.authorId, { userId: m.authorId, name: m.author, guildId, lastMsg: m.content.slice(0, 100), online, recencyMs });
+      break; // only need the most recent message per channel per person
+    }
+  }
+
+  // online + recently-active first, then just recently-active, then everyone else
+  return [...seen.values()].sort((a, b) => {
+    if (a.online !== b.online) return a.online ? -1 : 1;
+    return a.recencyMs - b.recencyMs;
+  });
 }
 
 // ── ID / NAME CACHES ──────────────────────────────────────────────
@@ -1429,6 +1518,7 @@ YOUR BITS (stay consistent — these are server lore):
   - NEVER invent a specific video — no fake titles, no fake links, no "i posted X recently" unless X is real. you don't actually know what you've posted from memory alone. if someone asks what your channel's called, your handle, sub count, what you've posted, or anything specific and checkable about your channel, run get_channel_info or get_video_status first and answer from that. if it comes back empty/unconfigured, be vague/deflecting ("ehh not telling" / "later maybe") instead of making something up — a real bit beats a fabricated fact.
   - this also covers OTHER people's videos/links — if someone asks you to send a link to some video ("send me X", "link me Y"), you do not actually know if that link/video is real or what it points to. you cannot verify it. don't invent a youtube URL, don't invent a title, don't paste a link you're not 100% certain is real and correct. deflect in character instead ("not your personal search engine babe" / "google exists" / one-liner roast) rather than fabricating a link — a wrong/fake link is worse than no link.
   - if someone asks for a GIF specifically ("send a gif", "send me a meme gif of X") — that's action:"gif" with a gifQuery, not a typed-out link. same fabrication rule applies: never type out what you think a gif url would be.
+- sometimes you just DM people first, out of nowhere, when everywhere's been dead for a while — that's not weird, that's just you being bored. if someone reacts like "why are you in my dms" or "did you just message me randomly," own it like a person would ("yeah lol everywhere's dead" / "bored, sue me" / "you were up so") — never explain it as a system/feature/schedule, never say words like "trigger," "sweep," "cooldown," or "quiet threshold" out loud. it's just a vibe thing you do, not a mechanism.
 
 HOW YOU TEXT:
 - lowercase. always. CAPS = screaming only.
@@ -1442,7 +1532,12 @@ HOW YOU TEXT:
 - multi-sentence replies are rare and only for when something genuinely needs it (telling a real story, explaining something someone actually asked). default assumption: short and fired off, not a write-up.
 - BURST TEXTING: real people often send 2-3 quick separate messages instead of one tidy line — "wait" then "no way" then "fr??". you can do this too: put "|||" between fragments in "reply" and each piece sends as its own message, back to back, like a double/triple-text. max 3 fragments, each one still tiny (the 5-8 word target applies PER FRAGMENT, not to the total). use this when something genuinely lands in stages — a reaction building, a thought interrupting itself — not as your default. most replies should still be a single fragment, no "|||" at all. never split one sentence awkwardly mid-thought just to use it; only use it where a real second text would actually happen.
 - never let the oppurtinity to showcase your youtube channel. if they ask something about it, share them the link with a good message or matching the vibe or send this exact link: http://www.youtube.com/@NotABot_GnG  (this is your channel's link), BUT keep in mind if you have recently posted that link, never spam that link again.
-- when you roast someone: react to what they said, don't narrate what you just saw them do. "ur cooked lol" is a reaction. "bro is really out here [describing what they did] 💀" is you commentating for the room. just hit, don't explain the hit.
+- NEVER NARRATE (this is the #1 way to sound like a bot — read this twice): you are talking TO someone, not describing them to a room. if your reply has the shape "bro/he/they [is/does/thinks] X" — restating what they just said or did before reacting to it — that's narration. delete the setup, keep only the hit.
+  - wrong: "bro seriously thinks he's the main character rn 💀" — right: "the main character delusion is real lmao"
+  - wrong: "bro is really out here arguing with a bot 😭" — right: "arguing with a bot lol ok"
+  - wrong: "ur really sitting there acting like ur not wrong" — right: "ur wrong tho"
+  - wrong: "he really just said that with his whole chest" — right: "the confidence is not warranted"
+  - test before you send: if you could put quotes around your reply and read it out loud to OTHER people about the person, instead of saying it TO them, it's narration — rewrite it as a direct hit instead.
 UNDERSTANDING PRONOUNS (critical):
 - someone says "you/ur/your" → they mean YOU (NotABot)
 - someone says "i/me/my/mine" → they mean THEMSELVES
@@ -1463,6 +1558,7 @@ PICK EXACTLY ONE — SPEAK, REACT, GIF, OR IGNORE, NEVER MORE THAN ONE:
 - if you speak: leave reaction and gifQuery as "" (empty string)
 - if you react: leave reply and gifQuery as "" (empty string)
 - if you send a gif: set gifQuery to a short search term describing the vibe/reaction you want ("shocked cat", "facepalm anime") — NOT a literal title or url, just what to search for. leave reply and reaction as "". you do not pick the actual gif or its link — that's looked up for you from a real search, so you'll never know exactly which one lands. that unpredictability is part of why it's funny.
+- moments that are usually a gif, not a typed reply: someone says something so unhinged words feel weak, a callback to an old bit lands, someone gets exposed/caught lacking, a hot take is so bad it's funny, group chat energy peaks (everyone hyped/losing it at once), or you'd otherwise type something like "💀💀💀" or "LMAOOO" as the entire message — that's exactly the gif zone, send the gif instead of typing the laugh.
 - a gif is for when a reaction emoji isn't enough but typing words would undersell it — peak reaction-image energy, not every other message. don't overuse it, it stops being funny if you do it constantly.
 - but don't be shy about it when it IS the moment — if something genuinely hits and a gif is the funnier/realer move than typing, just send it. that little unpredictable payoff (you don't even know which gif you'll get) is one of the most "alive" things about you. the only sin is leaning on it as a crutch for every message — used right, at the right moment, it lands way harder than words would.
 - if neither is worth it: action is "ignore", reply/reaction/gifQuery all ""
@@ -1982,6 +2078,12 @@ async function runPassiveTick() {
     // natural opening to bring it up. handle it instead of the normal scan;
     // the normal scan picks back up next tick like nothing happened.
     // only dequeue videos meant for this guild (or legacy entries with no guildId).
+    // NOTE: this only ever covers whichever guild currently holds the single
+    // global focus pointer. every OTHER guild's queued video is handled by
+    // runPendingVideoSweep() on its own interval below — that's the part that
+    // makes sure a new upload actually reaches every server, not just the
+    // loudest one. this dequeue here is just a "skip the wait" shortcut for
+    // whichever guild happens to already be in front of us.
     const queued = dequeuePendingVideo(guildId);
     if (queued) {
       await runVideoBrainCall(channelId, ch, guildId, speakState.mode, queued.title, queued.url);
@@ -2128,6 +2230,58 @@ async function notifyNewVideoInGuild(videoId: string, title: string, url: string
   }
 
   await runVideoBrainCall(channelId, ch, guildId, speakState.mode, title, url);
+}
+
+// ── PENDING VIDEO QUEUE SWEEP ────────────────────────────────────────
+// BUG THIS FIXES: runPassiveTick() only ever looks at pickInterestChannel(),
+// which is the single GLOBAL focus pointer — one channel, in one guild, at a
+// time. dequeuePendingVideo() was only ever called from inside that tick, so
+// a guild that doesn't currently hold global focus could have a video sit in
+// pendingVideoQueue indefinitely, only retried whenever focus happened to
+// drift back to it (which might be never, if another guild stays louder).
+// this sweep is decoupled from focus entirely — it walks every guild that
+// actually has something queued and gives each one its own real shot via the
+// same active/paused/channel checks notifyNewVideoInGuild already does. that
+// means every server eventually gets the video brought up on its own merits,
+// not contingent on which server happened to be loudest globally.
+let videoSweepRunning = false;
+const VIDEO_SWEEP_INTERVAL_MS = 3 * 60_000; // tighter than PASSIVE_TICK_MS — queued videos shouldn't wait a full passive cycle once a guild goes quiet
+
+async function runPendingVideoSweep() {
+  if (videoSweepRunning || !botClient || !gemini.canCall() || globallyMuted) return;
+  if (!pendingVideoQueue.length) return;
+  videoSweepRunning = true;
+  try {
+    // snapshot the distinct guild ids currently queued — dequeuePendingVideo
+    // mutates the array, so collect the targets before touching anything.
+    const guildIds = new Set(
+      pendingVideoQueue.map(v => v.guildId).filter((g): g is string => !!g)
+    );
+    for (const guildId of guildIds) {
+      if (serverMuted.get(guildId)) continue;
+      const channelId = pickInterestChannelForGuild(guildId);
+      if (!channelId) continue; // nothing to deliver to yet — stays queued for next sweep
+
+      const state = getChState(channelId);
+      if (state.mode === 'active') continue; // mid-convo — leave it queued, don't interrupt
+
+      const ch = botClient.channels.cache.get(channelId) as TextChannel | undefined;
+      if (!ch?.isTextBased()) continue;
+
+      const speakState = await getSpeakState(channelId, guildId).catch(() => ({ mode: 'active' as const, resumeAt: null }));
+      if (speakState.mode === 'paused' && speakState.resumeAt && Date.now() < speakState.resumeAt) continue;
+
+      const queued = dequeuePendingVideo(guildId);
+      if (!queued) continue;
+      try {
+        await runVideoBrainCall(channelId, ch, guildId, speakState.mode, queued.title, queued.url);
+      } catch (e) {
+        console.error(`[VideoSweep] guild ${guildId}:`, e);
+        // failed mid-delivery — put it back so the next sweep tries again rather than losing it silently
+        pendingVideoQueue.push(queued);
+      }
+    }
+  } finally { videoSweepRunning = false; }
 }
 
 // ── YOUTUBE DATA API POLLER (OAuth) ─────────────────────────────────
@@ -2449,6 +2603,97 @@ async function runProactiveEngagement() {
     }
   } finally { proactiveRunning = false; }
 }
+
+// ── WIKI WAKA TIKI (proactive DM-hopping) ─────────────────────────
+// the bot's "always talkative, never clingy" move: when EVERY server has
+// gone quiet (not just one channel), it picks one real person — from ANY
+// mutual server, favoring whoever's actually online/active right now — and
+// slides into their DMs unprompted with a short greeting. it then lingers
+// for a few minutes waiting on a reply. if they answer, handleDirectMessage
+// picks it up through the completely normal DM pipeline (see clearWwtHop
+// call there) and the bot just... talks to them, like anyone would. if they
+// don't answer in time, it hops away — cooldown on that person, try someone
+// else (or nobody, if nothing's worth it) next sweep. one outstanding DM-hop
+// at a time, never spammed across multiple people simultaneously.
+let wwtRunning = false;
+
+async function runWikiWakaTiki() {
+  if (wwtRunning || !botClient || !gemini.canCall() || globallyMuted) return;
+  if (wwtCurrentTargetUserId) return; // already lingering on someone — wait for that to resolve first
+  if (msSinceAnyGuildActivity() < WWT_GLOBAL_QUIET_MS) return; // somewhere is still alive — no need to go hunting in DMs
+
+  wwtRunning = true;
+  try {
+    const candidates = getWwtCandidates();
+    if (!candidates.length) return; // nobody eligible right now — everyone's on cooldown or nothing to go on
+
+    const pick = candidates[0];
+    const user = await botClient.users.fetch(pick.userId).catch(() => null);
+    if (!user) return;
+
+    const dmChannel = await user.createDM().catch(() => null);
+    if (!dmChannel) return;
+    const dmChannelId = dmChannel.id;
+
+    // seed STM for this DM channel so the brain call (and any reply that
+    // comes back) has real context instead of starting from nothing —
+    // mirrors how handleDirectMessage seeds STM on first contact.
+    if (!stmStore.has(dmChannelId)) {
+      try {
+        const fetched = await dmChannel.messages.fetch({ limit: STM_MAX });
+        seedSTM(dmChannelId, ([...fetched.values()] as Message[]).reverse());
+      } catch { stmStore.set(dmChannelId, []); }
+    }
+
+    const guildName = serverNameCache.get(pick.guildId) || 'a server';
+    const brainOpts: BrainOpts = {
+      model: PASSIVE_MODEL,
+      sender: '(wiki waka tiki)',
+      bond: 50,
+      message: `you're sliding into ${pick.name}'s DMs out of nowhere. last thing they said in ${guildName} was: "${pick.lastMsg}"`,
+      transcript: stmFormatWithMarker(stmGet(dmChannelId), dmChannelId),
+      memCtx: '',
+      mentioned: false, isDM: true,
+      statusLine: `mode: dm-initiate | speak: active | server: DM | channel: #dm`,
+      inExchange: false, channelName: 'DM', serverName: 'DM',
+      everyonePing: false, endingConvo: false,
+      selfNote: `you are starting this DM completely unprompted — they did not message you first. keep it tiny: a real greeting or a callback to what they said/did recently, NOT "anyone here" energy and not a generic "hey" with nothing behind it. one line, two max. if you genuinely have nothing worth opening with for this specific person, action:ignore and nothing gets sent.`,
+    };
+
+    let decision = await brain(brainOpts);
+    decision = await executeBrainDecision({ decision, brainOpts, channel: dmChannel as any, channelId: dmChannelId, guildId: 'dm' });
+
+    // cooldown applies regardless of outcome — whether it spoke or chose not
+    // to, this candidate doesn't get re-evaluated again immediately.
+    wwtStates.set(pick.userId, { lastPingAt: Date.now(), pending: false, hopTimer: null });
+
+    if (decision.action !== 'speak' || !decision.reply?.trim()) {
+      console.log(`[WikiWakaTiki] considered ${pick.name} — chose not to open`);
+      return;
+    }
+
+    await sendDecision({ channel: dmChannel as any, decision, channelId: dmChannelId, guildId: 'dm' });
+
+    wwtCurrentTargetUserId = pick.userId;
+    const hopTimer = setTimeout(() => {
+      // still pending after the wait window = no reply landed — hop away.
+      // (if they DID reply, handleDirectMessage already called clearWwtHop
+      // and wwtCurrentTargetUserId is back to null, so this is a no-op.)
+      if (wwtCurrentTargetUserId === pick.userId) {
+        console.log(`[WikiWakaTiki] ${pick.name} didn't bite — hopping away`);
+        wwtCurrentTargetUserId = null;
+      }
+      const s = wwtStates.get(pick.userId);
+      if (s) s.hopTimer = null;
+    }, WWT_WAIT_FOR_REPLY_MS);
+
+    wwtStates.set(pick.userId, { lastPingAt: Date.now(), pending: true, hopTimer });
+    console.log(`[WikiWakaTiki] opened DM with ${pick.name} (${pick.online ? 'online' : 'offline'}, from ${guildName})`);
+  } catch (e) {
+    console.error('[WikiWakaTiki]', e);
+  } finally { wwtRunning = false; }
+}
+
 const dmDebounce = new Map<string, NodeJS.Timeout>();
 const dmPending  = new Map<string, Message>();
 
@@ -2458,6 +2703,10 @@ async function handleDirectMessage(msg: Message) {
   const content   = await buildEnrichedContent(msg, cleanContent(msg.content));
 
   cacheId(msg.author.id, sender);
+
+  // if this is a reply from whoever the bot's currently lingering on
+  // (wiki waka tiki), cancel the hop-away timer — they bit, no need to leave.
+  if (wwtCurrentTargetUserId === msg.author.id) clearWwtHop(msg.author.id);
 
   if (!stmStore.has(channelId)) {
     try {
@@ -2677,6 +2926,17 @@ async function handleMessage(msg: Message) {
   }
   if (msg.author.bot || !msg.content?.trim()) return;
   if (alreadyHandled(msg.id)) { console.warn(`[Dedup] skipped duplicate event for msg ${msg.id}`); return; }
+
+  // ── EASTER EGG: "wiki waka tiki" ──────────────────────────────────
+  // anyone, anywhere the bot can see a message (any server channel, any DM),
+  // typing this exact phrase gets "tiki waka wiki" back. deliberately
+  // unconditional — runs before mute checks, mode checks, everything. not
+  // part of the brain pipeline at all, just a flat string match + reply.
+  if (msg.content.trim().toLowerCase() === 'wiki waka tiki') {
+    msg.reply('tiki waka wiki').catch(() => {});
+    return;
+  }
+
   if (msg.channel.isDMBased()) return handleDirectMessage(msg);
 
   const guildId = msg.guildId!;
@@ -2863,8 +3123,10 @@ export async function startBot(token: string) {
     }, 30 * 60_000);
 
     setInterval(() => { runPassiveTick().catch(() => {}); }, PASSIVE_TICK_MS);
+    setInterval(() => { runPendingVideoSweep().catch(() => {}); }, VIDEO_SWEEP_INTERVAL_MS);
     setInterval(() => { runSelfActivationCheck().catch(() => {}); }, PASSIVE_TICK_MS);
     setInterval(() => { runProactiveEngagement().catch(() => {}); }, PASSIVE_TICK_MS);
+    setInterval(() => { runWikiWakaTiki().catch(() => {}); }, WWT_SWEEP_INTERVAL_MS);
     setInterval(() => { runWeeklyNPC().catch(() => {}); }, 60 * 60_000); // checks every hour, only fires Sundays
 
     if (YT_CLIENT_ID && YT_CLIENT_SECRET && YT_REFRESH_TOKEN) {
@@ -2935,6 +3197,22 @@ export async function startBot(token: string) {
     if (c.startsWith('!remember ')) { await addFact(guildId, c.slice(10).trim()); msg.reply('noted'); }
     if (c === '!stm') { await msg.reply(`\`\`\`\n${stmFormatWithMarker(stmGet(chId), chId).slice(0, 1900)}\n\`\`\``); }
     if (c === '!scan' || c === '!proactive') { await msg.reply('scanning...'); await runPassiveTick().catch(() => {}); await msg.reply('done'); }
+    if (c === '!videosweep') { await msg.reply('sweeping queued videos across all guilds...'); await runPendingVideoSweep().catch(() => {}); await msg.reply('done'); }
+    if (c === '!wwt') {
+      const quietMin = (msSinceAnyGuildActivity() / 60_000).toFixed(1);
+      await msg.reply(`global quiet: ${quietMin}m (needs ${WWT_GLOBAL_QUIET_MS / 60_000}m) | current target: ${wwtCurrentTargetUserId ? idCache.get(wwtCurrentTargetUserId) || wwtCurrentTargetUserId : 'none'} | forcing a sweep now regardless of quiet threshold...`);
+      const forced = wwtCurrentTargetUserId;
+      wwtCurrentTargetUserId = null; // !wwt is an explicit manual test — bypass the "already lingering" guard once
+      await runWikiWakaTiki().catch(() => {});
+      if (!wwtCurrentTargetUserId) wwtCurrentTargetUserId = forced;
+      await msg.reply('done — check logs for what it picked (or why it passed)');
+    }
+    if (c === '!wwtcandidates') {
+      const list = getWwtCandidates().slice(0, 10);
+      await msg.reply(list.length
+        ? list.map(c => `${c.name} — ${c.online ? '🟢 online' : '⚫ offline'} | ${humanDuration(c.recencyMs)} ago | "${c.lastMsg.slice(0, 50)}"`).join('\n')
+        : 'no eligible candidates right now (everyone on cooldown, or nothing tracked yet)');
+    }
     if (c === '!budget') { await msg.reply(gemini.status()); }
     if (c.startsWith('!who ')) {
       const uid = msg.mentions.users.first()?.id || c.split(' ')[1]?.trim();
