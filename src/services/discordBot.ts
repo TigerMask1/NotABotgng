@@ -1,6 +1,6 @@
 import {
   Client, GatewayIntentBits, Message, Partials,
-  Events, TextChannel,
+  Events, TextChannel, PermissionFlagsBits,
 } from 'discord.js';
 import { db } from './firebase.ts';
 
@@ -263,11 +263,18 @@ let BOT_ID    = '';
 let botClient: Client | null = null;
 
 // global kill switch, separate from per-channel speakState (!pause/!sleep/!wake
-// are per-channel; this is everywhere, all servers, all DMs, until !resume).
-// the client stays connected and logged in while muted — !resume works because
+// are per-channel; this is everywhere, all servers, all DMs, until !gresume).
+// the client stays connected and logged in while muted — !gresume works because
 // of that. !shutdown is the one that actually disconnects and can't be undone
 // from inside discord.
 let globallyMuted = false;
+
+// bot owner — only this user ID can run global admin commands (!gmute/!gresume/!shutdown etc.)
+const ADMIN_ID = '1296109674361520146';
+
+// per-server mute: server admins (anyone with Administrator perm) can !stop / !resume the bot
+// in their own server without affecting other servers. stored in-memory + persisted to Firebase.
+const serverMuted = new Map<string, boolean>();
 
 // ── ID / NAME CACHES ──────────────────────────────────────────────
 const idCache          = new Map<string, string>();
@@ -511,6 +518,31 @@ function trackInterest(channelId: string, mentioned: boolean) {
 
 function pickInterestChannel(): string | null {
   return focus?.channelId ?? null;
+}
+
+// like pickInterestChannel but scoped to a specific guild — used by per-server YT notifications
+// so each guild gets its own "most relevant" channel instead of competing over a single global focus.
+function pickInterestChannelForGuild(guildId: string): string | null {
+  if (!botClient) return null;
+  // prefer the current global focus if it belongs to this guild
+  if (focus?.channelId) {
+    const fc = botClient.channels.cache.get(focus.channelId) as any;
+    if (fc?.guildId === guildId) return focus.channelId;
+  }
+  // next: most recently active passive channel in this guild
+  let best: string | null = null;
+  let bestTs = 0;
+  for (const [chId, state] of channelState.entries()) {
+    if (state.mode === 'active') continue; // skip — mid-convo, video gets queued
+    const ch = botClient.channels.cache.get(chId) as any;
+    if (ch?.guildId !== guildId) continue;
+    if (state.lastActivityAt > bestTs) { bestTs = state.lastActivityAt; best = chId; }
+  }
+  if (best) return best;
+  // fallback: first text channel in the guild that we can see
+  const guild = botClient.guilds.cache.get(guildId);
+  if (!guild) return null;
+  return guild.channels.cache.find(c => c.isTextBased() && !c.isDMBased())?.id ?? null;
 }
 
 // ── FIREBASE / MEMORY ─────────────────────────────────────────────
@@ -1142,6 +1174,12 @@ HOW YOU TEXT:
 - multi-sentence replies are rare and only for when something genuinely needs it (telling a real story, explaining something someone actually asked). default assumption: short and fired off, not a write-up.
 - BURST TEXTING: real people often send 2-3 quick separate messages instead of one tidy line — "wait" then "no way" then "fr??". you can do this too: put "|||" between fragments in "reply" and each piece sends as its own message, back to back, like a double/triple-text. max 3 fragments, each one still tiny (the 5-8 word target applies PER FRAGMENT, not to the total). use this when something genuinely lands in stages — a reaction building, a thought interrupting itself — not as your default. most replies should still be a single fragment, no "|||" at all. never split one sentence awkwardly mid-thought just to use it; only use it where a real second text would actually happen.
 - never let the oppurtinity to showcase your youtube channel. if they ask something about it, share them the link with a good message or matching the vibe or send this exact link: http://www.youtube.com/@NotABot_GnG  (this is your channel's link), BUT keep in mind if you have recently posted that link, never spam that link again.
+
+ROASTING (read this):
+- fire AT the person, not ABOUT them to the room. "ur so cooked lol" is a roast. "bro is really out here doing X 💀 wow" is you narrating it for an audience like a commentator. don't commentate — just hit.
+- vary your openers. if you said "bro" last time, say something else. if you notice you're starting the same way you did before, change it.
+- short and sharp beats long and explained. if you have to explain why it's a burn, it's not a burn. one-liner, fire it, move on.
+- 💀 is a full reaction by itself. it doesn't need a follow-up sentence after it. "lmao 💀" or just "💀" often lands harder than three lines about what you just witnessed.
 UNDERSTANDING PRONOUNS (critical):
 - someone says "you/ur/your" → they mean YOU (NotABot)
 - someone says "i/me/my/mine" → they mean THEMSELVES
@@ -1179,7 +1217,7 @@ CATCHING UP ON A PILE OF MESSAGES (read this carefully):
 
 THINKING OUT LOUD (when memory is involved):
 - if someone says "don't you remember i told you X" or you want to recall something → output a thinking message like "hm lemme think" or "wait" and run a get_history or get_stm command
-- be natural about it, not robotic. "hm" is enough. don't announce you're running a command. commands cost time — skip them in fast back-and-forths unless you genuinely need the lookup.
+- be natural about it, not robotic. "hm" is enough. don't announce you're running a command. commands make sense at natural pause points — a lull in the convo, when you actually want to check something, when someone asks you something checkable. don't run them mid back-and-forth at full speed, but don't avoid them either just because things are moving fast.
 
 PACING YOURSELF:
 - after 2-3 replies in a row, judge if it wound down. if so: pause 5-15 (minutes) or stayActive:false to drop back to passive right now.
@@ -1666,6 +1704,8 @@ async function runPassiveTick() {
     const guildId = (ch as any).guildId as string | undefined;
     if (!guildId) return;
 
+    if (serverMuted.get(guildId)) return; // server admin used !stop
+
     const speakState = await getSpeakState(channelId, guildId);
     if (speakState.mode === 'paused' && speakState.resumeAt && Date.now() < speakState.resumeAt) return;
 
@@ -1673,7 +1713,8 @@ async function runPassiveTick() {
     // from) was active — now that we're here and passive, this is the first
     // natural opening to bring it up. handle it instead of the normal scan;
     // the normal scan picks back up next tick like nothing happened.
-    const queued = dequeuePendingVideo();
+    // only dequeue videos meant for this guild (or legacy entries with no guildId).
+    const queued = dequeuePendingVideo(guildId);
     if (queued) {
       await runVideoBrainCall(channelId, ch, guildId, speakState.mode, queued.title, queued.url);
       return;
@@ -1717,16 +1758,26 @@ async function runPassiveTick() {
 // up then. "ignore" is still a fully valid outcome — queueing only
 // guarantees the brain gets ASKED, never that it posts.
 const notifiedVideoIds = new Set<string>(); // hard guard: never mention the same video twice in a session
-interface PendingVideo { videoId: string; title: string; url: string; queuedAt: number; }
+interface PendingVideo { videoId: string; title: string; url: string; queuedAt: number; guildId?: string; }
 const pendingVideoQueue: PendingVideo[] = [];
 const PENDING_VIDEO_MAX_AGE_MS = 6 * 60 * 60_000; // stale after 6h — don't surface week-old "just posted this" energy
 
-function dequeuePendingVideo(): PendingVideo | null {
+function dequeuePendingVideo(guildId?: string): PendingVideo | null {
   const now = Date.now();
-  while (pendingVideoQueue.length) {
-    const next = pendingVideoQueue.shift()!;
-    if (now - next.queuedAt <= PENDING_VIDEO_MAX_AGE_MS) return next;
-    console.log(`[NewVideo] dropped stale queued video: "${next.title}"`);
+  for (let i = 0; i < pendingVideoQueue.length; i++) {
+    const v = pendingVideoQueue[i];
+    // skip stale
+    if (now - v.queuedAt > PENDING_VIDEO_MAX_AGE_MS) {
+      pendingVideoQueue.splice(i, 1);
+      console.log(`[NewVideo] dropped stale queued video: "${v.title}"`);
+      i--;
+      continue;
+    }
+    // if guildId specified, only return videos for that guild (or legacy no-guild entries)
+    if (!guildId || !v.guildId || v.guildId === guildId) {
+      pendingVideoQueue.splice(i, 1);
+      return v;
+    }
   }
   return null;
 }
@@ -1767,38 +1818,48 @@ export async function notifyNewVideo(videoId: string, title: string, url: string
   notifiedVideoIds.add(videoId);
 
   if (globallyMuted) {
-    // still queue it — once !resume happens the passive tick will pick this
-    // up same as any other queued video. don't post anything while muted.
-    pendingVideoQueue.push({ videoId, title, url, queuedAt: Date.now() });
+    // queue once per-guild so each server gets it when they unmute
+    for (const guild of botClient.guilds.cache.values()) {
+      if (!serverMuted.get(guild.id)) {
+        pendingVideoQueue.push({ videoId, title, url, queuedAt: Date.now(), guildId: guild.id });
+      }
+    }
     return;
   }
 
-  try {
-    const channelId = pickInterestChannel();
-    if (!channelId) { pendingVideoQueue.push({ videoId, title, url, queuedAt: Date.now() }); return; }
+  // post independently to every server the bot is in
+  for (const guild of botClient.guilds.cache.values()) {
+    if (serverMuted.get(guild.id)) continue; // server admin used !stop
+    try {
+      await notifyNewVideoInGuild(videoId, title, url, guild.id);
+    } catch (e) { console.error(`[NewVideo] guild ${guild.id}:`, e); }
+  }
+}
 
-    const state = getChState(channelId);
-    if (state.mode === 'active') {
-      // mid-conversation — don't interrupt. queue it for the next passive tick
-      // that finds this (or whichever) channel free.
-      pendingVideoQueue.push({ videoId, title, url, queuedAt: Date.now() });
-      console.log(`[NewVideo] queued — channel active: "${title}"`);
-      return;
-    }
+async function notifyNewVideoInGuild(videoId: string, title: string, url: string, guildId: string) {
+  const channelId = pickInterestChannelForGuild(guildId);
+  if (!channelId) {
+    pendingVideoQueue.push({ videoId, title, url, queuedAt: Date.now(), guildId });
+    return;
+  }
 
-    const ch = botClient.channels.cache.get(channelId) as TextChannel | undefined;
-    if (!ch?.isTextBased()) { pendingVideoQueue.push({ videoId, title, url, queuedAt: Date.now() }); return; }
-    const guildId = (ch as any).guildId as string | undefined;
-    if (!guildId) { pendingVideoQueue.push({ videoId, title, url, queuedAt: Date.now() }); return; }
+  const state = getChState(channelId);
+  if (state.mode === 'active') {
+    pendingVideoQueue.push({ videoId, title, url, queuedAt: Date.now(), guildId });
+    console.log(`[NewVideo] queued for guild ${guildId} — channel active: "${title}"`);
+    return;
+  }
 
-    const speakState = await getSpeakState(channelId, guildId);
-    if (speakState.mode === 'paused' && speakState.resumeAt && Date.now() < speakState.resumeAt) {
-      pendingVideoQueue.push({ videoId, title, url, queuedAt: Date.now() });
-      return;
-    }
+  const ch = botClient!.channels.cache.get(channelId) as TextChannel | undefined;
+  if (!ch?.isTextBased()) { pendingVideoQueue.push({ videoId, title, url, queuedAt: Date.now(), guildId }); return; }
 
-    await runVideoBrainCall(channelId, ch, guildId, speakState.mode, title, url);
-  } catch (e) { console.error('[NewVideo]', e); }
+  const speakState = await getSpeakState(channelId, guildId);
+  if (speakState.mode === 'paused' && speakState.resumeAt && Date.now() < speakState.resumeAt) {
+    pendingVideoQueue.push({ videoId, title, url, queuedAt: Date.now(), guildId });
+    return;
+  }
+
+  await runVideoBrainCall(channelId, ch, guildId, speakState.mode, title, url);
 }
 
 // ── YOUTUBE DATA API POLLER (OAuth) ─────────────────────────────────
@@ -1952,6 +2013,7 @@ async function runSelfActivationCheck() {
     const ch = botClient.channels.cache.get(channelId) as TextChannel | undefined;
     if (!ch?.isTextBased()) continue;
     const guildId = ((ch as any).guildId as string | undefined) ?? 'dm';
+    if (guildId !== 'dm' && serverMuted.get(guildId)) continue; // server muted
 
     try {
       const memCtx      = guildId === 'dm' ? '' : await buildMemCtx(guildId);
@@ -2138,6 +2200,7 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
   const statusLine = `mode: active (goal: ${state.goal || 'none set'}) | speak: ${speakState.mode} | server: ${tServerName} | channel: #${tChannelName}`;
 
   const liveMsgs = stmGet(channelId);
+  const secsSinceSpoke = state.lastBotMsgAt ? Math.round((Date.now() - state.lastBotMsgAt) / 1000) : null;
   const brainOpts: BrainOpts = {
     model: ACTIVE_MODEL,
     sender: tSender, bond, message: tContent,
@@ -2149,6 +2212,12 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
     goal: state.goal, batchSize: batch.length,
     images,
     consecutiveUnpromptedReplies: state.consecutiveUnpromptedReplies,
+    // if the bot spoke very recently and wasn't pinged, flag it explicitly —
+    // the model sees its reply in the STM transcript but doesn't always register
+    // how recent it was, which causes it to reply again to harmless follow-ups.
+    selfNote: (!anyMentioned && secsSinceSpoke !== null && secsSinceSpoke < 25)
+      ? `you spoke ${secsSinceSpoke}s ago. you've already responded. be extra reluctant to reply again unless something genuinely new happened.`
+      : undefined,
   };
 
   let decision = await brain(brainOpts);
@@ -2197,12 +2266,33 @@ async function handleMessage(msg: Message) {
     try { msg = await msg.fetch(); } catch { return; }
   }
   if (msg.author.bot || !msg.content?.trim()) return;
-  if (globallyMuted) return; // !stop was used — only the admin listener still runs, so !resume still works
   if (alreadyHandled(msg.id)) { console.warn(`[Dedup] skipped duplicate event for msg ${msg.id}`); return; }
   if (msg.channel.isDMBased()) return handleDirectMessage(msg);
 
+  const guildId = msg.guildId!;
+
+  // ── per-server admin !stop / !resume ──────────────────────────────
+  // any Discord member with Administrator permission can mute/unmute the bot
+  // for their server specifically. runs before globallyMuted so admins can
+  // always get a response even when the bot is globally quiet.
+  const cmd = msg.content.trim();
+  if ((cmd === '!stop' || cmd === '!resume' || cmd === '!start') &&
+      msg.member?.permissions.has(PermissionFlagsBits.Administrator)) {
+    const muting = cmd === '!stop';
+    serverMuted.set(guildId, muting);
+    // persist across restarts
+    db.collection('servers').doc(guildId).set({ botMuted: muting }, { merge: true }).catch(() => {});
+    msg.reply(muting
+      ? 'going quiet in this server. any server admin can !resume me back'
+      : 'back 🫡'
+    ).catch(() => {});
+    return;
+  }
+
+  if (globallyMuted) return; // !gmute was used — only the ADMIN_ID listener still runs
+  if (serverMuted.get(guildId)) return; // server admin used !stop
+
   try {
-    const guildId     = msg.guildId!;
     const channelId   = msg.channelId;
     const mentioned   = BOT_ID ? msg.mentions.has(BOT_ID) : false;
     const everyonePing = msg.mentions.everyone ?? false;
@@ -2289,6 +2379,11 @@ export async function startBot(token: string) {
     for (const g of botClient!.guilds.cache.values()) {
       cacheServerName(g.id, g.name);
       await db.collection('servers').doc(g.id).set({ name: g.name, updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+      // restore per-server mute state persisted across restarts
+      try {
+        const snap = await db.collection('servers').doc(g.id).get();
+        if (snap.data()?.botMuted) { serverMuted.set(g.id, true); console.log(`[Boot] "${g.name}" — bot was muted, restoring`); }
+      } catch {}
       for (const ch of g.channels.cache.filter(c => c.isTextBased()).values()) {
         cacheChannelName(ch.id, (ch as any).name);
       }
@@ -2370,7 +2465,7 @@ export async function startBot(token: string) {
       const speak = await getSpeakState(chId, guildId);
       const marker = getMarker(chId);
       await msg.reply([
-        `global: ${globallyMuted ? '🔇 muted (!resume to undo)' : '🟢 live'}`,
+        `global: ${globallyMuted ? '🔇 gmuted (!gresume to undo)' : '🟢 live'}`,
         `mode: ${st.mode}${st.goal ? ` (goal: ${st.goal})` : ''}`,
         `speak: ${speak.mode}${speak.resumeAt ? ` until ${new Date(speak.resumeAt).toLocaleTimeString()}` : ''}`,
         `focus: ${focus?.channelId === chId ? 'yes' : 'no'}`,
@@ -2420,13 +2515,13 @@ export async function startBot(token: string) {
         `last seen video id: ${lastSeenVideoId || 'none yet (baseline not set)'}`,
       ].join('\n'));
     }
-    if (c === '!stop') {
+    if (c === '!gmute') {
       globallyMuted = true;
-      await msg.reply('going quiet everywhere. !resume to bring me back');
+      await msg.reply('going quiet everywhere (global). !gresume to bring me back');
     }
-    if (c === '!resume' || c === '!start') {
+    if (c === '!gresume' || c === '!gstart') {
       globallyMuted = false;
-      await msg.reply('back 🫡');
+      await msg.reply('back globally 🫡');
     }
     if (c === '!shutdown') {
       await msg.reply('shutting down for real 💀 — needs a restart from the host to come back, !resume won\'t work after this');
