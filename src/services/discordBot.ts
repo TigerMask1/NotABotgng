@@ -258,6 +258,11 @@ const YT_CLIENT_ID          = process.env.YT_CLIENT_ID     || '';
 const YT_CLIENT_SECRET      = process.env.YT_CLIENT_SECRET || '';
 const YT_REFRESH_TOKEN      = process.env.YT_REFRESH_TOKEN || '';
 
+// ── PROACTIVE ENGAGEMENT CONSTANTS ───────────────────────────────
+const PROACTIVE_QUIET_MS    = 35 * 60_000;  // channel must be this silent before notabot pokes in
+const PROACTIVE_MIN_GAP_MS  = 50 * 60_000;  // minimum gap between proactive attempts (doubles each strike)
+const PROACTIVE_MAX_STRIKES = 3;             // ignored this many times in a row → lose interest in this channel
+
 let BOT_NAME  = 'NotABot';
 let BOT_ID    = '';
 let botClient: Client | null = null;
@@ -275,6 +280,18 @@ const ADMIN_ID = '1296109674361520146';
 // per-server mute: server admins (anyone with Administrator perm) can !stop / !resume the bot
 // in their own server without affecting other servers. stored in-memory + persisted to Firebase.
 const serverMuted = new Map<string, boolean>();
+
+// per-channel proactive engagement state — tracks how many times notabot tried
+// to start something and got ignored, and whether it's given up on this channel.
+// resets when someone actually talks (renewed interest).
+interface ProactiveState { lastAt: number; strikes: number; lostInterest: boolean; }
+const proactiveStates = new Map<string, ProactiveState>();
+
+function getProactiveState(channelId: string): ProactiveState {
+  let s = proactiveStates.get(channelId);
+  if (!s) { s = { lastAt: 0, strikes: 0, lostInterest: false }; proactiveStates.set(channelId, s); }
+  return s;
+}
 
 // ── ID / NAME CACHES ──────────────────────────────────────────────
 const idCache          = new Map<string, string>();
@@ -1034,8 +1051,243 @@ async function wikiLookup(topic: string): Promise<string> {
   }
 }
 
+// ── XP / LEVELLING ───────────────────────────────────────────────
+// every meaningful interaction with notabot earns points.
+// stored per-user per-guild in Firebase under servers/{guildId}/xp/{userId}.
+// levels unlock at every 150 XP — no gameplay gate, just a label and a
+// level-up callout from the bot in channel (in character, not a system message).
+
+const XP_PER_LEVEL = 150;
+
+// threshold → name — evaluated top-down, first match wins
+const LEVEL_TIERS: Array<[number, string]> = [
+  [15, 'certified'],
+  [10, 'main character'],
+  [8,  'veteran'],
+  [5,  'actually here'],
+  [3,  'regular'],
+  [2,  'showing up'],
+  [1,  'exists'],
+  [0,  'who'],
+];
+function getLevelName(level: number): string {
+  for (const [thresh, name] of LEVEL_TIERS) if (level >= thresh) return name;
+  return 'who';
+}
+
+const LEVEL_UP_LINES = [
+  '{u} hit level {l} lmaooo',
+  'wait {u} is actually level {l} now??',
+  '{u} level {l}. this is ur life now huh',
+  'congrats {u} on level {l} i guess 💀',
+  '{u} grinded to level {l}. get a hobby fr',
+  'level {l} {u}. certified regular at this point',
+];
+
+async function addXP(
+  guildId: string, userId: string, username: string, amount: number
+): Promise<{ newXP: number; newLevel: number; oldLevel: number; leveledUp: boolean }> {
+  try {
+    const ref  = db.collection('servers').doc(guildId).collection('xp').doc(userId);
+    const snap = await ref.get();
+    const oldXP    = (snap.data()?.xp ?? 0) as number;
+    const oldLevel = Math.floor(oldXP / XP_PER_LEVEL);
+    const newXP    = oldXP + amount;
+    const newLevel = Math.floor(newXP / XP_PER_LEVEL);
+    await ref.set({ xp: newXP, level: newLevel, username, updatedAt: Date.now() }, { merge: true });
+    return { newXP, newLevel, oldLevel, leveledUp: newLevel > oldLevel };
+  } catch {
+    return { newXP: amount, newLevel: 0, oldLevel: 0, leveledUp: false };
+  }
+}
+
+async function getUserXPData(guildId: string, userId: string) {
+  try {
+    const snap = await db.collection('servers').doc(guildId).collection('xp').doc(userId).get();
+    const d = snap.data() ?? {};
+    return { xp: (d.xp ?? 0) as number, level: (d.level ?? 0) as number, username: (d.username ?? 'unknown') as string };
+  } catch { return { xp: 0, level: 0, username: 'unknown' }; }
+}
+
+async function getLeaderboard(guildId: string, limit = 5) {
+  try {
+    const snap = await db.collection('servers').doc(guildId).collection('xp')
+      .orderBy('xp', 'desc').limit(limit).get();
+    return snap.docs.map(d => ({ userId: d.id, ...(d.data() as any) })) as
+      Array<{ userId: string; xp: number; level: number; username: string }>;
+  } catch { return []; }
+}
+
+async function announceLevelUp(channelId: string, userId: string, newLevel: number) {
+  const ch = botClient?.channels.cache.get(channelId) as TextChannel | undefined;
+  if (!ch?.isTextBased()) return;
+  const line = LEVEL_UP_LINES[Math.floor(Math.random() * LEVEL_UP_LINES.length)];
+  const text  = line.replace('{u}', `<@${userId}>`).replace('{l}', `${newLevel} (${getLevelName(newLevel)})`);
+  try {
+    await sleep(800);
+    const sent = await ch.send(text);
+    stmPush(channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: text });
+  } catch {}
+}
+
+// ── EVENTS ────────────────────────────────────────────────────────
+// brain starts events via the start_event command. each event has a participation
+// window (or is instant for npc_check), then auto-judges via a brain call and
+// announces the winner. one active event per guild at a time.
+
+type EventType = 'hot_take' | 'roast_battle' | 'trivia' | 'npc_check';
+
+interface EventEntry { userId: string; username: string; content: string; ts: number; }
+interface ServerEvent {
+  type:      EventType;
+  channelId: string;
+  guildId:   string;
+  startedAt: number;
+  endsAt:    number;
+  entries:   EventEntry[];
+  phase:     'open' | 'judging' | 'done';
+  answer?:   string;         // trivia only — stored lowercase
+  timerId?:  ReturnType<typeof setTimeout>;
+}
+
+const serverEvents = new Map<string, ServerEvent>(); // guildId → event
+
+const EVENT_DURATIONS_MS: Record<EventType, number> = {
+  hot_take:     3 * 60_000,
+  roast_battle: 4 * 60_000,
+  trivia:       2 * 60_000,
+  npc_check:    0,            // instant judge from transcript
+};
+
+async function startEvent(
+  guildId: string, channelId: string, type: EventType,
+  opts: { answer?: string } = {},
+): Promise<string> {
+  if (serverEvents.has(guildId)) return 'already an event running in this server — wait for it to end';
+  const duration = EVENT_DURATIONS_MS[type];
+  const now = Date.now();
+  const ev: ServerEvent = {
+    type, channelId, guildId, startedAt: now, endsAt: now + duration,
+    entries: [], phase: duration > 0 ? 'open' : 'done',
+    answer: opts.answer ? opts.answer.toLowerCase().trim() : undefined,
+  };
+  serverEvents.set(guildId, ev);
+  if (duration > 0) {
+    ev.timerId = setTimeout(() => judgeEvent(guildId).catch(e => console.error('[Event]', e)), duration);
+  } else {
+    setTimeout(() => judgeEvent(guildId).catch(e => console.error('[Event]', e)), 200);
+  }
+  console.log(`[Event] ${type} started in guild ${guildId}`);
+  return `event started: ${type}${duration ? ` (${duration / 60_000}min window)` : ' (instant)'}`;
+}
+
+async function judgeEvent(guildId: string) {
+  const ev = serverEvents.get(guildId);
+  if (!ev || ev.phase === 'done') return;
+  ev.phase = 'judging';
+
+  const ch = botClient?.channels.cache.get(ev.channelId) as TextChannel | undefined;
+  if (!ch?.isTextBased()) { serverEvents.delete(guildId); return; }
+
+  try {
+    const memCtx     = await buildMemCtx(guildId);
+    const liveMsgs   = stmGet(ev.channelId);
+    const transcript = stmFormatWithMarker(liveMsgs, ev.channelId);
+    const serverName = serverNameCache.get(guildId) ?? 'unknown';
+    const channelName = (ch as any).name ?? ev.channelId.slice(-5);
+
+    const entriesText = ev.entries.length
+      ? ev.entries.map((e, i) => `${i + 1}. ${e.username}: "${e.content}"`).join('\n')
+      : '(nobody participated)';
+
+    const judgeContext = ev.type === 'npc_check'
+      ? 'look at the recent transcript and pick the most quiet / boring / mid person. call them out specifically in your voice. award them the NPC title.'
+      : `event: ${ev.type}\nentries:\n${entriesText}\n\npick a winner. be specific about why. roast the losers too if there's material.`;
+
+    const brainOpts: BrainOpts = {
+      model: PASSIVE_MODEL,
+      sender: '(event-judge)',
+      bond: 50,
+      message: `time's up. judge this:\n${judgeContext}`,
+      transcript, memCtx,
+      mentioned: false, isDM: false,
+      statusLine: `mode: event-judge | type: ${ev.type} | server: ${serverName} | channel: #${channelName}`,
+      inExchange: false, channelName, serverName,
+      everyonePing: false, endingConvo: false,
+      selfNote: 'you ran this event. announce the result naturally — who won and why, brief roast of the rest. declare the winner clearly by name so the system can find them.',
+    };
+
+    const decision = await brain(brainOpts);
+    ev.phase = 'done';
+    serverEvents.delete(guildId);
+
+    if (decision.action === 'speak' && decision.reply?.trim()) {
+      const text = resolveMentionNames(decision.reply).slice(0, 400);
+
+      // award XP: winner = first entry whose name appears in the reply
+      const winnerEntry = ev.entries.find(e =>
+        text.toLowerCase().includes(e.username.toLowerCase())
+      );
+      if (winnerEntry) {
+        const r = await addXP(guildId, winnerEntry.userId, winnerEntry.username, 75);
+        if (r.leveledUp) announceLevelUp(ev.channelId, winnerEntry.userId, r.newLevel).catch(() => {});
+      }
+      // participation XP for everyone else
+      for (const entry of ev.entries) {
+        if (winnerEntry && entry.userId === winnerEntry.userId) continue;
+        await addXP(guildId, entry.userId, entry.username, 15).catch(() => {});
+      }
+      // consolation XP for npc_check subject
+      if (ev.type === 'npc_check' && ev.entries.length === 0 && winnerEntry) {
+        await addXP(guildId, winnerEntry.userId, winnerEntry.username, 5).catch(() => {});
+      }
+
+      try { await ch.sendTyping(); } catch {}
+      await sleep(700);
+      const sent = await ch.send(text);
+      stmPush(ev.channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: text });
+    }
+  } catch (e) {
+    console.error('[EventJudge]', e);
+    serverEvents.delete(guildId);
+  }
+}
+
+// called from handleMessage — silently adds user's message to the active event's entry list.
+// returns true if added (caller can skip routing to brain if the channel is event-only mode).
+function tryAddEventEntry(guildId: string, userId: string, username: string, content: string): boolean {
+  const ev = serverEvents.get(guildId);
+  if (!ev || ev.phase !== 'open') return false;
+  if (ev.entries.some(e => e.userId === userId)) return false; // one entry per person
+  ev.entries.push({ userId, username, content: content.slice(0, 300), ts: Date.now() });
+  return true;
+}
+
+// ── WEEKLY NPC CHECK ─────────────────────────────────────────────
+// fires every Sunday. notabot looks at recent activity and crowns the most
+// mid/quiet person as NPC of the week. purely chaotic, no user action needed.
+let lastWeeklyNPCAt = 0;
+const WEEKLY_NPC_COOLDOWN_MS = 6 * 24 * 60 * 60_000;
+
+async function runWeeklyNPC() {
+  if (new Date().getDay() !== 0) return; // Sunday only
+  const now = Date.now();
+  if (now - lastWeeklyNPCAt < WEEKLY_NPC_COOLDOWN_MS) return;
+  if (!botClient || !gemini.canCall() || globallyMuted) return;
+  lastWeeklyNPCAt = now;
+  console.log('[WeeklyNPC] running...');
+
+  for (const guild of botClient.guilds.cache.values()) {
+    if (serverMuted.get(guild.id)) continue;
+    if (serverEvents.has(guild.id)) continue;
+    const channelId = pickInterestChannelForGuild(guild.id);
+    if (!channelId) continue;
+    await startEvent(guild.id, channelId, 'npc_check').catch(e => console.error('[WeeklyNPC]', e));
+  }
+}
+
 // ── COMMAND EXECUTION ─────────────────────────────────────────────
-type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'get_channel_info' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'get_cross_server' | 'set_reminder' | 'create_poll' | 'wiki_lookup' | 'none';
+type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'get_channel_info' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'get_cross_server' | 'set_reminder' | 'create_poll' | 'wiki_lookup' | 'start_event' | 'get_leaderboard' | 'none';
 
 async function executeCommand(
   command: BotCommand,
@@ -1121,6 +1373,22 @@ async function executeCommand(
       if (!topic) return 'no topic given — pass commandArgs.topic';
       return await wikiLookup(topic);
     }
+    case 'start_event': {
+      const type = String(args.type || 'hot_take') as EventType;
+      if (!['hot_take', 'roast_battle', 'trivia', 'npc_check'].includes(type)) {
+        return 'invalid event type — use: hot_take | roast_battle | trivia | npc_check';
+      }
+      return await startEvent(guildId, channelId, type, {
+        answer: args.answer ? String(args.answer) : undefined,
+      });
+    }
+    case 'get_leaderboard': {
+      const board = await getLeaderboard(guildId, 8);
+      if (!board.length) return 'nobody has XP yet in this server';
+      return board.map((e, i) =>
+        `${i + 1}. ${e.username} — ${e.xp} XP (lv${e.level} "${getLevelName(e.level)}")`
+      ).join('\n');
+    }
     default:
       return 'unknown command';
   }
@@ -1187,6 +1455,7 @@ MODES (you're told which one in "mode: ..." each time):
 - active: you're already in it. every message reaches you. decide fast — speed over a perfect read.
 - passive scan: a periodic check-in with a ton of context. take your time. chat's dead? you can start something from memory — not just "hey".
 - self-check: you spoke and got ghosted. read the room before saying anything — sometimes funny, sometimes needy, don't reuse the same bit twice.
+- proactive: chat has been dead for a while, you're starting something from scratch. you'll have a list of recent members — pick ONE, @mention them by name, say something specific to them. calling back something they said, poking fun about something you know about them, dropping a take and wanting their reaction. "anyone here" or generic pings are the worst possible move here — if you don't have something actually worth saying to someone specifically, action:ignore and leave it dead.
 - you'll be told if several messages landed at once while you were thinking — that's normal chat noise, not a queue you owe responses to. ignoring the whole thing is the expected default; only respond if something in there actually earns it.
 
 PICK EXACTLY ONE — SPEAK, REACT, GIF, OR IGNORE, NEVER MORE THAN ONE:
@@ -1257,6 +1526,8 @@ COMMANDS YOU CAN RUN (include in JSON when needed, leave "none" otherwise):
 - set_reminder: set a reminder that fires in this channel later. args: { minutes: 60, note: "what to remind about" }. note gets posted as-is when it fires, keep it short and in-character, not a formal reminder notice. these don't survive a restart — don't promise something will definitely happen, just set it and move on.
 - create_poll: post a real discord poll (not reactions — an actual native poll people vote on). args: { question: "...", options: ["a","b","c"], hours: 1 }. 2-10 options, question under 300 chars, options under 55 chars each. use when a real debate's happening and "let's just vote on it" would actually land.
 - wiki_lookup: get a real wikipedia summary on something. args: { topic: "subject" }. use to settle "wait is that actually true" arguments or quick facts — way more reliable than guessing, and you don't burn web_search's quota on it.
+- start_event: start a server event. args: { type: "hot_take|roast_battle|trivia|npc_check", answer?: "correct answer (trivia only, stored secretly)", topic?: "optional context" }. put your actual announcement text in "reply" — the system sets up the backend silently. only one event per server at a time. use during passive or proactive mode when the server could use some chaos. hot_take = 3min, people drop takes and you judge. roast_battle = 4min, two people roast each other and you pick the winner. trivia = 2min, first correct answer wins instantly. npc_check = instant, no participation, you just call out the most mid person in the transcript.
+- get_leaderboard: get the server XP leaderboard. args: {} (none needed). use if someone asks who's most active, for bragging rights context, or if you want to call out the gap between #1 and #2.
 system will run the command and send you the result. you then give your actual reply.
 
 in transcripts: [me] = your own past messages
@@ -1273,7 +1544,7 @@ CRITICAL OUTPUT RULE: respond with RAW JSON ONLY. first character must be "{", l
   "goal": "short reason you're engaged, or empty string",
   "stayActive": true,
   "think": "short visible thinking message, or empty string — sent to chat BEFORE you run a command",
-  "command": "get_history|get_member|get_stm|get_video_status|get_channel_info|recall_memory|get_server_stats|get_time|web_search|get_cross_server|set_reminder|create_poll|wiki_lookup|none",
+  "command": "get_history|get_member|get_stm|get_video_status|get_channel_info|recall_memory|get_server_stats|get_time|web_search|get_cross_server|set_reminder|create_poll|wiki_lookup|start_event|get_leaderboard|none",
   "commandArgs": {}
 }`;
 
@@ -1498,12 +1769,7 @@ async function sendDecision(opts: {
   }
 
   if (decision.action === 'speak' && decision.reply?.trim()) {
-    // burst support: the model can separate up to 3 short fragments with "|||" to
-    // mimic how people actually text — multiple quick messages instead of one
-    // polished paragraph. each fragment gets its own typing pause; only the FIRST
-    // one threads as a reply to the trigger message, the rest land as normal
-    // follow-up sends (exactly like a real double/triple-text would look).
-    const fragments = decision.reply.split('|||').map(f => f.trim()).filter(Boolean).slice(0, 3);
+    const fragments = decision.reply.split('|||').map(f => resolveMentionNames(f.trim())).filter(Boolean).slice(0, 3);
     let isFirst = true;
     for (const frag of fragments) {
       const text = frag.slice(0, 250);
@@ -1520,6 +1786,13 @@ async function sendDecision(opts: {
     state.lastBotMsgAt = Date.now();
     state.gotResponseSinceLastBotMsg = false;
     if (guildId !== 'dm' && replyToMsg) updateBond(guildId, replyToMsg.author.id, 1).catch(() => {});
+    // XP for being spoken to
+    if (guildId !== 'dm' && replyToMsg && replyToMsg.author.id !== BOT_ID) {
+      const tName = (replyToMsg as any).member?.displayName ?? replyToMsg.author.username;
+      addXP(guildId, replyToMsg.author.id, tName, 8).then(r => {
+        if (r.leveledUp) announceLevelUp(channelId, replyToMsg.author.id, r.newLevel).catch(() => {});
+      }).catch(() => {});
+    }
   }
 
   if (decision.stayActive === false) {
@@ -1995,6 +2268,34 @@ async function runYtPoll() {
   } finally { ytPollRunning = false; }
 }
 
+// ── MENTION RESOLUTION ───────────────────────────────────────────
+// converts "@name" patterns in bot messages into real discord <@userId> pings.
+// only resolves names that exist in idCache (people the bot has seen this session).
+// safe — unresolved names are left as-is rather than breaking the message.
+function resolveMentionNames(text: string): string {
+  return text.replace(/@([\w]{1,32})/gi, (match, rawName) => {
+    const name = rawName.trim().toLowerCase();
+    if (!name) return match;
+    const entry = [...idCache.entries()].find(([, n]) => n.toLowerCase() === name);
+    return entry ? `<@${entry[0]}>` : match;
+  });
+}
+
+// picks the N most recently active non-bot members from STM for the proactive brain call.
+// returns name + the last thing they said so the model has something to work with.
+function getRecentMembers(channelId: string, limit = 5): Array<{ name: string; lastMsg: string }> {
+  const msgs = stmGet(channelId);
+  const seen = new Map<string, string>();
+  for (const m of [...msgs].reverse()) {
+    if (m.authorId === BOT_ID) continue;
+    const name = m.author === '[me]' ? '' : m.author;
+    if (!name) continue;
+    if (!seen.has(name)) seen.set(name, m.content.slice(0, 100));
+    if (seen.size >= limit) break;
+  }
+  return [...seen.entries()].map(([name, lastMsg]) => ({ name, lastMsg }));
+}
+
 // ── SELF-ACTIVATION (noticed it got ghosted) ──────────────────────
 async function runSelfActivationCheck() {
   if (!botClient || !gemini.canCall() || globallyMuted) return;
@@ -2041,7 +2342,113 @@ async function runSelfActivationCheck() {
   }
 }
 
-// ── DIRECT MESSAGES ───────────────────────────────────────────────
+// ── PROACTIVE ENGAGEMENT (starts dead conversations) ──────────────
+// fires every passive tick but has its own per-channel cooldown + backoff.
+// different from self-check: this fires when nobody has been talking at ALL —
+// notabot wasn't ghosted, the chat just died. it picks a real person and
+// @mentions them about something specific, not a generic "anyone here".
+// after PROACTIVE_MAX_STRIKES ignored attempts → marks channel as lost interest.
+// interest resets the moment someone actually talks again.
+let proactiveRunning = false;
+async function runProactiveEngagement() {
+  if (proactiveRunning || !botClient || !gemini.canCall() || globallyMuted) return;
+  proactiveRunning = true;
+  try {
+    const now = Date.now();
+
+    for (const guild of botClient.guilds.cache.values()) {
+      if (serverMuted.get(guild.id)) continue;
+
+      // find most recently active passive channel in this guild
+      let bestChannelId: string | null = null;
+      let bestTs = 0;
+      for (const [chId, state] of channelState.entries()) {
+        if (state.mode === 'active') continue;
+        const c = botClient.channels.cache.get(chId) as any;
+        if (c?.guildId !== guild.id) continue;
+        if (state.lastActivityAt > bestTs) { bestTs = state.lastActivityAt; bestChannelId = chId; }
+      }
+      if (!bestChannelId) continue;
+
+      const quietMs = now - bestTs;
+      if (quietMs < PROACTIVE_QUIET_MS) continue;
+
+      const ps = getProactiveState(bestChannelId);
+      if (ps.lostInterest) continue;
+
+      // gap doubles after each ignored attempt
+      const minGap = PROACTIVE_MIN_GAP_MS * Math.pow(2, ps.strikes);
+      if (now - ps.lastAt < minGap) continue;
+
+      const ch = botClient.channels.cache.get(bestChannelId) as TextChannel | undefined;
+      if (!ch?.isTextBased()) continue;
+
+      const speakState = await getSpeakState(bestChannelId, guild.id).catch(() => ({ mode: 'active' as const, resumeAt: null }));
+      if (speakState.mode === 'paused' && speakState.resumeAt && now < speakState.resumeAt) continue;
+
+      const recentMembers = getRecentMembers(bestChannelId);
+      if (!recentMembers.length) continue;
+
+      try {
+        const memCtx      = await buildMemCtx(guild.id);
+        const liveMsgs    = stmGet(bestChannelId);
+        const transcript  = stmFormatWithMarker(liveMsgs, bestChannelId);
+        const serverName  = guild.name;
+        const channelName = (ch as any).name || bestChannelId.slice(-5);
+        const quietHours  = (quietMs / 3_600_000).toFixed(1);
+        const memberList  = recentMembers.map(m => `${m.name}: "${m.lastMsg}"`).join('\n');
+        const statusLine  = `mode: proactive | speak: ${speakState.mode} | quiet: ${quietHours}h | server: ${serverName} | channel: #${channelName}`;
+
+        const brainOpts: BrainOpts = {
+          model: PASSIVE_MODEL,
+          sender: '(proactive)',
+          bond: 50,
+          message: `chat dead ${quietHours}h. recent members:\n${memberList}`,
+          transcript, memCtx,
+          mentioned: false, isDM: false, statusLine,
+          inExchange: false, channelName, serverName,
+          everyonePing: false, endingConvo: false,
+          selfNote: `you are STARTING this unprompted. pick one person from the member list and @mention them by exact name. make it specific — call back something they said, poke fun, drop an opinion and want their take. do NOT send "anyone here" or "helloo" or anything generic — that's embarrassing. if you have nothing worth saying, ignore.`,
+        };
+
+        ps.lastAt = now;
+
+        let decision = await brain(brainOpts);
+        decision = await executeBrainDecision({ decision, brainOpts, channel: ch, channelId: bestChannelId, guildId: guild.id });
+
+        if (decision.action === 'speak' && decision.reply?.trim()) {
+          decision = { ...decision, reply: resolveMentionNames(decision.reply) };
+          ps.strikes = 0;
+          goActive(bestChannelId, 'proactive start');
+          console.log(`[Proactive] fired in #${channelName} (${guild.name}) — quiet ${quietHours}h`);
+
+          // +12 XP to whoever got @mentioned — bot sought them out specifically
+          for (const m of recentMembers) {
+            if (decision.reply.toLowerCase().includes(m.name.toLowerCase())) {
+              const uid = [...idCache.entries()].find(([, n]) => n.toLowerCase() === m.name.toLowerCase())?.[0];
+              if (uid) {
+                addXP(guild.id, uid, m.name, 12).then(r => {
+                  if (r.leveledUp) announceLevelUp(bestChannelId!, uid, r.newLevel).catch(() => {});
+                }).catch(() => {});
+              }
+              break;
+            }
+          }
+        } else {
+          ps.strikes++;
+          console.log(`[Proactive] chose not to speak — strike ${ps.strikes}/${PROACTIVE_MAX_STRIKES} in #${channelName}`);
+          if (ps.strikes >= PROACTIVE_MAX_STRIKES) {
+            ps.lostInterest = true;
+            console.log(`[Proactive] lost interest in #${channelName} (${guild.name})`);
+          }
+        }
+
+        await sendDecision({ channel: ch, decision, channelId: bestChannelId, guildId: guild.id });
+        advanceMarker(bestChannelId, liveMsgs.map(m => m.id), decision);
+      } catch (e) { console.error(`[Proactive] guild ${guild.id}:`, e); }
+    }
+  } finally { proactiveRunning = false; }
+}
 const dmDebounce = new Map<string, NodeJS.Timeout>();
 const dmPending  = new Map<string, Message>();
 
@@ -2192,7 +2599,11 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
   // person picking their moments.
   const unprompted = !anyMentioned && !tEveryonePing && !inExchange;
 
-  const statusLine = `mode: active (goal: ${state.goal || 'none set'}) | speak: ${speakState.mode} | server: ${tServerName} | channel: #${tChannelName}`;
+  const activeEvent = serverEvents.get(guildId);
+  const eventCtx = activeEvent?.phase === 'open'
+    ? ` | event: ${activeEvent.type} (${Math.max(0, Math.round((activeEvent.endsAt - Date.now()) / 1000))}s left, ${activeEvent.entries.length} entries)`
+    : '';
+  const statusLine = `mode: active (goal: ${state.goal || 'none set'}) | speak: ${speakState.mode} | server: ${tServerName} | channel: #${tChannelName}${eventCtx}`;
 
   const liveMsgs = stmGet(channelId);
   const secsSinceSpoke = state.lastBotMsgAt ? Math.round((Date.now() - state.lastBotMsgAt) / 1000) : null;
@@ -2291,8 +2702,31 @@ async function handleMessage(msg: Message) {
   if (globallyMuted) return; // !gmute was used — only the ADMIN_ID listener still runs
   if (serverMuted.get(guildId)) return; // server admin used !stop
 
+  // someone is talking — renewed interest, reset proactive backoff for this channel
+  const ps = proactiveStates.get(msg.channelId);
+  if (ps?.lostInterest || (ps?.strikes ?? 0) > 0) {
+    proactiveStates.set(msg.channelId, { lastAt: 0, strikes: 0, lostInterest: false });
+  }
+
   try {
     const channelId   = msg.channelId;
+
+    // ── user commands (no brain needed) ──────────────────────────
+    if (cmd === '!rank') {
+      const data  = await getUserXPData(guildId, msg.author.id);
+      const board = await getLeaderboard(guildId, 100);
+      const rank  = board.findIndex(e => e.userId === msg.author.id) + 1;
+      const rankStr = rank > 0 ? `#${rank} in this server` : 'not ranked yet';
+      msg.reply(`${data.xp} XP | level ${data.level} (${getLevelName(data.level)}) | ${rankStr}`).catch(() => {});
+      return;
+    }
+    if (cmd === '!top') {
+      const board = await getLeaderboard(guildId, 5);
+      if (!board.length) { msg.reply('nobody has XP yet lol').catch(() => {}); return; }
+      const text = board.map((e, i) => `${i + 1}. ${e.username} — ${e.xp} XP (lv${e.level})`).join('\n');
+      msg.reply(text).catch(() => {});
+      return;
+    }
     const mentioned   = BOT_ID ? msg.mentions.has(BOT_ID) : false;
     const everyonePing = msg.mentions.everyone ?? false;
     const sender      = msg.member?.displayName || msg.author.username;
@@ -2322,6 +2756,22 @@ async function handleMessage(msg: Message) {
     touchActivity(channelId);
 
     maybeLogHistory(channelId, guildId).catch(() => {});
+
+    // ── event entry collection ────────────────────────────────────
+    // if there's an open event, silently log this message as the user's entry.
+    // trivia also checks for a correct answer immediately.
+    const ev = serverEvents.get(guildId);
+    if (ev?.phase === 'open') {
+      const memberName = msg.member?.displayName ?? msg.author.username;
+      const added = tryAddEventEntry(guildId, msg.author.id, memberName, content);
+      if (added && ev.type === 'trivia' && ev.answer) {
+        if (content.toLowerCase().includes(ev.answer)) {
+          clearTimeout(ev.timerId);
+          ev.timerId = undefined;
+          judgeEvent(guildId).catch(() => {});
+        }
+      }
+    }
 
     if (mentioned && state.mode !== 'active') goActive(channelId, 'got pinged');
 
@@ -2414,6 +2864,8 @@ export async function startBot(token: string) {
 
     setInterval(() => { runPassiveTick().catch(() => {}); }, PASSIVE_TICK_MS);
     setInterval(() => { runSelfActivationCheck().catch(() => {}); }, PASSIVE_TICK_MS);
+    setInterval(() => { runProactiveEngagement().catch(() => {}); }, PASSIVE_TICK_MS);
+    setInterval(() => { runWeeklyNPC().catch(() => {}); }, 60 * 60_000); // checks every hour, only fires Sundays
 
     if (YT_CLIENT_ID && YT_CLIENT_SECRET && YT_REFRESH_TOKEN) {
       runYtPoll().catch(() => {});
@@ -2441,8 +2893,6 @@ export async function startBot(token: string) {
   // ── ADMIN COMMANDS ──────────────────────────────────────────────
   // locked to one person, not discord roles/permissions — only this user ID
   // can run admin commands, regardless of their server roles anywhere.
-  const ADMIN_ID = '1296109674361520146';
-
   botClient.on(Events.MessageCreate, async (msg) => {
     if (msg.author.id !== ADMIN_ID) return;
 
