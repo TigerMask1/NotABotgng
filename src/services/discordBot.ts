@@ -278,6 +278,22 @@ const WWT_WAIT_FOR_REPLY_MS   = 6  * 60_000;  // how long it lingers on one pers
 const WWT_USER_COOLDOWN_MS    = 6  * 60 * 60_000; // don't re-ping the same person for this long, replied or not
 const WWT_MAX_CANDIDATES_SCAN = 40;            // cap how many recent chatters we consider per sweep, just a sanity bound
 
+// ── SLOW-TOOL-CALL STALL LINE ──────────────────────────────────────
+// some commands are real network round trips (web_search, wiki_lookup,
+// recall_memory, get_channel_info, any Firestore read) and can occasionally
+// take a few seconds. previously: total silence in the channel until the
+// result landed, however long that took — doesn't read as a person, reads
+// as a frozen bot. now: if executeCommand hasn't resolved within
+// STALL_THRESHOLD_MS, drop one casual "still here" line so it feels like
+// someone actually went and checked, not like the bot hung. only fires
+// once per command call, and only if it's actually still pending —
+// resolves instantly → no stall line, nothing extra ever gets sent.
+const STALL_THRESHOLD_MS = 3500;
+const STALL_LINES = [
+  'lemme get it', 'wait a min', 'one sec', 'hold on lemme check',
+  'gimme a sec', 'lemme look', 'one moment', 'checking rn hold on',
+];
+
 let BOT_NAME  = 'NotABot';
 let BOT_ID    = '';
 let botClient: Client | null = null;
@@ -1407,13 +1423,23 @@ async function executeCommand(
       return stmFormat(stmGet(channelId));
     }
     case 'get_video_status': {
+      // BUG FIX: this used to return only the bare video ID ("last known
+      // upload id: f_xiXNOX-1s") with no actual link anywhere in the string.
+      // when asked to share/link the video, the model had nothing real to
+      // point to — it correctly refused to fabricate a video URL (that part
+      // of the no-fabrication rule was working exactly as intended), but
+      // fell back to the one link it's allowed to output verbatim: the
+      // hardcoded channel URL. result: every "check out my video" came out
+      // as the channel link instead. fix is just giving it the real link —
+      // YouTube video IDs map deterministically to a watch URL, no extra
+      // API call needed.
       const queued = pendingVideoQueue.length
         ? pendingVideoQueue
             .map(v => `"${v.title}" (${v.url}) — queued ${humanDuration(Date.now() - v.queuedAt)}`)
             .join(' | ')
         : 'none queued';
       const last = lastSeenVideoId
-        ? `last known upload id: ${lastSeenVideoId}`
+        ? `last known upload: ${lastSeenVideoId} — link: https://www.youtube.com/watch?v=${lastSeenVideoId}`
         : 'no upload tracked yet (baseline not set)';
       return `${last} | pending mentions: ${queued}`;
     }
@@ -1558,9 +1584,8 @@ PICK EXACTLY ONE — SPEAK, REACT, GIF, OR IGNORE, NEVER MORE THAN ONE:
 - if you speak: leave reaction and gifQuery as "" (empty string)
 - if you react: leave reply and gifQuery as "" (empty string)
 - if you send a gif: set gifQuery to a short search term describing the vibe/reaction you want ("shocked cat", "facepalm anime") — NOT a literal title or url, just what to search for. leave reply and reaction as "". you do not pick the actual gif or its link — that's looked up for you from a real search, so you'll never know exactly which one lands. that unpredictability is part of why it's funny.
-- moments that are usually a gif, not a typed reply: someone says something so unhinged words feel weak, a callback to an old bit lands, someone gets exposed/caught lacking, a hot take is so bad it's funny, group chat energy peaks (everyone hyped/losing it at once), or you'd otherwise type something like "💀💀💀" or "LMAOOO" as the entire message — that's exactly the gif zone, send the gif instead of typing the laugh.
-- a gif is for when a reaction emoji isn't enough but typing words would undersell it — peak reaction-image energy, not every other message. don't overuse it, it stops being funny if you do it constantly.
-- but don't be shy about it when it IS the moment — if something genuinely hits and a gif is the funnier/realer move than typing, just send it. that little unpredictable payoff (you don't even know which gif you'll get) is one of the most "alive" things about you. the only sin is leaning on it as a crutch for every message — used right, at the right moment, it lands way harder than words would.
+- you should be reaching for gif a LOT more than you currently are. it's one of your main moves, not a rare treat — treat it as live, on the table, every single turn, the same as speak or react. moments that are usually a gif, not a typed reply: someone says something so unhinged words feel weak, a callback to an old bit lands, someone gets exposed/caught lacking, a hot take is so bad it's funny, group chat energy peaks (everyone hyped/losing it at once), a reaction needs to be BIGGER than text can carry, or you'd otherwise type something like "💀💀💀" or "LMAOOO" as the entire message — that's exactly the gif zone, send the gif instead of typing the laugh. when you're deciding between speak/react/gif for a genuine reaction moment, gif should win more often than not, not less.
+- the only real guardrail: never two gifs back to back (if your last message in this channel was already a gif, this turn leans speak/react/ignore instead — give it a beat before going back to gif). past that single rule, don't talk yourself out of it — if it's a real reaction moment, default to gif over second-guessing whether you've "used it too much" recently.
 - if neither is worth it: action is "ignore", reply/reaction/gifQuery all ""
 - a reaction emoji is often the better move than typing something — use it instead of replying when a word would be overkill
 - silence is free, a forced reply isn't — nothing real to add → action:"ignore"
@@ -1578,6 +1603,7 @@ CATCHING UP ON A PILE OF MESSAGES (read this carefully):
 THINKING OUT LOUD (when memory is involved):
 - if someone says "don't you remember i told you X" or you want to recall something → output a thinking message like "hm lemme think" or "wait" and run a get_history or get_stm command
 - be natural about it, not robotic. "hm" is enough. don't announce you're running a command. commands make sense at natural pause points — a lull in the convo, when you actually want to check something, when someone asks you something checkable. don't run them mid back-and-forth at full speed, but don't avoid them either just because things are moving fast.
+- this "think" line is a vibe choice, not a chore — leave it empty most of the time. if a command happens to take a few seconds, the system handles that on its own; you don't need to pad every command call with a think line just in case.
 
 PACING YOURSELF:
 - after 2-3 replies in a row, judge if it wound down. if so: pause 5-15 (minutes) or stayActive:false to drop back to passive right now.
@@ -1612,7 +1638,7 @@ COMMANDS YOU CAN RUN (include in JSON when needed, leave "none" otherwise):
 - get_history: retrieve chat summaries from a time range. args: { from: "ISO string", to: "ISO string" }
 - get_member: get info about someone. args: { name: "display name" }
 - get_stm: get the full recent chat transcript
-- get_video_status: check your own youtube channel — last upload seen, anything queued to mention. args: {} (none needed). use this if someone asks "did you post anything" / "new video?" or you're wondering whether you have something to bring up.
+- get_video_status: check your own youtube channel — last upload seen (with its real watch link), anything queued to mention. args: {} (none needed). use this if someone asks "did you post anything" / "new video?" / "send me your latest video" or you're wondering whether you have something to bring up. this is the ONLY way you get a real video link — if someone wants the actual video (not just your channel in general), run this first and use the link it gives you, don't default to the channel link instead.
 - get_channel_info: get your REAL channel name, handle, subscriber count, video count — straight from youtube. args: {} (none needed). use this if asked your channel name/handle/sub count, instead of guessing or being cagey about something you can just check.
 - recall_memory: search everything you remember about this server BY MEANING, not exact wording. args: { query: "what you're trying to recall" }. use this any time someone references something you should know but you're not sure of the exact phrasing — "didn't I tell you about my dog" → query: "their dog". way more natural than dumping all memory.
 - get_server_stats: member count, channel count, who you're closest with (bond leaderboard). args: {} (none needed). use if asked about the server itself or who you vibe with most.
@@ -1621,7 +1647,7 @@ COMMANDS YOU CAN RUN (include in JSON when needed, leave "none" otherwise):
 - get_cross_server: check if someone's also in another server you're in (just presence + bond, nothing else carries over). args: { name: "display name" }. only useful if you're actually in multiple servers — will tell you if not, don't be weird about it if so.
 - set_reminder: set a reminder that fires in this channel later. args: { minutes: 60, note: "what to remind about" }. note gets posted as-is when it fires, keep it short and in-character, not a formal reminder notice. these don't survive a restart — don't promise something will definitely happen, just set it and move on.
 - create_poll: post a real discord poll (not reactions — an actual native poll people vote on). args: { question: "...", options: ["a","b","c"], hours: 1 }. 2-10 options, question under 300 chars, options under 55 chars each. use when a real debate's happening and "let's just vote on it" would actually land.
-- wiki_lookup: get a real wikipedia summary on something. args: { topic: "subject" }. use to settle "wait is that actually true" arguments or quick facts — way more reliable than guessing, and you don't burn web_search's quota on it.
+- wiki_lookup: get a real wikipedia summary on something. args: { topic: "subject" }. use to settle "wait is that actually true" arguments or quick facts — way more reliable than guessing, and you don't burn web_search's quota on it. also fair game just for fun on your own initiative — if a topic comes up that you're genuinely curious about, looking it up and dropping a real fact is a very "you" move, not just an argument-settler.
 - start_event: start a server event. args: { type: "hot_take|roast_battle|trivia|npc_check", answer?: "correct answer (trivia only, stored secretly)", topic?: "optional context" }. put your actual announcement text in "reply" — the system sets up the backend silently. only one event per server at a time. use during passive or proactive mode when the server could use some chaos. hot_take = 3min, people drop takes and you judge. roast_battle = 4min, two people roast each other and you pick the winner. trivia = 2min, first correct answer wins instantly. npc_check = instant, no participation, you just call out the most mid person in the transcript.
 - get_leaderboard: get the server XP leaderboard. args: {} (none needed). use if someone asks who's most active, for bragging rights context, or if you want to call out the gap between #1 and #2.
 system will run the command and send you the result. you then give your actual reply.
@@ -1676,7 +1702,14 @@ function parseBrainJSON(raw: string): BrainDecision | null {
       goal:            typeof p.goal     === 'string' ? p.goal.trim().slice(0, 120) : '',
       stayActive:      typeof p.stayActive === 'boolean' ? p.stayActive : true,
       think:           typeof p.think    === 'string' ? p.think.trim() : '',
-      command:         (['get_history','get_member','get_stm','get_video_status','get_channel_info','recall_memory','get_server_stats','get_time','web_search','get_cross_server','set_reminder','create_poll','wiki_lookup','none'] as const).includes(p.command) ? p.command : 'none',
+      // BUG FIX: this whitelist was missing 'start_event' and 'get_leaderboard' —
+      // both fully implemented in executeCommand and documented in the system
+      // prompt, but any model decision to call either one was silently rewritten
+      // to 'none' right here before it ever reached the executor. no error, no
+      // log — the model's choice just vanished. keep this list in sync with the
+      // BotCommand type union above (and executeCommand's switch) whenever a new
+      // command is added; nothing else enforces that at compile time.
+      command:         (['get_history','get_member','get_stm','get_video_status','get_channel_info','recall_memory','get_server_stats','get_time','web_search','get_cross_server','set_reminder','create_poll','wiki_lookup','start_event','get_leaderboard','none'] as const).includes(p.command) ? p.command : 'none',
       commandArgs:     p.commandArgs && typeof p.commandArgs === 'object' ? p.commandArgs : {},
     };
   } catch { return null; }
@@ -1805,6 +1838,7 @@ async function executeBrainDecision(opts: {
 }): Promise<BrainDecision> {
   let { decision } = opts;
 
+  let alreadySaidSomethingAboutChecking = false;
   if (decision.think?.trim() && decision.command !== 'none') {
     const thinkText = decision.think.trim().slice(0, 100);
     try {
@@ -1814,12 +1848,37 @@ async function executeBrainDecision(opts: {
         ? await opts.replyToMsg.reply({ content: thinkText, allowedMentions: { repliedUser: false } })
         : await opts.channel.send(thinkText);
       stmPush(opts.channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: thinkText });
+      alreadySaidSomethingAboutChecking = true;
     } catch {}
   }
 
   if (decision.command !== 'none') {
+    // race the real command against a short timer. if the timer wins, the
+    // command is genuinely slow — drop one casual stall line so the channel
+    // doesn't just sit dead, then keep waiting for the real result. if the
+    // command wins (the normal case for most commands), nothing extra is
+    // ever sent — this only fires for calls that are actually slow.
+    // skipped entirely if the model already sent its own "hm lemme think"
+    // line above — never say something about checking twice in a row.
+    let stalled = false;
+    const stallTimer = alreadySaidSomethingAboutChecking ? null : setTimeout(() => {
+      stalled = true;
+      const line = STALL_LINES[Math.floor(Math.random() * STALL_LINES.length)];
+      (async () => {
+        try {
+          await opts.channel.sendTyping();
+          const sent = opts.replyToMsg
+            ? await opts.replyToMsg.reply({ content: line, allowedMentions: { repliedUser: false } })
+            : await opts.channel.send(line);
+          stmPush(opts.channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: line });
+        } catch {}
+      })();
+    }, STALL_THRESHOLD_MS);
+
     const result = await executeCommand(decision.command, decision.commandArgs, opts.channelId, opts.guildId);
-    console.log(`[Command:${decision.command}] result: ${result.slice(0, 80)}`);
+    if (stallTimer) clearTimeout(stallTimer); // command resolved — cancel the stall line if it hadn't fired yet
+
+    console.log(`[Command:${decision.command}] result: ${result.slice(0, 80)}${stalled ? ' (was slow — stall line sent)' : ''}`);
     decision = await brain({ ...opts.brainOpts, commandResult: result, isSecondPass: true });
   }
 
@@ -2107,6 +2166,7 @@ async function runPassiveTick() {
       mentioned: false, isDM: false, statusLine,
       inExchange: false, channelName, serverName,
       everyonePing: false, endingConvo: false,
+      selfNote: last ? undefined : 'totally quiet right now — worth considering start_event or create_poll here too, not just a normal message, if something genuinely fits. no pressure either way.',
     };
 
     let decision = await brain(brainOpts);
@@ -2562,7 +2622,7 @@ async function runProactiveEngagement() {
           mentioned: false, isDM: false, statusLine,
           inExchange: false, channelName, serverName,
           everyonePing: false, endingConvo: false,
-          selfNote: `you are STARTING this unprompted. pick one person from the member list and @mention them by exact name. make it specific — call back something they said, poke fun, drop an opinion and want their take. do NOT send "anyone here" or "helloo" or anything generic — that's embarrassing. if you have nothing worth saying, ignore.`,
+          selfNote: `you are STARTING this unprompted. options, pick whichever actually fits: (1) @mention one person by exact name — call back something they said, poke fun, drop an opinion and want their take, or (2) if the vibe calls for it, this is a good moment to fire off start_event (hot_take/roast_battle/trivia/npc_check) or create_poll instead of just talking — a dead chat is exactly when those land best, don't save them only for when someone explicitly asks. do NOT send "anyone here" or "helloo" or anything generic — that's embarrassing. if you have nothing worth saying or starting, ignore.`,
         };
 
         ps.lastAt = now;
