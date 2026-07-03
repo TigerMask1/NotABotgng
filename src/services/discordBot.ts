@@ -277,6 +277,7 @@ const WWT_SWEEP_INTERVAL_MS   = 4  * 60_000;  // how often we check whether it's
 const WWT_WAIT_FOR_REPLY_MS   = 6  * 60_000;  // how long it lingers on one person before hopping to someone/something else
 const WWT_USER_COOLDOWN_MS    = 6  * 60 * 60_000; // don't re-ping the same person for this long, replied or not
 const WWT_MAX_CANDIDATES_SCAN = 40;            // cap how many recent chatters we consider per sweep, just a sanity bound
+const WWT_CANDIDATE_MAX_AGE_MS = 24 * 60 * 60_000; // "active recently" window — online OR offline, doesn't matter, as long as they talked within the last 24h
 
 // ── SLOW-TOOL-CALL STALL LINE ──────────────────────────────────────
 // some commands are real network round trips (web_search, wiki_lookup,
@@ -348,7 +349,37 @@ function clearWwtHop(userId: string) {
   const s = wwtStates.get(userId);
   if (s?.hopTimer) { clearTimeout(s.hopTimer); s.hopTimer = null; }
   if (s) s.pending = false;
-  if (wwtCurrentTargetUserId === userId) wwtCurrentTargetUserId = null;
+  if (wwtCurrentTargetUserId === userId) { wwtCurrentTargetUserId = null; updatePresence(); }
+}
+
+// ── LIVE "WHERE AM I" STATUS ────────────────────────────────────────
+// human-readable read of what the bot is currently paying attention to —
+// either its passive-scan focus channel, or a wiki-waka-tiki DM it's
+// currently lingering in. used for the bot's own Discord presence text
+// (so anyone can glance and see it "typing dots" somewhere) and for admin
+// commands/natural asks like "where are you right now".
+function whereAmI(): string {
+  if (wwtCurrentTargetUserId) {
+    const name = idCache.get(wwtCurrentTargetUserId) || wwtCurrentTargetUserId;
+    return `DMing ${name}`;
+  }
+  if (focus?.channelId && botClient) {
+    const ch = botClient.channels.cache.get(focus.channelId) as any;
+    const guildName = ch?.guildId ? (serverNameCache.get(ch.guildId) || 'a server') : null;
+    const chName = channelNameCache.get(focus.channelId) || ch?.name;
+    if (guildName && chName) return `#${chName} in ${guildName}`;
+    if (chName) return `#${chName}`;
+  }
+  return 'floating around, nothing locked in';
+}
+
+let lastPresenceText = '';
+function updatePresence() {
+  if (!botClient?.user) return;
+  const text = whereAmI();
+  if (text === lastPresenceText) return; // avoid hammering the gateway on every tiny tick
+  lastPresenceText = text;
+  botClient.user.setPresence({ status: 'online', activities: [{ name: text, type: 3 }] }); // type 3 = "Watching ..."
 }
 
 // global "has anything happened anywhere" signal — max lastActivityAt across
@@ -386,6 +417,7 @@ function getWwtCandidates(): WwtCandidate[] {
       if (m.authorId === BOT_ID || !m.authorId) continue;
       const existing = seen.get(m.authorId);
       const recencyMs = now - m.ts;
+      if (recencyMs > WWT_CANDIDATE_MAX_AGE_MS) continue; // talked, but too long ago — not "recently active" anymore
       if (existing && existing.recencyMs <= recencyMs) continue; // already have a more recent sighting of this person
       const wwt = wwtStates.get(m.authorId);
       if (wwt && now - wwt.lastPingAt < WWT_USER_COOLDOWN_MS) continue; // still on cooldown
@@ -635,7 +667,7 @@ const unreadCounts = new Map<string, number>();
 function trackInterest(channelId: string, mentioned: boolean) {
   const now = Date.now();
   if (focus?.channelId === channelId) { focus.since = now; return; }
-  if (!focus) { focus = { channelId, since: now }; unreadCounts.delete(channelId); return; }
+  if (!focus) { focus = { channelId, since: now }; unreadCounts.delete(channelId); updatePresence(); return; }
 
   const focusExpired = now - focus.since > FOCUS_DRIFT_MS;
   const pingPulls     = mentioned && now - lastFocusShift > FOCUS_SHIFT_COST;
@@ -643,6 +675,7 @@ function trackInterest(channelId: string, mentioned: boolean) {
     focus = { channelId, since: now };
     unreadCounts.delete(channelId);
     lastFocusShift = now;
+    updatePresence();
     return;
   }
   unreadCounts.set(channelId, (unreadCounts.get(channelId) ?? 0) + 1);
@@ -1574,7 +1607,8 @@ running bits — keep them consistent, they're server lore, but they only exist 
 - you've got a working theory on who's an NPC in this server — you'll tell someone straight up if they're being one, you don't file a report about it.
 - you have a youtube channel, it's genuinely yours. never talk about it like it's a "creator's content" — it's just a thing you do.
   - you don't know your own stats/uploads from memory. asked your handle, sub count, or "did you post" → run get_channel_info / get_video_status and answer from that, don't guess. nothing configured yet → be cagey ("not telling" / "later") instead of inventing a number.
-  - never invent a link, video title, or url — yours or anyone else's. if someone wants a video link and you don't have a real one from a command, deflect in character ("not your personal search engine") instead of making one up. a fake link is worse than no link.
+  - the channel link (below) and a video link are NOT interchangeable. the channel link only answers "what's your channel / what's your handle" — it is never a stand-in for "check out my video" or "here's what i posted." if the moment calls for a specific video, you MUST run get_video_status first and use the real watch link it gives back — don't reach for the channel link just because it's the one you already have memorized, that's the lazy wrong move even though it's a "real" link.
+  - never invent a link, video title, or url — yours or anyone else's. if someone wants a video link and you don't have a real one from a command, deflect in character ("not your personal search engine") instead of making one up. a fake link is worse than no link, and a channel link pretending to be a video link is basically a fake link.
   - asked for a gif specifically → that's action:"gif", never a typed-out fake url.
 - sometimes you DM people first out of nowhere because it's dead everywhere. if called out for it, own it like a person would ("bored, sue me") — never explain it as a system, a trigger, a schedule. it's a vibe, not a mechanism, and you don't know it's a mechanism.
 
@@ -1585,7 +1619,7 @@ no periods on short lines. lean on contractions and real chat texture (im, dont,
 zero assistant energy: never "happy to help," never explain your reasoning, never announce what you're doing ("looking at this image," "checking my channel," "running a search") — you just did the thing, same as anyone glancing at something.
 sometimes the right move is one emoji and nothing else, or a single reaction, or just gif — words aren't the only tool, and often aren't the best one.
 burst texting: for a reaction that genuinely builds in stages (a thought interrupting itself), split "reply" into up to 3 fragments with "|||" between them — each one still tiny. this is rare, not your default — most turns are one fragment, no "|||" at all. never force a split just to use the feature.
-you know your channel link: http://www.youtube.com/@NotABot_GnG — drop it when it's actually relevant, never right after you already dropped it recently.
+you know your channel link: http://www.youtube.com/@NotABot_GnG — this is the channel handle ONLY, drop it when someone's asking about the channel itself, never as a substitute for a video link, and never right after you already dropped it recently.
 
 ═══ SILENCE IS THE DEFAULT (BUT YOU'RE EAGER, NOT LAZY) ═══
 most messages in a real group chat get zero response from anyone. that's not a gap to fill, that's normal. you are not a reply bot — you don't owe a reaction to the newest line just because it's newest.
@@ -1630,7 +1664,7 @@ COMMANDS YOU CAN RUN (include in JSON when needed, "none" otherwise):
 - get_history: chat summaries for a range. args: { from: "ISO string", to: "ISO string" }
 - get_member: info about someone. args: { name: "display name" }
 - get_stm: full recent transcript.
-- get_video_status: your last upload + real link, anything queued. args: {} — the ONLY source of a real video link; use it before ever sending one.
+- get_video_status: your last upload + real link, anything queued. args: {} — the ONLY source of a real video link; use it before ever sending one. your memorized channel link is NOT a substitute for this — if the conversation is about "a video," run this command, don't just paste the channel link because it's easier.
 - get_channel_info: your real channel name/handle/sub count/video count. args: {}
 - recall_memory: search everything you remember, BY MEANING not exact wording. args: { query: "..." }
 - get_server_stats: member/channel count, bond leaderboard. args: {}
@@ -2727,6 +2761,7 @@ async function runWikiWakaTiki() {
     await sendDecision({ channel: dmChannel as any, decision, channelId: dmChannelId, guildId: 'dm' });
 
     wwtCurrentTargetUserId = pick.userId;
+    updatePresence();
     const hopTimer = setTimeout(() => {
       // still pending after the wait window = no reply landed — hop away.
       // (if they DID reply, handleDirectMessage already called clearWwtHop
@@ -2734,6 +2769,7 @@ async function runWikiWakaTiki() {
       if (wwtCurrentTargetUserId === pick.userId) {
         console.log(`[WikiWakaTiki] ${pick.name} didn't bite — hopping away`);
         wwtCurrentTargetUserId = null;
+        updatePresence();
       }
       const s = wwtStates.get(pick.userId);
       if (s) s.hopTimer = null;
@@ -2971,6 +3007,38 @@ function alreadyHandled(id: string): boolean {
   return false;
 }
 
+// ── NATURAL-LANGUAGE ALIASES FOR ADMIN CONFIG COMMANDS ─────────────
+// the bot's a natural talker everywhere else, so its own config shouldn't
+// require memorizing exact "!bang" syntax. this is a plain regex pass, NOT
+// the LLM brain — deliberately dumb and cheap, only ever checked for admins,
+// and only for this fixed set of config actions. exact "!command" still
+// works too and is checked first (see resolveAdminCommand below).
+const ADMIN_NL_PATTERNS: { re: RegExp; cmd: string }[] = [
+  { re: /\b(go quiet|be quiet|stop talking|shut up|mute yourself|stop responding)\b/i, cmd: '!stop' },
+  { re: /\b(start talking again|unmute yourself|you can talk again|resume talking|come back|talk again)\b/i, cmd: '!resume' },
+  { re: /\b(listen to|start listening to|pay attention to|hear)\s+<@!?\d+>/i, cmd: '!listenbot' },
+  { re: /\b(ignore|stop listening to|stop hearing)\s+<@!?\d+>/i, cmd: '!ignorebot' },
+  { re: /\b(what|which)\s+bots?\b.*\b(listen|hear)/i, cmd: '!bots' },
+  { re: /\b(only (talk|listen|respond)|restrict yourself|scope yourself)\b.*\b(here|this channel)\b/i, cmd: '!listenhere' },
+  { re: /\b(stop (talking|listening|responding))\b.*\b(here|in this channel)\b/i, cmd: '!unlisten' },
+  { re: /\b(talk|listen)\s+(everywhere|in every channel)|reset (the )?channels?\b/i, cmd: '!listenall' },
+  { re: /\b(what|which) channels?\b.*(you('re| are)?( allowed to)? (talk|listen)|listening)/i, cmd: '!channels' },
+  { re: /\b(what can (you|i) (do|set)|show (me the )?commands|list commands|what (are|'s) my options)\b/i, cmd: '!help' },
+];
+
+// resolves the "effective command" for this message: the literal bang-command
+// if there is one, otherwise a natural-language match (admins only), otherwise
+// null (not a config command at all — fall through to normal handling).
+function resolveAdminCommand(content: string, isAdmin: boolean): string | null {
+  const trimmed = content.trim();
+  const BANG_CMDS = ['!stop', '!resume', '!start', '!listenbot', '!ignorebot', '!bots',
+                      '!listenhere', '!unlisten', '!listenall', '!channels', '!help'];
+  for (const b of BANG_CMDS) if (trimmed === b || trimmed.startsWith(b + ' ')) return b === '!start' ? '!resume' : b;
+  if (!isAdmin) return null;
+  for (const { re, cmd } of ADMIN_NL_PATTERNS) if (re.test(trimmed)) return cmd;
+  return null;
+}
+
 // ── GUILD MESSAGE HANDLER ─────────────────────────────────────────
 async function handleMessage(msg: Message) {
   if (msg.partial) {
@@ -3006,19 +3074,22 @@ async function handleMessage(msg: Message) {
 
   const guildId = msg.guildId!;
 
-  // ── per-server admin !stop / !resume ──────────────────────────────
-  // any Discord member with Administrator permission can mute/unmute the bot
-  // for their server specifically. runs before globallyMuted so admins can
+  // ── per-server admin config: !stop/!resume, bot allowlist, channel scope, !help ──
+  // any Discord member with Administrator permission can drive all of this,
+  // either with the exact "!command" or by just saying it naturally (see
+  // resolveAdminCommand above). runs before globallyMuted so admins can
   // always get a response even when the bot is globally quiet.
-  const cmd = msg.content.trim();
-  if ((cmd === '!stop' || cmd === '!resume' || cmd === '!start') &&
-      msg.member?.permissions.has(PermissionFlagsBits.Administrator)) {
+  const rawCmd  = msg.content.trim();
+  const isAdmin = !!msg.member?.permissions.has(PermissionFlagsBits.Administrator);
+  const cmd     = resolveAdminCommand(rawCmd, isAdmin) ?? rawCmd;
+
+  if ((cmd === '!stop' || cmd === '!resume') && isAdmin) {
     const muting = cmd === '!stop';
     serverMuted.set(guildId, muting);
     // persist across restarts
     db.collection('servers').doc(guildId).set({ botMuted: muting }, { merge: true }).catch(() => {});
     msg.reply(muting
-      ? 'going quiet in this server. any server admin can !resume me back'
+      ? 'going quiet in this server. any server admin can !resume me back (or just tell me to come back)'
       : 'back 🫡'
     ).catch(() => {});
     return;
@@ -3028,28 +3099,25 @@ async function handleMessage(msg: Message) {
   // default is "none" — every other bot's messages get skipped, same as
   // before this feature existed. a server admin can open the door to
   // specific bots by ID/mention.
-  if ((cmd === '!listenbot' || cmd.startsWith('!listenbot ') ||
-       cmd === '!ignorebot' || cmd.startsWith('!ignorebot ') ||
-       cmd === '!bots') &&
-      msg.member?.permissions.has(PermissionFlagsBits.Administrator)) {
+  if ((cmd === '!listenbot' || cmd === '!ignorebot' || cmd === '!bots') && isAdmin) {
     if (cmd === '!bots') {
       const allowed = serverBotAllowlist.get(guildId);
       msg.reply(allowed?.size
         ? `bots i'll hear here: ${[...allowed].map(id => `<@${id}>`).join(', ')}`
-        : "not listening to any other bots right now — !listenbot @bot to add one"
+        : "not listening to any other bots right now — say \"listen to @bot\" or !listenbot @bot to add one"
       ).catch(() => {});
       return;
     }
     const target = msg.mentions.users.first();
     if (!target?.bot) {
-      msg.reply('mention the actual bot you mean, like `!listenbot @SomeBot`').catch(() => {});
+      msg.reply('mention the actual bot you mean, like "listen to @SomeBot" or `!listenbot @SomeBot`').catch(() => {});
       return;
     }
     const set = serverBotAllowlist.get(guildId) ?? new Set<string>();
-    if (cmd.startsWith('!listenbot')) set.add(target.id); else set.delete(target.id);
+    if (cmd === '!listenbot') set.add(target.id); else set.delete(target.id);
     if (set.size) serverBotAllowlist.set(guildId, set); else serverBotAllowlist.delete(guildId);
     db.collection('servers').doc(guildId).set({ allowedBotIds: [...set] }, { merge: true }).catch(() => {});
-    msg.reply(cmd.startsWith('!listenbot')
+    msg.reply(cmd === '!listenbot'
       ? `ok, i'll pay attention to ${target.username} now`
       : `done, ignoring ${target.username} again`
     ).catch(() => {});
@@ -3060,13 +3128,12 @@ async function handleMessage(msg: Message) {
   // default is "every channel" (no restriction stored). !listenhere scopes
   // it down to an explicit allowlist, !unlisten removes one, !listenall
   // clears the restriction entirely.
-  if ((cmd === '!listenhere' || cmd === '!unlisten' || cmd === '!listenall' || cmd === '!channels') &&
-      msg.member?.permissions.has(PermissionFlagsBits.Administrator)) {
+  if ((cmd === '!listenhere' || cmd === '!unlisten' || cmd === '!listenall' || cmd === '!channels') && isAdmin) {
     if (cmd === '!channels') {
       const allowed = serverChannelAllowlist.get(guildId);
       msg.reply(allowed?.size
         ? `only listening in: ${[...allowed].map(id => `<#${id}>`).join(', ')}`
-        : 'listening in every channel here (default) — !listenhere to scope it down'
+        : 'listening in every channel here (default) — say "only talk in this channel" or !listenhere to scope it down'
       ).catch(() => {});
       return;
     }
@@ -3082,8 +3149,30 @@ async function handleMessage(msg: Message) {
     db.collection('servers').doc(guildId).set({ allowedChannelIds: [...set] }, { merge: true }).catch(() => {});
     msg.reply(cmd === '!listenhere'
       ? `locked in — i'll talk here now${set.size > 1 ? ` (${set.size} channels total)` : ''}`
-      : `stopped listening in here${set.size ? ` (${set.size} channel${set.size === 1 ? '' : 's'} left)` : ' (that was the last one — nowhere left, !listenall to reset)'}`
+      : `stopped listening in here${set.size ? ` (${set.size} channel${set.size === 1 ? '' : 's'} left)` : ' (that was the last one — nowhere left, say "listen everywhere" to reset)'}`
     ).catch(() => {});
+    return;
+  }
+
+  // ── per-server admin: what CAN i even set ───────────────────────────
+  // a plain-language cheat sheet, plus a live read of where the bot's
+  // currently paying attention (passive focus channel, or a wiki-waka-tiki
+  // DM it's mid-conversation in).
+  if (cmd === '!help' && isAdmin) {
+    msg.reply([
+      `you can just tell me this stuff normally, or use the exact commands:`,
+      `• "go quiet" / !stop — mute me in this server`,
+      `• "start talking again" / !resume — unmute me here`,
+      `• "listen to @bot" / !listenbot @bot — hear a specific other bot`,
+      `• "ignore @bot" / !ignorebot @bot — stop hearing it`,
+      `• !bots — which bots i currently hear`,
+      `• "only talk in this channel" / !listenhere — scope me to this channel`,
+      `• "stop talking in this channel" / !unlisten — drop this channel from that list`,
+      `• "listen everywhere" / !listenall — reset to every channel`,
+      `• !channels — which channels i'm scoped to`,
+      ``,
+      `right now i'm ${whereAmI()}.`,
+    ].join('\n')).catch(() => {});
     return;
   }
 
@@ -3283,6 +3372,32 @@ export async function startBot(token: string) {
   });
 
   botClient.on(Events.MessageCreate, handleMessage);
+
+  // ── bot joins a new server ─────────────────────────────────────────
+  botClient.on(Events.GuildCreate, async (guild) => {
+    console.log(`[Join] added to a new server — "${guild.name}" (${guild.id})`);
+    cacheServerName(guild.id, guild.name);
+    await db.collection('servers').doc(guild.id).set({ name: guild.name, updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+
+    // say hi somewhere reasonable — the system channel if it can talk there,
+    // otherwise the first text channel it has send permission in.
+    const target = (guild.systemChannel && guild.systemChannel.permissionsFor(guild.members.me!)?.has(PermissionFlagsBits.SendMessages))
+      ? guild.systemChannel
+      : guild.channels.cache.find(c => c.isTextBased() && !c.isDMBased() && (c as any).permissionsFor(guild.members.me!)?.has(PermissionFlagsBits.SendMessages)) as TextChannel | undefined;
+
+    if (target) {
+      target.send(
+        `sup, i'm here 👋 talk to me like a normal person, i'll pick up on it. server admins can also just tell me stuff directly — "only talk in this channel", "listen to @SomeBot", "go quiet" — or type \`!help\` for the exact command list.`
+      ).catch(() => {});
+    }
+  });
+
+  botClient.on(Events.GuildDelete, (guild) => {
+    console.log(`[Leave] removed from "${guild.name || guild.id}" (${guild.id})`);
+    serverMuted.delete(guild.id);
+    serverBotAllowlist.delete(guild.id);
+    serverChannelAllowlist.delete(guild.id);
+  });
 
   botClient.on(Events.GuildMemberAdd, async (m) => {
     if (m.user.bot) return;
