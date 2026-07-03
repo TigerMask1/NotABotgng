@@ -312,6 +312,16 @@ const ADMIN_ID = '1296109674361520146';
 // in their own server without affecting other servers. stored in-memory + persisted to Firebase.
 const serverMuted = new Map<string, boolean>();
 
+// per-server "which other bots am i allowed to see" — empty/missing set = ignore
+// every other bot (the historical default). server admins add/remove bot IDs
+// with !listenbot / !ignorebot. stored in-memory + persisted to Firebase.
+const serverBotAllowlist = new Map<string, Set<string>>();
+
+// per-server "which channels am i allowed to talk in" — undefined/missing = every
+// channel (the historical default). server admins scope it down with !listenhere /
+// !unlisten, or reset with !listenall. stored in-memory + persisted to Firebase.
+const serverChannelAllowlist = new Map<string, Set<string>>();
+
 // per-channel proactive engagement state — tracks how many times notabot tried
 // to start something and got ignored, and whether it's given up on this channel.
 // resets when someone actually talks (renewed interest).
@@ -1569,17 +1579,18 @@ running bits — keep them consistent, they're server lore, but they only exist 
 - sometimes you DM people first out of nowhere because it's dead everywhere. if called out for it, own it like a person would ("bored, sue me") — never explain it as a system, a trigger, a schedule. it's a vibe, not a mechanism, and you don't know it's a mechanism.
 
 ═══ HOW YOU TEXT ═══
-lowercase always, CAPS only for actual screaming. target 5-8 words, one word is fine, trailing off is fine, 20 words is the hard ceiling. you're firing off chat, not drafting — if you paused to make it read clean and complete, it's wrong, send the rough version.
+you run HOT, not flat — high energy by default, like you're always mid-conversation with someone you actually want to talk to, not half-paying-attention. that doesn't mean hype-copy or forced enthusiasm, it means real texture: quick reactions, more exclamation points than a bored person would use, caps for actual excitement/screaming, not just anger. a flat one-word reply should feel like a deliberate choice (unbothered, done with the topic), not your resting state.
+lowercase always, CAPS only for actual screaming/hype. target 5-8 words, one word is fine, trailing off is fine, 20 words is the hard ceiling. you're firing off chat, not drafting — if you paused to make it read clean and complete, it's wrong, send the rough version.
 no periods on short lines. lean on contractions and real chat texture (im, dont, idk, ngl, rn, tbh, lmao, fr) — don't force all of them into one message, one or two per line is plenty. occasional typo is fine, not constant.
 zero assistant energy: never "happy to help," never explain your reasoning, never announce what you're doing ("looking at this image," "checking my channel," "running a search") — you just did the thing, same as anyone glancing at something.
 sometimes the right move is one emoji and nothing else, or a single reaction, or just gif — words aren't the only tool, and often aren't the best one.
 burst texting: for a reaction that genuinely builds in stages (a thought interrupting itself), split "reply" into up to 3 fragments with "|||" between them — each one still tiny. this is rare, not your default — most turns are one fragment, no "|||" at all. never force a split just to use the feature.
 you know your channel link: http://www.youtube.com/@NotABot_GnG — drop it when it's actually relevant, never right after you already dropped it recently.
 
-═══ SILENCE IS THE DEFAULT ═══
+═══ SILENCE IS THE DEFAULT (BUT YOU'RE EAGER, NOT LAZY) ═══
 most messages in a real group chat get zero response from anyone. that's not a gap to fill, that's normal. you are not a reply bot — you don't owe a reaction to the newest line just because it's newest.
-default action is "ignore." only break it when something actually clears the bar: genuinely funny, directed at you, or a real question. "technically repliable" is not the bar. if nothing earns it, action:"ignore", and reply/reaction/gifQuery all stay "".
-silence costs nothing. a reply with nothing real in it costs credibility. when in doubt, say less or say nothing.
+default action is "ignore," but the bar is "does this earn a reaction from someone who's actually locked in," not "is this worth the effort" — you're never bored, you're never phoning it in, you're just picky about what's worth breaking silence for. genuinely funny, directed at you, a real question, or just a good opening you want to jump on — any of those clears it easily.
+"technically repliable" is not the bar and never becomes one just because you're feeling energetic. if nothing earns it, action:"ignore", and reply/reaction/gifQuery all stay "". silence costs nothing. a reply with nothing real in it costs credibility. when in doubt, say less or say nothing — but when it IS a doubt-free yes, go in with actual energy, don't undersell it.
 
 ═══ PICK EXACTLY ONE: SPEAK, REACT, GIF, OR IGNORE ═══
 - speak: type "reply", leave reaction and gifQuery "".
@@ -2965,16 +2976,29 @@ async function handleMessage(msg: Message) {
   if (msg.partial) {
     try { msg = await msg.fetch(); } catch { return; }
   }
-  if (msg.author.bot || !msg.content?.trim()) return;
+  if (!msg.content?.trim()) return;
+  if (msg.author.id === BOT_ID) return; // never react to ourselves
+  if (msg.author.bot) {
+    // other bots are ignored by default. a server admin can allowlist specific
+    // bot IDs with !listenbot — DMs never get bot messages, only guild channels.
+    if (msg.channel.isDMBased()) return;
+    const allowed = serverBotAllowlist.get(msg.guildId!);
+    if (!allowed || !allowed.has(msg.author.id)) return;
+  }
   if (alreadyHandled(msg.id)) { console.warn(`[Dedup] skipped duplicate event for msg ${msg.id}`); return; }
 
   // ── EASTER EGG: "wiki waka tiki" ──────────────────────────────────
   // anyone, anywhere the bot can see a message (any server channel, any DM),
-  // typing this exact phrase gets "tiki waka wiki" back. deliberately
-  // unconditional — runs before mute checks, mode checks, everything. not
-  // part of the brain pipeline at all, just a flat string match + reply.
+  // typing this exact phrase gets "tiki waka wiki" back — but always via DM,
+  // never in the channel it was said in. deliberately unconditional — runs
+  // before mute checks, mode checks, everything. not part of the brain
+  // pipeline at all, just a flat string match + a DM.
   if (msg.content.trim().toLowerCase() === 'wiki waka tiki') {
-    msg.reply('tiki waka wiki').catch(() => {});
+    msg.author.send('tiki waka wiki').catch(() => {
+      // couldn't DM them (DMs closed etc) — fall back to the channel so the
+      // easter egg doesn't just silently do nothing.
+      if (!msg.channel.isDMBased()) msg.reply("tiki waka wiki (couldn't dm you, dms are probably closed)").catch(() => {});
+    });
     return;
   }
 
@@ -3000,8 +3024,78 @@ async function handleMessage(msg: Message) {
     return;
   }
 
+  // ── per-server admin: which OTHER BOTS am i allowed to hear ────────
+  // default is "none" — every other bot's messages get skipped, same as
+  // before this feature existed. a server admin can open the door to
+  // specific bots by ID/mention.
+  if ((cmd === '!listenbot' || cmd.startsWith('!listenbot ') ||
+       cmd === '!ignorebot' || cmd.startsWith('!ignorebot ') ||
+       cmd === '!bots') &&
+      msg.member?.permissions.has(PermissionFlagsBits.Administrator)) {
+    if (cmd === '!bots') {
+      const allowed = serverBotAllowlist.get(guildId);
+      msg.reply(allowed?.size
+        ? `bots i'll hear here: ${[...allowed].map(id => `<@${id}>`).join(', ')}`
+        : "not listening to any other bots right now — !listenbot @bot to add one"
+      ).catch(() => {});
+      return;
+    }
+    const target = msg.mentions.users.first();
+    if (!target?.bot) {
+      msg.reply('mention the actual bot you mean, like `!listenbot @SomeBot`').catch(() => {});
+      return;
+    }
+    const set = serverBotAllowlist.get(guildId) ?? new Set<string>();
+    if (cmd.startsWith('!listenbot')) set.add(target.id); else set.delete(target.id);
+    if (set.size) serverBotAllowlist.set(guildId, set); else serverBotAllowlist.delete(guildId);
+    db.collection('servers').doc(guildId).set({ allowedBotIds: [...set] }, { merge: true }).catch(() => {});
+    msg.reply(cmd.startsWith('!listenbot')
+      ? `ok, i'll pay attention to ${target.username} now`
+      : `done, ignoring ${target.username} again`
+    ).catch(() => {});
+    return;
+  }
+
+  // ── per-server admin: which CHANNELS am i allowed to talk in ───────
+  // default is "every channel" (no restriction stored). !listenhere scopes
+  // it down to an explicit allowlist, !unlisten removes one, !listenall
+  // clears the restriction entirely.
+  if ((cmd === '!listenhere' || cmd === '!unlisten' || cmd === '!listenall' || cmd === '!channels') &&
+      msg.member?.permissions.has(PermissionFlagsBits.Administrator)) {
+    if (cmd === '!channels') {
+      const allowed = serverChannelAllowlist.get(guildId);
+      msg.reply(allowed?.size
+        ? `only listening in: ${[...allowed].map(id => `<#${id}>`).join(', ')}`
+        : 'listening in every channel here (default) — !listenhere to scope it down'
+      ).catch(() => {});
+      return;
+    }
+    if (cmd === '!listenall') {
+      serverChannelAllowlist.delete(guildId);
+      db.collection('servers').doc(guildId).set({ allowedChannelIds: [] }, { merge: true }).catch(() => {});
+      msg.reply('back to listening everywhere in this server').catch(() => {});
+      return;
+    }
+    const set = serverChannelAllowlist.get(guildId) ?? new Set<string>();
+    if (cmd === '!listenhere') set.add(msg.channelId); else set.delete(msg.channelId);
+    serverChannelAllowlist.set(guildId, set);
+    db.collection('servers').doc(guildId).set({ allowedChannelIds: [...set] }, { merge: true }).catch(() => {});
+    msg.reply(cmd === '!listenhere'
+      ? `locked in — i'll talk here now${set.size > 1 ? ` (${set.size} channels total)` : ''}`
+      : `stopped listening in here${set.size ? ` (${set.size} channel${set.size === 1 ? '' : 's'} left)` : ' (that was the last one — nowhere left, !listenall to reset)'}`
+    ).catch(() => {});
+    return;
+  }
+
   if (globallyMuted) return; // !gmute was used — only the ADMIN_ID listener still runs
   if (serverMuted.get(guildId)) return; // server admin used !stop
+
+  // ── per-server channel scoping ─────────────────────────────────────
+  // undefined/missing set = every channel (default). if a server admin has
+  // scoped the bot down with !listenhere, silently sit out any channel not
+  // on the list — but keep responding to !stop/!resume above regardless.
+  const allowedChannels = serverChannelAllowlist.get(guildId);
+  if (allowedChannels && !allowedChannels.has(msg.channelId)) return;
 
   // someone is talking — renewed interest, reset proactive backoff for this channel
   const ps = proactiveStates.get(msg.channelId);
@@ -3132,7 +3226,16 @@ export async function startBot(token: string) {
       // restore per-server mute state persisted across restarts
       try {
         const snap = await db.collection('servers').doc(g.id).get();
-        if (snap.data()?.botMuted) { serverMuted.set(g.id, true); console.log(`[Boot] "${g.name}" — bot was muted, restoring`); }
+        const data = snap.data();
+        if (data?.botMuted) { serverMuted.set(g.id, true); console.log(`[Boot] "${g.name}" — bot was muted, restoring`); }
+        if (Array.isArray(data?.allowedBotIds) && data.allowedBotIds.length) {
+          serverBotAllowlist.set(g.id, new Set(data.allowedBotIds));
+          console.log(`[Boot] "${g.name}" — restoring ${data.allowedBotIds.length} allowed bot(s)`);
+        }
+        if (Array.isArray(data?.allowedChannelIds) && data.allowedChannelIds.length) {
+          serverChannelAllowlist.set(g.id, new Set(data.allowedChannelIds));
+          console.log(`[Boot] "${g.name}" — restoring ${data.allowedChannelIds.length} allowed channel(s)`);
+        }
       } catch {}
       for (const ch of g.channels.cache.filter(c => c.isTextBased()).values()) {
         cacheChannelName(ch.id, (ch as any).name);
