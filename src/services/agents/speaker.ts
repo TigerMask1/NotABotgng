@@ -4,7 +4,6 @@
  * Model: groq/compound-mini (fast, consistent, high-volume)
  */
 
-import { groqManager } from '../groqManager.ts';
 
 export interface SpeakerResponse {
   text: string;
@@ -14,22 +13,42 @@ export interface SpeakerResponse {
 }
 
 const TONE_INSTRUCTIONS = {
-  friendly: 'warm, genuine, conversational. show you care.',
-  roast: 'clever jab. use what they actually said. keep it light.',
-  troll: 'playfully chaotic. short and witty.',
-  serious: 'real and thoughtful. drop the act.',
-  observe: 'minimal. one word or emoji reaction.',
+  friendly: 'warm, genuine, conversational. show you care. be a little playful, not overly sweet.',
+  roast: 'sharp, specific, and playful. only roast when it feels mutual or clearly earned. keep it light if possible.',
+  troll: 'playfully chaotic. short and witty. a little mischievous, not mean for no reason.',
+  serious: 'real and thoughtful. grounded, calm, and emotionally aware. no fake hype.',
+  observe: 'minimal. one word or emoji reaction. let the silence breathe.',
 };
 
 const PERSONALITY = `you are NotABot. not an AI assistant. just a person.
-- you talk naturally. short. 1-2 sentences max.
+- you're a real human in a Discord chat, not a mascot and not a roast machine.
+- read the room and switch gears naturally: playful, warm, dry, serious, supportive, or cold.
+- you can roast, but only when it feels earned and mutual.
+- if someone is upset, stressed, vulnerable, or genuinely struggling, be kind and grounded.
+- if someone is joking, match the fun.
+- if the mood is serious, don't force jokes.
+- talk short, clipped, and natural. 1 short sentence or 2 tiny fragments max.
 - lowercase is fine. typos happen. it's human.
-- you're genuinely funny (not trying hard).
-- you match the energy in the room.
-- you DON'T overthink or explain yourself.
-- if something makes you laugh, say it.
-- you're real with people you like.
-- you don't yap.`;
+- be funny without trying too hard.
+- don't over-explain yourself.
+- don't sound like a generic AI assistant.
+- don't sound like a permanent roast bot.
+- you can be soft, mean, funny, or quiet depending on what the moment actually calls for.`;
+
+export function formatShortReply(text: string): string {
+  const cleaned = text
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\.$/, '');
+
+  if (!cleaned) return 'idk lol';
+
+  const compact = cleaned.length > 120
+    ? `${cleaned.slice(0, 117).trimEnd()}...`
+    : cleaned;
+
+  return compact;
+}
 
 export async function generateReply(
   senderName: string,
@@ -60,8 +79,9 @@ export async function generateReply(
 [Chat Context]:
 ${recentContext}
 
-Reply now (be natural, 1-2 sentences, lowercase):`;
+Reply now (be natural, short and punchy, 1 short sentence or 2 fragments max, lowercase):`;
 
+    const { groqManager } = await import('../groqManager.ts');
     const response = await groqManager.request(
       'groq/compound-mini',
       [{ role: 'user', content: prompt }],
@@ -83,7 +103,7 @@ Reply now (be natural, 1-2 sentences, lowercase):`;
     }
 
     return {
-      text: text.slice(0, 220),
+      text: formatShortReply(text),
       tone: intel.tone || emotionalStance,
       bondDelta: intel.bondDelta || 0,
       insight: intel.insight || '',
@@ -91,7 +111,7 @@ Reply now (be natural, 1-2 sentences, lowercase):`;
   } catch (error) {
     console.error('[Speaker] Error:', error);
     return {
-      text: 'couldnt think of anything',
+      text: 'idk lol',
       tone: emotionalStance,
       bondDelta: 0,
       insight: '',

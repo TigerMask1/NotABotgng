@@ -1,8 +1,16 @@
 import {
   Client, GatewayIntentBits, Message, Partials,
-  Events, TextChannel, PermissionFlagsBits,
+  Events, TextChannel, PermissionFlagsBits, ChannelType, InviteTargetType,
 } from 'discord.js';
+import {
+  joinVoiceChannel,
+  VoiceConnection,
+  entersState,
+  VoiceConnectionStatus,
+} from '@discordjs/voice';
 import { db } from './firebase.ts';
+import { extractRequestedActivity, resolveActivityAppId } from './discordActivities.ts';
+import { resolveReplyTarget } from './replyTarget.ts';
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
@@ -2975,12 +2983,11 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
   else if (unprompted) state.consecutiveUnpromptedReplies++;
 
   // resolve which message the model wants to reply/react to.
-  // if replyToMsgId is empty, targetMsg is undefined — sendDecision will
-  // just channel.send() instead of threading, which is correct for casual
-  // banter that doesn't need a reply tag.
-  const targetMsg = decision.replyToMsgId
-    ? (batch.find(b => b.msg.id === decision.replyToMsgId)?.msg ?? last)
-    : undefined;
+  // if replyToMsgId is empty or points to a message we don't actually have in
+  // this batch, fall back to a plain channel message instead of replying to
+  // the wrong message by accident. this keeps normal chat messages from being
+  // mis-threaded when the model is just trying to send a normal line.
+  const targetMsg = resolveReplyTarget(decision.replyToMsgId, batch, last);
 
   await sendDecision({ channel: last.channel, decision, channelId, guildId, replyToMsg: targetMsg });
   advanceMarker(channelId, liveMsgs.map(m => m.id), decision);
@@ -3271,6 +3278,10 @@ async function handleMessage(msg: Message) {
   } catch (e) { console.error('[Handler outer]', e); }
 }
 
+async function handleActivityRequest(msg: Message) {
+  return;
+}
+
 // ── STARTUP ───────────────────────────────────────────────────────
 export async function startBot(token: string) {
   if (botClient) return;
@@ -3279,6 +3290,7 @@ export async function startBot(token: string) {
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.GuildVoiceStates,
       GatewayIntentBits.DirectMessages,
       GatewayIntentBits.DirectMessageReactions,
       GatewayIntentBits.DirectMessageTyping,
