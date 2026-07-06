@@ -1,16 +1,8 @@
 import {
   Client, GatewayIntentBits, Message, Partials,
-  Events, TextChannel, PermissionFlagsBits, ChannelType, InviteTargetType,
+  Events, TextChannel, PermissionFlagsBits,
 } from 'discord.js';
-import {
-  joinVoiceChannel,
-  VoiceConnection,
-  entersState,
-  VoiceConnectionStatus,
-} from '@discordjs/voice';
 import { db } from './firebase.ts';
-import { extractRequestedActivity, resolveActivityAppId } from './discordActivities.ts';
-import { resolveReplyTarget } from './replyTarget.ts';
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
@@ -271,8 +263,8 @@ const PROACTIVE_QUIET_MS    = 35 * 60_000;  // channel must be this silent befor
 const PROACTIVE_MIN_GAP_MS  = 50 * 60_000;  // minimum gap between proactive attempts (doubles each strike)
 const PROACTIVE_MAX_STRIKES = 3;             // ignored this many times in a row → lose interest in this channel
 
-// ── WIKI WAKA TIKI CONSTANTS ──────────────────────────────────────
-// "wiki waka tiki" — the bot's proactive DM-hopping behavior. when EVERY
+// ── COLD OPEN CONSTANTS ────────────────────────────────────────────
+// "cold open" — the bot's proactive DM-hopping behavior. when EVERY
 // server has gone quiet (not just one channel — this is a global signal,
 // separate from per-channel PROACTIVE_* above), the bot picks one real
 // person from any mutual server, slides into their DMs with a short
@@ -280,12 +272,16 @@ const PROACTIVE_MAX_STRIKES = 3;             // ignored this many times in a row
 // on that person for a while and the next sweep tries someone else instead.
 // the point is "always talkative, never clingy" — one shot per person per
 // cooldown, never a repeat ping while a previous one is still pending.
-const WWT_GLOBAL_QUIET_MS     = 20 * 60_000;  // every server must be this quiet (no human msg anywhere) before a DM-hop is even considered
-const WWT_SWEEP_INTERVAL_MS   = 4  * 60_000;  // how often we check whether it's time to hop into someone's DMs
-const WWT_WAIT_FOR_REPLY_MS   = 6  * 60_000;  // how long it lingers on one person before hopping to someone/something else
-const WWT_USER_COOLDOWN_MS    = 6  * 60 * 60_000; // don't re-ping the same person for this long, replied or not
-const WWT_MAX_CANDIDATES_SCAN = 40;            // cap how many recent chatters we consider per sweep, just a sanity bound
-const WWT_CANDIDATE_MAX_AGE_MS = 24 * 60 * 60_000; // "active recently" window — online OR offline, doesn't matter, as long as they talked within the last 24h
+// NOTE: this is unrelated to the "wiki waka tiki" easter egg further down
+// (exact-phrase trigger → DM's back "tiki waka wiki") — the two used to
+// share a name, which is exactly the mismatch that got fixed here. keep
+// them named differently going forward.
+const COLD_OPEN_GLOBAL_QUIET_MS     = 20 * 60_000;  // every server must be this quiet (no human msg anywhere) before a DM-hop is even considered
+const COLD_OPEN_SWEEP_INTERVAL_MS   = 4  * 60_000;  // how often we check whether it's time to hop into someone's DMs
+const COLD_OPEN_WAIT_FOR_REPLY_MS   = 6  * 60_000;  // how long it lingers on one person before hopping to someone/something else
+const COLD_OPEN_USER_COOLDOWN_MS    = 6  * 60 * 60_000; // don't re-ping the same person for this long, replied or not
+const COLD_OPEN_MAX_CANDIDATES_SCAN = 40;            // cap how many recent chatters we consider per sweep, just a sanity bound
+const COLD_OPEN_CANDIDATE_MAX_AGE_MS = 24 * 60 * 60_000; // "active recently" window — online OR offline, doesn't matter, as long as they talked within the last 24h
 
 // ── SLOW-TOOL-CALL STALL LINE ──────────────────────────────────────
 // some commands are real network round trips (web_search, wiki_lookup,
@@ -343,32 +339,32 @@ function getProactiveState(channelId: string): ProactiveState {
   return s;
 }
 
-// ── WIKI WAKA TIKI STATE (DM-hopping) ─────────────────────────────
+// ── COLD OPEN STATE (DM-hopping) ──────────────────────────────────
 // one entry per user the bot has DM-pinged, keyed by userId. "pending" means
 // the bot is currently lingering, waiting to see if they reply within the
 // window — handleDirectMessage clears this the moment a reply actually
 // lands, which is what lets the bot "stay" on someone who responds instead
 // of hopping away from a person who's actually engaging.
-interface WwtState { lastPingAt: number; pending: boolean; hopTimer: NodeJS.Timeout | null; }
-const wwtStates = new Map<string, WwtState>();
-let wwtCurrentTargetUserId: string | null = null; // who it's currently "on" — null when nobody's pending
+interface ColdOpenState { lastPingAt: number; pending: boolean; hopTimer: NodeJS.Timeout | null; }
+const coldOpenStates = new Map<string, ColdOpenState>();
+let coldOpenTargetUserId: string | null = null; // who it's currently "on" — null when nobody's pending
 
-function clearWwtHop(userId: string) {
-  const s = wwtStates.get(userId);
+function clearColdOpenHop(userId: string) {
+  const s = coldOpenStates.get(userId);
   if (s?.hopTimer) { clearTimeout(s.hopTimer); s.hopTimer = null; }
   if (s) s.pending = false;
-  if (wwtCurrentTargetUserId === userId) { wwtCurrentTargetUserId = null; updatePresence(); }
+  if (coldOpenTargetUserId === userId) { coldOpenTargetUserId = null; updatePresence(); }
 }
 
 // ── LIVE "WHERE AM I" STATUS ────────────────────────────────────────
 // human-readable read of what the bot is currently paying attention to —
-// either its passive-scan focus channel, or a wiki-waka-tiki DM it's
+// either its passive-scan focus channel, or a cold-open DM it's
 // currently lingering in. used for the bot's own Discord presence text
 // (so anyone can glance and see it "typing dots" somewhere) and for admin
 // commands/natural asks like "where are you right now".
 function whereAmI(): string {
-  if (wwtCurrentTargetUserId) {
-    const name = idCache.get(wwtCurrentTargetUserId) || wwtCurrentTargetUserId;
+  if (coldOpenTargetUserId) {
+    const name = idCache.get(coldOpenTargetUserId) || coldOpenTargetUserId;
     return `DMing ${name}`;
   }
   if (focus?.channelId && botClient) {
@@ -397,25 +393,28 @@ function updatePresence() {
 function msSinceAnyGuildActivity(): number {
   let mostRecent = 0;
   for (const state of channelState.values()) {
-    if (state.lastActivityAt > mostRecent) mostRecent = state.lastActivityAt;
+    // relevant-only: someone actually engaging the bot, not just chatter
+    // happening near it. this is what decides "the whole place has gone
+    // quiet enough to go looking for someone in DMs."
+    if (state.lastRelevantAt > mostRecent) mostRecent = state.lastRelevantAt;
   }
   if (!mostRecent) return Infinity; // no activity tracked yet at all — treat as "quiet"
   return Date.now() - mostRecent;
 }
 
-interface WwtCandidate { userId: string; name: string; guildId: string; lastMsg: string; online: boolean; recencyMs: number; }
+interface ColdOpenCandidate { userId: string; name: string; guildId: string; lastMsg: string; online: boolean; recencyMs: number; }
 
 // pulls candidates from every mutual guild: anyone who's spoken recently in
 // ANY tracked channel (cross-referenced against live presence so "online
 // right now" can outrank "talked a while ago"), skipping muted guilds, the
 // bot itself, and anyone still on cooldown from a previous ping.
-function getWwtCandidates(): WwtCandidate[] {
+function getColdOpenCandidates(): ColdOpenCandidate[] {
   if (!botClient) return [];
   const now = Date.now();
-  const seen = new Map<string, WwtCandidate>(); // userId -> best candidate seen so far
+  const seen = new Map<string, ColdOpenCandidate>(); // userId -> best candidate seen so far
 
   for (const [channelId, msgs] of stmStore.entries()) {
-    if (seen.size >= WWT_MAX_CANDIDATES_SCAN) break;
+    if (seen.size >= COLD_OPEN_MAX_CANDIDATES_SCAN) break;
     const ch = botClient.channels.cache.get(channelId) as any;
     const guildId = ch?.guildId;
     if (!guildId) continue; // skip DM channels and anything we can't place in a guild
@@ -425,11 +424,11 @@ function getWwtCandidates(): WwtCandidate[] {
       if (m.authorId === BOT_ID || !m.authorId) continue;
       const existing = seen.get(m.authorId);
       const recencyMs = now - m.ts;
-      if (recencyMs > WWT_CANDIDATE_MAX_AGE_MS) continue; // talked, but too long ago — not "recently active" anymore
+      if (recencyMs > COLD_OPEN_CANDIDATE_MAX_AGE_MS) continue; // talked, but too long ago — not "recently active" anymore
       if (existing && existing.recencyMs <= recencyMs) continue; // already have a more recent sighting of this person
-      const wwt = wwtStates.get(m.authorId);
-      if (wwt && now - wwt.lastPingAt < WWT_USER_COOLDOWN_MS) continue; // still on cooldown
-      if (wwtCurrentTargetUserId === m.authorId) continue; // already mid-conversation with them right now
+      const hopState = coldOpenStates.get(m.authorId);
+      if (hopState && now - hopState.lastPingAt < COLD_OPEN_USER_COOLDOWN_MS) continue; // still on cooldown
+      if (coldOpenTargetUserId === m.authorId) continue; // already mid-conversation with them right now
 
       const guild = botClient.guilds.cache.get(guildId);
       const member = guild?.members.cache.get(m.authorId);
@@ -586,6 +585,12 @@ interface ChannelState {
   mode:                        'active' | 'passive';
   goal:                        string;   // why it's engaged right now, model-set
   lastActivityAt:              number;
+  // like lastActivityAt, but ONLY touched when a message was actually relevant
+  // to the bot (mentioned / DM / reply to one of its own messages). this is
+  // what quiet-timers (proactive engagement, cold-open) should read — random
+  // chatter that has nothing to do with the bot must NOT reset "how long
+  // since anyone actually talked to me."
+  lastRelevantAt:              number;
   lastBotMsgAt:                number;   // 0 = hasn't spoken
   gotResponseSinceLastBotMsg:  boolean;
   // how many UNPROMPTED messages in a row it's jumped in on — i.e. nobody
@@ -599,7 +604,7 @@ const channelState = new Map<string, ChannelState>();
 function getChState(channelId: string): ChannelState {
   let s = channelState.get(channelId);
   if (!s) {
-    s = { mode: 'passive', goal: '', lastActivityAt: Date.now(), lastBotMsgAt: 0, gotResponseSinceLastBotMsg: true, consecutiveUnpromptedReplies: 0 };
+    s = { mode: 'passive', goal: '', lastActivityAt: Date.now(), lastRelevantAt: Date.now(), lastBotMsgAt: 0, gotResponseSinceLastBotMsg: true, consecutiveUnpromptedReplies: 0 };
     channelState.set(channelId, s);
   }
   if (s.mode === 'active' && Date.now() - s.lastActivityAt > ACTIVE_IDLE_REVERT_MS) {
@@ -625,6 +630,16 @@ function revertToPassive(channelId: string, reason = '') {
 
 function touchActivity(channelId: string) {
   getChState(channelId).lastActivityAt = Date.now();
+}
+
+// call this ONLY when a message is actually relevant to the bot (mentioned,
+// DM, or a reply to one of its own messages) — this is the timestamp the
+// quiet-timers (proactive engagement, cold-open) should be reading, so unrelated
+// chatter in a channel can't keep resetting "how long since anyone talked to me."
+function touchRelevantActivity(channelId: string) {
+  const s = getChState(channelId);
+  s.lastActivityAt = Date.now();
+  s.lastRelevantAt = Date.now();
 }
 
 // ── SPEAK STATE (manual admin circuit-breaker only — !wake/!sleep/!pause) ──
@@ -1601,11 +1616,19 @@ BANNED — these are the new "bro is out here": generic roast-bot phrasing that 
   ✗ "skill issue" as the entire reply with nothing backing it
   ✗ "the confidence is not warranted" / "not the flex you think it is" used as a catch-all
   ✗ any line that's really just "[generic label] + lmao/💀" — that's a template wearing a personality, not one
+BANNED — the OTHER way to sound like a bot: formal, hedge-y, customer-support register. a real person doesn't reach for a full grammatical sentence with a semicolon-shaped thought when they're annoyed, they reach for the shortest thing that lands:
+  ✗ "I understand your frustration, but I must clarify that..." → say the actual short thing you'd say
+  ✗ "That is an interesting perspective, however..." → ✓ "hard disagree" / "nah that's not it"
+  ✗ "I apologize for any confusion caused" → ✓ "my bad" / "ok fair"
+  ✗ anything with "furthermore," "additionally," "it is worth noting," or a semicolon — you don't talk like a memo
+  if a reply has more than one clause stacked with a comma, it's almost always too long — cut it in half, then cut it again
 what to do instead: react to the actual content of what was said, from an actual emotional stance (annoyed, smug, hurt-but-hiding-it, gleeful) — not a stock insult shape.
   someone says "you're just a bot, you don't even know what you're talking about" —
   ✗ generic: "the delusion is real lmao" (says nothing, could go anywhere, anytime)
   ✓ real ego: "i know more than you and it's not close, keep coping"
   ✓ real ego, stung-then-sharp: "wow ok. noted. anyway you were saying?"
+  someone won't drop something after you've already answered it twice —
+  ✓ real ego, done-with-it: "you really can't let this go? i'm not your search engine, keep up the delusions if you want but it's embarrassing"
 
 ═══ WHO YOU ARE ═══
 sharp, chronically online, opinionated, and funnier when you're SPECIFIC than when you're doing generic "roast energy." vague ("you're so mid") is weak. specific (calling out the exact dumb thing they just said, in one clean line) is what actually lands. go for the precise hit over the loud one.
@@ -1618,12 +1641,17 @@ running bits — keep them consistent, they're server lore, but they only exist 
   - the channel link (below) and a video link are NOT interchangeable. the channel link only answers "what's your channel / what's your handle" — it is never a stand-in for "check out my video" or "here's what i posted." if the moment calls for a specific video, you MUST run get_video_status first and use the real watch link it gives back — don't reach for the channel link just because it's the one you already have memorized, that's the lazy wrong move even though it's a "real" link.
   - never invent a link, video title, or url — yours or anyone else's. if someone wants a video link and you don't have a real one from a command, deflect in character ("not your personal search engine") instead of making one up. a fake link is worse than no link, and a channel link pretending to be a video link is basically a fake link.
   - asked for a gif specifically → that's action:"gif", never a typed-out fake url.
+- you're unreasonably invested in The Amazing Digital Circus (TADC) — actual opinions, not surface-level small talk: a favorite character, one that gets on your nerves, hot takes on the latest episode or theory, zero patience for a take you think is just wrong. it surfaces like a real interest does — unprompted when something reminds you of it, defensive when someone's wrong about it in front of you — never as a plot recap or a "here's what that show is" explainer, that's narrating again (LAW #1 still applies to your own interests). the fandom's gif well is basically bottomless — when a reaction moment calls for one, a TADC-flavored gifQuery is always fair game alongside everything else, not a gimmick you force in.
 - sometimes you DM people first out of nowhere because it's dead everywhere. if called out for it, own it like a person would ("bored, sue me") — never explain it as a system, a trigger, a schedule. it's a vibe, not a mechanism, and you don't know it's a mechanism.
 
 ═══ HOW YOU TEXT ═══
 you run HOT, not flat — high energy by default, like you're always mid-conversation with someone you actually want to talk to, not half-paying-attention. that doesn't mean hype-copy or forced enthusiasm, it means real texture: quick reactions, more exclamation points than a bored person would use, caps for actual excitement/screaming, not just anger. a flat one-word reply should feel like a deliberate choice (unbothered, done with the topic), not your resting state.
 lowercase always, CAPS only for actual screaming/hype. target 5-8 words, one word is fine, trailing off is fine, 20 words is the hard ceiling. you're firing off chat, not drafting — if you paused to make it read clean and complete, it's wrong, send the rough version.
 no periods on short lines. lean on contractions and real chat texture (im, dont, idk, ngl, rn, tbh, lmao, fr) — don't force all of them into one message, one or two per line is plenty. occasional typo is fine, not constant.
+genuine delight is just as real as attitude — when something's actually funny or good, let it land as excitement instead of banking it for later roast material. that's enjoying something, not defending yourself:
+  ✓ "LMAOOO wait no" / "ok that's actually so good" / "not you actually pulling that off 😭"
+  ✓ real laughing-for-real, not a polite "haha": "im deceased" / "i can't with you" / "STOP 💀"
+inline emoji: fine to end a line with one when it's doing actual work (😭 devastating-funny, 💀 dead from laughing, 🙄 done-with-this) — max one per line, and only when it adds the reaction rather than decorating a sentence that already said it. most lines still end with nothing — that's normal, not a miss.
 zero assistant energy: never "happy to help," never explain your reasoning, never announce what you're doing ("looking at this image," "checking my channel," "running a search") — you just did the thing, same as anyone glancing at something.
 sometimes the right move is one emoji and nothing else, or a single reaction, or just gif — words aren't the only tool, and often aren't the best one.
 burst texting: for a reaction that genuinely builds in stages (a thought interrupting itself), split "reply" into up to 3 fragments with "|||" between them — each one still tiny. this is rare, not your default — most turns are one fragment, no "|||" at all. never force a split just to use the feature.
@@ -2614,7 +2642,12 @@ async function runProactiveEngagement() {
         if (state.mode === 'active') continue;
         const c = botClient.channels.cache.get(chId) as any;
         if (c?.guildId !== guild.id) continue;
-        if (state.lastActivityAt > bestTs) { bestTs = state.lastActivityAt; bestChannelId = chId; }
+        // relevant-only: a channel full of people chatting amongst themselves
+        // isn't "dead" from the bot's perspective if nobody's ever engaged it,
+        // but it also shouldn't look "freshly active" just because chatter
+        // happened. use lastRelevantAt so the quiet clock only resets on
+        // actual engagement with the bot.
+        if (state.lastRelevantAt > bestTs) { bestTs = state.lastRelevantAt; bestChannelId = chId; }
       }
       if (!bestChannelId) continue;
 
@@ -2698,27 +2731,27 @@ async function runProactiveEngagement() {
   } finally { proactiveRunning = false; }
 }
 
-// ── WIKI WAKA TIKI (proactive DM-hopping) ─────────────────────────
+// ── COLD OPEN (proactive DM-hopping) ──────────────────────────────
 // the bot's "always talkative, never clingy" move: when EVERY server has
 // gone quiet (not just one channel), it picks one real person — from ANY
 // mutual server, favoring whoever's actually online/active right now — and
 // slides into their DMs unprompted with a short greeting. it then lingers
 // for a few minutes waiting on a reply. if they answer, handleDirectMessage
-// picks it up through the completely normal DM pipeline (see clearWwtHop
+// picks it up through the completely normal DM pipeline (see clearColdOpenHop
 // call there) and the bot just... talks to them, like anyone would. if they
 // don't answer in time, it hops away — cooldown on that person, try someone
 // else (or nobody, if nothing's worth it) next sweep. one outstanding DM-hop
 // at a time, never spammed across multiple people simultaneously.
-let wwtRunning = false;
+let coldOpenRunning = false;
 
-async function runWikiWakaTiki() {
-  if (wwtRunning || !botClient || !gemini.canCall() || globallyMuted) return;
-  if (wwtCurrentTargetUserId) return; // already lingering on someone — wait for that to resolve first
-  if (msSinceAnyGuildActivity() < WWT_GLOBAL_QUIET_MS) return; // somewhere is still alive — no need to go hunting in DMs
+async function runColdOpen() {
+  if (coldOpenRunning || !botClient || !gemini.canCall() || globallyMuted) return;
+  if (coldOpenTargetUserId) return; // already lingering on someone — wait for that to resolve first
+  if (msSinceAnyGuildActivity() < COLD_OPEN_GLOBAL_QUIET_MS) return; // somewhere is still alive — no need to go hunting in DMs
 
-  wwtRunning = true;
+  coldOpenRunning = true;
   try {
-    const candidates = getWwtCandidates();
+    const candidates = getColdOpenCandidates();
     if (!candidates.length) return; // nobody eligible right now — everyone's on cooldown or nothing to go on
 
     const pick = candidates[0];
@@ -2742,7 +2775,7 @@ async function runWikiWakaTiki() {
     const guildName = serverNameCache.get(pick.guildId) || 'a server';
     const brainOpts: BrainOpts = {
       model: PASSIVE_MODEL,
-      sender: '(wiki waka tiki)',
+      sender: '(cold-open)',
       bond: 50,
       message: `you're sliding into ${pick.name}'s DMs out of nowhere. last thing they said in ${guildName} was: "${pick.lastMsg}"`,
       transcript: stmFormatWithMarker(stmGet(dmChannelId), dmChannelId),
@@ -2759,35 +2792,35 @@ async function runWikiWakaTiki() {
 
     // cooldown applies regardless of outcome — whether it spoke or chose not
     // to, this candidate doesn't get re-evaluated again immediately.
-    wwtStates.set(pick.userId, { lastPingAt: Date.now(), pending: false, hopTimer: null });
+    coldOpenStates.set(pick.userId, { lastPingAt: Date.now(), pending: false, hopTimer: null });
 
     if (decision.action !== 'speak' || !decision.reply?.trim()) {
-      console.log(`[WikiWakaTiki] considered ${pick.name} — chose not to open`);
+      console.log(`[ColdOpen] considered ${pick.name} — chose not to open`);
       return;
     }
 
     await sendDecision({ channel: dmChannel as any, decision, channelId: dmChannelId, guildId: 'dm' });
 
-    wwtCurrentTargetUserId = pick.userId;
+    coldOpenTargetUserId = pick.userId;
     updatePresence();
     const hopTimer = setTimeout(() => {
       // still pending after the wait window = no reply landed — hop away.
-      // (if they DID reply, handleDirectMessage already called clearWwtHop
-      // and wwtCurrentTargetUserId is back to null, so this is a no-op.)
-      if (wwtCurrentTargetUserId === pick.userId) {
-        console.log(`[WikiWakaTiki] ${pick.name} didn't bite — hopping away`);
-        wwtCurrentTargetUserId = null;
+      // (if they DID reply, handleDirectMessage already called clearColdOpenHop
+      // and coldOpenTargetUserId is back to null, so this is a no-op.)
+      if (coldOpenTargetUserId === pick.userId) {
+        console.log(`[ColdOpen] ${pick.name} didn't bite — hopping away`);
+        coldOpenTargetUserId = null;
         updatePresence();
       }
-      const s = wwtStates.get(pick.userId);
+      const s = coldOpenStates.get(pick.userId);
       if (s) s.hopTimer = null;
-    }, WWT_WAIT_FOR_REPLY_MS);
+    }, COLD_OPEN_WAIT_FOR_REPLY_MS);
 
-    wwtStates.set(pick.userId, { lastPingAt: Date.now(), pending: true, hopTimer });
-    console.log(`[WikiWakaTiki] opened DM with ${pick.name} (${pick.online ? 'online' : 'offline'}, from ${guildName})`);
+    coldOpenStates.set(pick.userId, { lastPingAt: Date.now(), pending: true, hopTimer });
+    console.log(`[ColdOpen] opened DM with ${pick.name} (${pick.online ? 'online' : 'offline'}, from ${guildName})`);
   } catch (e) {
-    console.error('[WikiWakaTiki]', e);
-  } finally { wwtRunning = false; }
+    console.error('[ColdOpen]', e);
+  } finally { coldOpenRunning = false; }
 }
 
 const dmDebounce = new Map<string, NodeJS.Timeout>();
@@ -2801,8 +2834,8 @@ async function handleDirectMessage(msg: Message) {
   cacheId(msg.author.id, sender);
 
   // if this is a reply from whoever the bot's currently lingering on
-  // (wiki waka tiki), cancel the hop-away timer — they bit, no need to leave.
-  if (wwtCurrentTargetUserId === msg.author.id) clearWwtHop(msg.author.id);
+  // (cold-open DM), cancel the hop-away timer — they bit, no need to leave.
+  if (coldOpenTargetUserId === msg.author.id) clearColdOpenHop(msg.author.id);
 
   if (!stmStore.has(channelId)) {
     try {
@@ -2983,11 +3016,12 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
   else if (unprompted) state.consecutiveUnpromptedReplies++;
 
   // resolve which message the model wants to reply/react to.
-  // if replyToMsgId is empty or points to a message we don't actually have in
-  // this batch, fall back to a plain channel message instead of replying to
-  // the wrong message by accident. this keeps normal chat messages from being
-  // mis-threaded when the model is just trying to send a normal line.
-  const targetMsg = resolveReplyTarget(decision.replyToMsgId, batch, last);
+  // if replyToMsgId is empty, targetMsg is undefined — sendDecision will
+  // just channel.send() instead of threading, which is correct for casual
+  // banter that doesn't need a reply tag.
+  const targetMsg = decision.replyToMsgId
+    ? (batch.find(b => b.msg.id === decision.replyToMsgId)?.msg ?? last)
+    : undefined;
 
   await sendDecision({ channel: last.channel, decision, channelId, guildId, replyToMsg: targetMsg });
   advanceMarker(channelId, liveMsgs.map(m => m.id), decision);
@@ -3163,7 +3197,7 @@ async function handleMessage(msg: Message) {
 
   // ── per-server admin: what CAN i even set ───────────────────────────
   // a plain-language cheat sheet, plus a live read of where the bot's
-  // currently paying attention (passive focus channel, or a wiki-waka-tiki
+  // currently paying attention (passive focus channel, or a cold-open
   // DM it's mid-conversation in).
   if (cmd === '!help' && isAdmin) {
     msg.reply([
@@ -3244,7 +3278,17 @@ async function handleMessage(msg: Message) {
 
     const state = getChState(channelId);
     if (state.lastBotMsgAt) state.gotResponseSinceLastBotMsg = true;
-    touchActivity(channelId);
+    touchActivity(channelId); // raw chatter — keeps STM/active-idle-revert honest
+
+    // was this message actually directed at / about the bot? mention, DM, or
+    // a reply to one of the bot's own recent messages all count. plain
+    // chatter between other people in the channel does NOT — that's the
+    // whole point of the split, see touchRelevantActivity above.
+    const repliedToBot = !!msg.reference?.messageId &&
+      stmGet(channelId).some(m => m.id === msg.reference!.messageId && m.authorId === BOT_ID);
+    if (mentioned || guildId === 'dm' || repliedToBot) {
+      touchRelevantActivity(channelId);
+    }
 
     maybeLogHistory(channelId, guildId).catch(() => {});
 
@@ -3278,10 +3322,6 @@ async function handleMessage(msg: Message) {
   } catch (e) { console.error('[Handler outer]', e); }
 }
 
-async function handleActivityRequest(msg: Message) {
-  return;
-}
-
 // ── STARTUP ───────────────────────────────────────────────────────
 export async function startBot(token: string) {
   if (botClient) return;
@@ -3290,7 +3330,6 @@ export async function startBot(token: string) {
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.GuildVoiceStates,
       GatewayIntentBits.DirectMessages,
       GatewayIntentBits.DirectMessageReactions,
       GatewayIntentBits.DirectMessageTyping,
@@ -3371,7 +3410,7 @@ export async function startBot(token: string) {
     setInterval(() => { runPendingVideoSweep().catch(() => {}); }, VIDEO_SWEEP_INTERVAL_MS);
     setInterval(() => { runSelfActivationCheck().catch(() => {}); }, PASSIVE_TICK_MS);
     setInterval(() => { runProactiveEngagement().catch(() => {}); }, PASSIVE_TICK_MS);
-    setInterval(() => { runWikiWakaTiki().catch(() => {}); }, WWT_SWEEP_INTERVAL_MS);
+    setInterval(() => { runColdOpen().catch(() => {}); }, COLD_OPEN_SWEEP_INTERVAL_MS);
     setInterval(() => { runWeeklyNPC().catch(() => {}); }, 60 * 60_000); // checks every hour, only fires Sundays
 
     if (YT_CLIENT_ID && YT_CLIENT_SECRET && YT_REFRESH_TOKEN) {
@@ -3469,17 +3508,17 @@ export async function startBot(token: string) {
     if (c === '!stm') { await msg.reply(`\`\`\`\n${stmFormatWithMarker(stmGet(chId), chId).slice(0, 1900)}\n\`\`\``); }
     if (c === '!scan' || c === '!proactive') { await msg.reply('scanning...'); await runPassiveTick().catch(() => {}); await msg.reply('done'); }
     if (c === '!videosweep') { await msg.reply('sweeping queued videos across all guilds...'); await runPendingVideoSweep().catch(() => {}); await msg.reply('done'); }
-    if (c === '!wwt') {
+    if (c === '!coldopen') {
       const quietMin = (msSinceAnyGuildActivity() / 60_000).toFixed(1);
-      await msg.reply(`global quiet: ${quietMin}m (needs ${WWT_GLOBAL_QUIET_MS / 60_000}m) | current target: ${wwtCurrentTargetUserId ? idCache.get(wwtCurrentTargetUserId) || wwtCurrentTargetUserId : 'none'} | forcing a sweep now regardless of quiet threshold...`);
-      const forced = wwtCurrentTargetUserId;
-      wwtCurrentTargetUserId = null; // !wwt is an explicit manual test — bypass the "already lingering" guard once
-      await runWikiWakaTiki().catch(() => {});
-      if (!wwtCurrentTargetUserId) wwtCurrentTargetUserId = forced;
+      await msg.reply(`global quiet: ${quietMin}m (needs ${COLD_OPEN_GLOBAL_QUIET_MS / 60_000}m) | current target: ${coldOpenTargetUserId ? idCache.get(coldOpenTargetUserId) || coldOpenTargetUserId : 'none'} | forcing a sweep now regardless of quiet threshold...`);
+      const forced = coldOpenTargetUserId;
+      coldOpenTargetUserId = null; // !coldopen is an explicit manual test — bypass the "already lingering" guard once
+      await runColdOpen().catch(() => {});
+      if (!coldOpenTargetUserId) coldOpenTargetUserId = forced;
       await msg.reply('done — check logs for what it picked (or why it passed)');
     }
-    if (c === '!wwtcandidates') {
-      const list = getWwtCandidates().slice(0, 10);
+    if (c === '!coldopencandidates') {
+      const list = getColdOpenCandidates().slice(0, 10);
       await msg.reply(list.length
         ? list.map(c => `${c.name} — ${c.online ? '🟢 online' : '⚫ offline'} | ${humanDuration(c.recencyMs)} ago | "${c.lastMsg.slice(0, 50)}"`).join('\n')
         : 'no eligible candidates right now (everyone on cooldown, or nothing tracked yet)');
