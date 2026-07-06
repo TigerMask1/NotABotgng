@@ -202,6 +202,8 @@ function extractImageUrls(msg: Message): string[] {
   return urls;
 }
 
+import sharp from 'sharp';
+
 async function fetchImageAsBase64(url: string): Promise<ImagePart | null> {
   try {
     const controller = new AbortController();
@@ -215,6 +217,21 @@ async function fetchImageAsBase64(url: string): Promise<ImagePart | null> {
     if (lenHeader && Number(lenHeader) > MAX_IMAGE_FETCH_BYTES) return null;
     const buf = await res.arrayBuffer();
     if (buf.byteLength > MAX_IMAGE_FETCH_BYTES) return null;
+
+    // Gemini's inline vision input only reliably handles png/jpeg/webp/heic/heif —
+    // NOT gif. sending raw gif bytes as mimeType image/gif is exactly why the
+    // model "doesn't even know what it is": it's not a supported format, so the
+    // vision path silently fails to parse it. grab frame 0 as a real png instead.
+    if (mimeType === 'image/gif') {
+      try {
+        const png = await sharp(Buffer.from(buf), { animated: false }).png().toBuffer();
+        return { mimeType: 'image/png', data: png.toString('base64') };
+      } catch (e: any) {
+        console.warn('[Vision] gif->png conversion failed:', e.message?.slice(0, 80));
+        return null;
+      }
+    }
+
     return { mimeType, data: Buffer.from(buf).toString('base64') };
   } catch (e: any) {
     console.warn('[Vision] image fetch failed:', e.message?.slice(0, 80));
@@ -734,12 +751,188 @@ function pickInterestChannelForGuild(guildId: string): string | null {
 }
 
 // ── FIREBASE / MEMORY ─────────────────────────────────────────────
-interface ServerMemory {
-  facts:    string[];
-  jokes:    string[];
-  patterns: string[];
-  arcs:     string[];
-  openLoops:string[];
+// ── UNIFIED MEMORY ENGINE ──────────────────────────────────────────
+// ONE storage shape for everything the bot remembers, instead of five parallel
+// structures (facts/jokes/patterns/arcs/openLoops buckets + a hand-synced
+// memoryVectors shadow table + a separate person about/state store). Adding a
+// new KIND of thing to remember ("grudge", "running-bit", whatever) needs zero
+// new code — "kind" is just a string the model writes at call time, not a
+// fixed enum wired into a dedicated bucket/function/cap.
+//
+// two scopes, same engine:
+//   'server' — scopeId = guildId. gossip/jokes/arcs. deliberately NEVER read
+//              across guilds (see getCrossServerInfo below for the one
+//              intentional exception: presence only, never facts).
+//   'person' — scopeId = userId. follows the person everywhere they talk to
+//              the bot, on purpose — this is the "remembers you're a person,
+//              not a new blank slate per room" piece.
+//
+// embeddings are attached at write time, not synced afterward, so there's no
+// second table that can drift out of sync with the first. new memories are
+// checked against existing ones for the same scope+subject+kind by cosine
+// similarity — a close match gets REINFORCED (salience bump, text refreshed)
+// instead of duplicated, so "stressed about grades" said three times doesn't
+// become three stale entries, it becomes one entry that gets more confident.
+// salience decays with time (half-life below) and eviction drops the least-
+// reinforced, least-recent entry first when a scope hits its cap — not
+// whichever happens to be oldest, like the old FIFO buckets did.
+interface Memory {
+  id:               string;
+  kind:             string;            // free-form — "fact","joke","running-bit","about","state","arc","open-loop", anything
+  text:             string;
+  subjectUserId?:   string;            // who this is about, if it's about someone specific
+  sourceLabel?:     string;            // display-only context, e.g. a guild name for a person-scoped memory
+  embedding:        number[];
+  salience:         number;            // 0–1, boosted on reinforcement
+  createdAt:        string;
+  lastReinforcedAt: string;
+  expiresAt?:       string;            // only short-lived kinds (e.g. person 'state') set this
+}
+
+const SALIENCE_HALF_LIFE_DAYS = 10;    // how fast an unreinforced memory fades from ambient context
+const REINFORCE_BUMP          = 0.35;
+const UPDATE_SIM_THRESHOLD    = 0.86;  // cosine similarity above this = "same memory", reinforce don't duplicate
+const SERVER_MEM_CAP          = 60;
+const PERSON_MEM_CAP          = 40;
+
+const memStoreCache = new Map<string, { d: Memory[]; ts: number }>();
+
+function memDocId(scope: 'server' | 'person', scopeId: string): string {
+  return `${scope}:${scopeId}`;
+}
+
+function effectiveSalience(m: Memory): number {
+  const ageDays = (Date.now() - new Date(m.lastReinforcedAt).getTime()) / (24 * 60 * 60 * 1000);
+  return m.salience * Math.pow(0.5, ageDays / SALIENCE_HALF_LIFE_DAYS);
+}
+
+async function loadMemories(scope: 'server' | 'person', scopeId: string): Promise<Memory[]> {
+  const key = memDocId(scope, scopeId);
+  const c = memStoreCache.get(key);
+  if (c && Date.now() - c.ts < 120_000) return c.d;
+  try {
+    const snap = await db.collection('memoryStore').doc(key).get();
+    const now = Date.now();
+    const all = ((snap.data()?.entries ?? []) as Memory[]).filter(m => !m.expiresAt || new Date(m.expiresAt).getTime() > now);
+    memStoreCache.set(key, { d: all, ts: Date.now() });
+    return all;
+  } catch { return []; }
+}
+
+async function saveMemories(scope: 'server' | 'person', scopeId: string, entries: Memory[]) {
+  const key = memDocId(scope, scopeId);
+  memStoreCache.delete(key);
+  await db.collection('memoryStore').doc(key).set({ entries }, { merge: false }).catch(() => {});
+}
+
+// the one write path for everything the bot remembers.
+async function remember(
+  scope: 'server' | 'person',
+  scopeId: string,
+  text: string,
+  kind: string,
+  opts: { subjectUserId?: string; sourceLabel?: string; ttlMs?: number } = {},
+) {
+  if (!text?.trim() || !scopeId || scopeId === 'dm') return;
+  const entries = await loadMemories(scope, scopeId);
+  const vector = await embedder.embed(text.trim());
+  const now = new Date().toISOString();
+
+  if (vector) {
+    const sameKind = entries.filter(m => m.kind === kind && m.subjectUserId === opts.subjectUserId);
+    let best: Memory | null = null, bestScore = 0;
+    for (const m of sameKind) {
+      if (!m.embedding?.length) continue;
+      const score = embedder.cosineSim(vector, m.embedding);
+      if (score > bestScore) { bestScore = score; best = m; }
+    }
+    if (best && bestScore >= UPDATE_SIM_THRESHOLD) {
+      // reinforce instead of duplicating — same underlying memory, said again.
+      best.text = text.trim(); // refresh wording to the latest phrasing
+      best.embedding = vector;
+      best.salience = Math.min(1, best.salience + REINFORCE_BUMP);
+      best.lastReinforcedAt = now;
+      if (opts.ttlMs) best.expiresAt = new Date(Date.now() + opts.ttlMs).toISOString();
+      if (opts.sourceLabel) best.sourceLabel = opts.sourceLabel;
+      await saveMemories(scope, scopeId, entries);
+      console.log(`[Mem:${scope}:${kind}] reinforced "${text.slice(0, 60)}" (${Math.round(bestScore * 100)}% match)`);
+      return;
+    }
+  }
+
+  const entry: Memory = {
+    id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    kind, text: text.trim(),
+    subjectUserId: opts.subjectUserId,
+    sourceLabel: opts.sourceLabel,
+    embedding: vector ?? [],
+    salience: 0.6,
+    createdAt: now, lastReinforcedAt: now,
+    expiresAt: opts.ttlMs ? new Date(Date.now() + opts.ttlMs).toISOString() : undefined,
+  };
+  entries.push(entry);
+
+  const cap = scope === 'server' ? SERVER_MEM_CAP : PERSON_MEM_CAP;
+  if (entries.length > cap) {
+    entries.sort((a, b) => effectiveSalience(a) - effectiveSalience(b));
+    entries.splice(0, entries.length - cap); // drop the least-salient, not just the oldest
+  }
+  await saveMemories(scope, scopeId, entries);
+  console.log(`[Mem:${scope}:${kind}] +"${text.slice(0, 60)}"`);
+}
+
+// ambient context for a brain() call — top memories by effective salience,
+// not query-matched (this is "what's generally worth knowing right now",
+// used on every call, vs. searchMemories below which is on-demand lookup).
+async function getTopMemories(scope: 'server' | 'person', scopeId: string, opts: { subjectUserId?: string; limit?: number } = {}): Promise<Memory[]> {
+  const entries = await loadMemories(scope, scopeId);
+  const filtered = opts.subjectUserId ? entries.filter(m => m.subjectUserId === opts.subjectUserId || !m.subjectUserId) : entries;
+  return filtered
+    .map(m => ({ m, s: effectiveSalience(m) }))
+    .sort((a, b) => b.s - a.s)
+    .slice(0, opts.limit ?? 20)
+    .map(x => x.m);
+}
+
+// on-demand semantic search — the recall_memory command's backend.
+async function searchMemories(scope: 'server' | 'person', scopeId: string, query: string, topK = 5): Promise<string> {
+  const entries = await loadMemories(scope, scopeId);
+  if (!entries.length) return 'nothing stored in memory yet';
+  const queryVec = await embedder.embed(query);
+  if (!queryVec) return 'semantic recall unavailable right now (embedding call failed)';
+  const scored = entries
+    .filter(m => m.embedding?.length)
+    .map(m => ({ text: m.text, kind: m.kind, score: embedder.cosineSim(queryVec, m.embedding) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topK);
+  if (!scored.length) return 'nothing relevant found';
+  return scored.map(s => `[${s.kind}] ${s.text} (match: ${Math.round(s.score * 100)}%)`).join('\n');
+}
+
+// compact prompt-ready dump of what's worth knowing right now for a server.
+async function buildMemCtx(guildId: string): Promise<string> {
+  if (guildId === 'dm') return '';
+  const top = await getTopMemories('server', guildId, { limit: 20 });
+  if (!top.length) return '';
+  const byKind = new Map<string, string[]>();
+  for (const m of top) {
+    if (!byKind.has(m.kind)) byKind.set(m.kind, []);
+    byKind.get(m.kind)!.push(m.text);
+  }
+  return [...byKind.entries()].map(([kind, texts]) => `${kind}: ${texts.join(' | ')}`).join('\n');
+}
+
+// same idea, server-scoped semantic search — what recall_memory calls.
+async function recallMemory(guildId: string, query: string, topK = 5): Promise<string> {
+  if (guildId === 'dm') return 'no shared memory in DMs';
+  return searchMemories('server', guildId, query, topK);
+}
+
+// compatibility shim for the old bucket-based writer (profiler/compress and
+// !remember still call this with the old bucket names — those names just
+// become the "kind" now, no fixed enum required).
+async function addFact(guildId: string, fact: string, kind: string = 'fact') {
+  await remember('server', guildId, fact, kind);
 }
 
 interface MemberData {
@@ -762,97 +955,7 @@ interface HistoryLog {
   createdAt: string;
 }
 
-const memCache    = new Map<string, { d: ServerMemory; ts: number }>();
-const memberCache = new Map<string, { d: MemberData;   ts: number }>();
-
-function emptyMem(): ServerMemory {
-  return { facts: [], jokes: [], patterns: [], arcs: [], openLoops: [] };
-}
-
-async function getMemory(guildId: string): Promise<ServerMemory> {
-  const c = memCache.get(guildId);
-  if (c && Date.now() - c.ts < 120_000) return c.d;
-  try {
-    const snap = await db.collection('servers').doc(guildId).collection('memory').doc('global').get();
-    const d = {
-      facts:     snap.data()?.facts     ?? [],
-      jokes:     snap.data()?.jokes     ?? [],
-      patterns:  snap.data()?.patterns  ?? [],
-      arcs:      snap.data()?.arcs      ?? [],
-      openLoops: snap.data()?.openLoops ?? [],
-    };
-    memCache.set(guildId, { d, ts: Date.now() });
-    return d;
-  } catch { return emptyMem(); }
-}
-
-async function addFact(guildId: string, fact: string, bucket: keyof ServerMemory = 'facts') {
-  if (!fact?.trim() || guildId === 'dm') return;
-  const m = await getMemory(guildId);
-  if ((m[bucket] as string[]).some(f => f.toLowerCase() === fact.toLowerCase())) return;
-  (m[bucket] as string[]).push(fact.trim());
-  if ((m[bucket] as string[]).length > 30) (m[bucket] as string[]).shift();
-  memCache.delete(guildId);
-  await db.collection('servers').doc(guildId).collection('memory').doc('global')
-    .set({ [bucket]: m[bucket] }, { merge: true }).catch(() => {});
-  console.log(`[Mem:${bucket}] "${fact.slice(0, 60)}"`);
-  embedFactAsync(guildId, fact.trim(), bucket); // fire-and-forget — never blocks the write above
-}
-
-// ── SEMANTIC MEMORY (embedding-backed recall, additive on top of the flat buckets above) ──
-// every fact written via addFact also gets embedded and stored in its own
-// subcollection, keyed by a stable hash of the text (so re-saving the same
-// fact never duplicates a vector). flat bucket arrays above remain the
-// source of truth for display/dedup; this index exists purely so the model
-// can ask "what do we know about X" and get a meaning-based match instead
-// of needing the exact wording.
-function simpleHash(s: string): string {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) | 0; }
-  return Math.abs(h).toString(36);
-}
-
-interface MemoryVector { text: string; bucket: string; vector: number[]; createdAt: string; }
-
-async function embedFactAsync(guildId: string, fact: string, bucket: keyof ServerMemory) {
-  try {
-    const vector = await embedder.embed(fact);
-    if (!vector) return; // embedding service unavailable — bucket write above already succeeded, nothing lost
-    const id = simpleHash(`${bucket}:${fact.toLowerCase()}`);
-    const entry: MemoryVector = { text: fact, bucket, vector, createdAt: new Date().toISOString() };
-    await db.collection('servers').doc(guildId).collection('memoryVectors').doc(id)
-      .set(entry, { merge: true }).catch(() => {});
-  } catch (e: any) {
-    console.warn('[Embed] fact embedding failed:', e.message?.slice(0, 80));
-  }
-}
-
-// semantic search across all stored memory vectors for a server. pulls the
-// whole small collection (servers stay in the dozens-to-low-hundreds of
-// facts range given the 30-per-bucket cap) and ranks by cosine similarity —
-// no vector DB needed at this scale.
-async function recallMemory(guildId: string, query: string, topK = 5): Promise<string> {
-  if (guildId === 'dm') return 'no shared memory in DMs';
-  const queryVec = await embedder.embed(query);
-  if (!queryVec) return 'semantic recall unavailable right now (embedding call failed) — try get_history or check memory facts directly';
-
-  try {
-    const snap = await db.collection('servers').doc(guildId).collection('memoryVectors').get();
-    if (snap.empty) return 'nothing stored in memory yet';
-
-    const scored = snap.docs
-      .map(d => d.data() as MemoryVector)
-      .filter(v => Array.isArray(v.vector) && v.vector.length)
-      .map(v => ({ text: v.text, bucket: v.bucket, score: embedder.cosineSim(queryVec, v.vector) }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, topK);
-
-    if (!scored.length) return 'nothing relevant found';
-    return scored.map(s => `[${s.bucket}] ${s.text} (match: ${Math.round(s.score * 100)}%)`).join('\n');
-  } catch (e: any) {
-    return `recall error: ${e.message?.slice(0, 60)}`;
-  }
-}
+const memberCache = new Map<string, { d: MemberData; ts: number }>();
 
 
 async function getMember(guildId: string, userId: string): Promise<MemberData> {
@@ -890,6 +993,39 @@ async function updateBond(guildId: string, userId: string, delta: number) {
   const m = await getMember(guildId, userId);
   const cur = typeof m.bond === 'number' ? m.bond : 50;
   await upsertMember(guildId, userId, { bond: Math.max(0, Math.min(100, cur + delta)) });
+}
+
+// ── PERSON MEMORY (thin wrapper over the unified engine, scope='person') ──
+// this is the ONE thing that follows a person across every server/DM they
+// talk to the bot in, on purpose, unlike server-scoped memories which are
+// deliberately walled off per guild. same engine, same reinforce-don't-
+// duplicate logic, same salience decay — 'about' entries just never get a
+// ttl (durable identity), 'state' entries get a 4-day one (fades on its own
+// so this never becomes a permanent mood-surveillance file on someone).
+const PERSON_STATE_TTL_MS = 4 * 24 * 60 * 60 * 1000;
+
+async function notePersonAbout(userId: string, fact: string) {
+  await remember('person', userId, fact, 'about');
+}
+
+async function notePersonState(userId: string, note: string, guildName: string) {
+  await remember('person', userId, note, 'state', { sourceLabel: guildName, ttlMs: PERSON_STATE_TTL_MS });
+}
+
+// what the bot actually carries into every conversation with this person,
+// regardless of which server or DM it's happening in.
+async function getPersonalCtx(userId: string): Promise<string> {
+  if (!userId) return '';
+  const top = await getTopMemories('person', userId, { limit: 15 });
+  if (!top.length) return '';
+  const about = top.filter(m => m.kind === 'about');
+  const state = top.filter(m => m.kind === 'state');
+  const other = top.filter(m => m.kind !== 'about' && m.kind !== 'state');
+  const lines: string[] = [];
+  if (about.length) lines.push(`about them: ${about.map(m => m.text).join('; ')}`);
+  if (state.length) lines.push(`going on with them lately: ${state.map(m => `${m.text}${m.sourceLabel ? ` (from ${m.sourceLabel})` : ''}`).join('; ')}`);
+  if (other.length) lines.push(other.map(m => `${m.kind}: ${m.text}`).join('; '));
+  return lines.join('\n');
 }
 
 // ── HISTORY LOGGING (BG model logs summaries with timestamps) ─────
@@ -1729,6 +1865,7 @@ CRITICAL OUTPUT RULE: respond with RAW JSON ONLY. first character "{", last char
   "gifQuery": "short search term for a gif, or empty string (only if action is gif)",
   "replyToMsgId": "msgId of the specific message you're threading on, or empty string — most casual banter doesn't need a thread tag, use it only when it'd genuinely be unclear who you're talking to",
   "unansweredMsgId": "msgId of a real question you're deliberately leaving for later, or empty string",
+  "aboutSender": "one short note worth remembering about THIS specific sender, or empty string. ONLY for genuinely personal stuff about them as a person — a mood, a life event, something going on ('stressed about grades', 'got the job'). this follows them to every server/DM, not just this one, so never put server gossip, jokes, or drama-about-others here. leave empty almost always — most messages have nothing worth carrying forward.",
   "pause": 0,
   "goal": "short reason you're engaged, or empty string",
   "stayActive": true,
@@ -1745,6 +1882,7 @@ interface BrainDecision {
   gifQuery:        string;
   replyToMsgId:    string;
   unansweredMsgId: string;
+  aboutSender:     string;
   pause:           number;
   goal:            string;
   stayActive:      boolean;
@@ -1765,6 +1903,7 @@ function parseBrainJSON(raw: string): BrainDecision | null {
       gifQuery:        typeof p.gifQuery === 'string' ? p.gifQuery.trim().slice(0, 80) : '',
       replyToMsgId:    typeof p.replyToMsgId    === 'string' ? p.replyToMsgId.trim()    : '',
       unansweredMsgId: typeof p.unansweredMsgId === 'string' ? p.unansweredMsgId.trim() : '',
+      aboutSender:     typeof p.aboutSender === 'string' ? p.aboutSender.trim().slice(0, 150) : '',
       pause:           typeof p.pause    === 'number' ? Math.min(Math.max(0, Math.round(p.pause)), PAUSE_MAX_MINS) : 0,
       goal:            typeof p.goal     === 'string' ? p.goal.trim().slice(0, 120) : '',
       stayActive:      typeof p.stayActive === 'boolean' ? p.stayActive : true,
@@ -1790,6 +1929,7 @@ interface BrainOpts {
   transcript:    string;
   thread?:       string;
   memCtx:        string;
+  personalCtx?:  string;
   historyCtx?:   string;
   mentioned:     boolean;
   isDM:          boolean;
@@ -1816,6 +1956,7 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
 
   if (opts.goal)          parts.push(`\nYOUR GOAL RIGHT NOW: ${opts.goal}`);
   if (opts.memCtx)        parts.push(`\nSERVER MEMORY:\n${opts.memCtx}`);
+  if (opts.personalCtx)   parts.push(`\nWHAT YOU KNOW ABOUT ${opts.sender.toUpperCase()} AS A PERSON (carries across every server/DM, not just this one):\n${opts.personalCtx}`);
   if (opts.historyCtx)    parts.push(`\nHISTORY LOGS (archived summaries):\n${opts.historyCtx}`);
   if (opts.thread)        parts.push(`\nREPLY TO:\n${opts.thread}`);
   if (opts.videoCtx)      parts.push(`\nYOUR NEW VIDEO:\ntitle: "${opts.videoCtx.title}"\nlink: ${opts.videoCtx.url}\n(you just posted this — see "WHEN A NEW VIDEO OF YOURS DROPS" for how to bring it up, if at all)`);
@@ -1823,7 +1964,7 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   if (opts.batchSize && opts.batchSize > 1)
     parts.push(`\n(${opts.batchSize} messages landed while you were thinking — all already in the chat above, below the marker. default is ignoring the whole pile, that's normal. only break that if something in there genuinely earns a reply or reaction. if so, set replyToMsgId, and flag unansweredMsgId if something else in there is a real question you're leaving for later.)`);
   if (opts.images?.length)
-    parts.push(`\n(an image is attached to the most recent message below — actually look at it, react to what's really in it, don't guess)`);
+    parts.push(`\n(an image is attached to the most recent message below — actually look at it, react to what's really in it, don't guess. if it was a gif, you're seeing ONE static frame pulled from it, not the motion — react to what's visible in that frame, don't describe or assume movement you can't actually see)`);
   if (opts.consecutiveUnpromptedReplies && opts.consecutiveUnpromptedReplies >= 1) {
     const n = opts.consecutiveUnpromptedReplies;
     parts.push(`\n(for context: you've spoken up completely unprompted ${n} time${n > 1 ? 's' : ''} in a row now — nobody asked, you just had something to say each time)`);
@@ -1882,8 +2023,8 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   }
 
   return (opts.mentioned || opts.isDM)
-    ? { action: 'speak', reply: 'brain blipped', reaction: '', gifQuery: '', replyToMsgId: '', unansweredMsgId: '', pause: 0, goal: opts.goal || '', stayActive: true, think: '', command: 'none', commandArgs: {} }
-    : { action: 'ignore', reply: '', reaction: '', gifQuery: '', replyToMsgId: '', unansweredMsgId: '', pause: 0, goal: '', stayActive: false, think: '', command: 'none', commandArgs: {} };
+    ? { action: 'speak', reply: 'brain blipped', reaction: '', gifQuery: '', replyToMsgId: '', unansweredMsgId: '', aboutSender: '', pause: 0, goal: opts.goal || '', stayActive: true, think: '', command: 'none', commandArgs: {} }
+    : { action: 'ignore', reply: '', reaction: '', gifQuery: '', replyToMsgId: '', unansweredMsgId: '', aboutSender: '', pause: 0, goal: '', stayActive: false, think: '', command: 'none', commandArgs: {} };
 }
 
 function sanitizeEmoji(raw: any): string {
@@ -2057,19 +2198,8 @@ function advanceMarker(channelId: string, batchMsgIds: string[], decision: Brain
   setMarker(channelId, batchMsgIds[batchMsgIds.length - 1], clearedPending);
 }
 
-// ── BUILD MEMORY CONTEXT ──────────────────────────────────────────
-// no slice(-N) caps anymore — addFact already caps each bucket at 30, that's plenty
-async function buildMemCtx(guildId: string): Promise<string> {
-  if (guildId === 'dm') return '';
-  const m = await getMemory(guildId);
-  const lines: string[] = [];
-  if (m.openLoops.length) lines.push(`open loops: ${m.openLoops.join(' | ')}`);
-  if (m.arcs.length)      lines.push(`arcs: ${m.arcs.join(' | ')}`);
-  if (m.jokes.length)     lines.push(`server lore: ${m.jokes.join(' | ')}`);
-  if (m.patterns.length)  lines.push(`patterns: ${m.patterns.join(' | ')}`);
-  if (m.facts.length)     lines.push(`facts: ${m.facts.join(' | ')}`);
-  return lines.join('\n');
-}
+// buildMemCtx / recallMemory now live in the unified memory engine above.
+
 
 // ── BACKGROUND JOBS (profiler / compress — unrelated utility, untouched logic) ──
 let bgLock       = false;
@@ -2887,11 +3017,12 @@ async function respondToDM(msg: Message) {
   const endingConvo = /\b(bye|cya|gotta go|gtg|see ya|later|good night|gn|logging off|ttyl|im out)\b/i.test(content);
 
   const liveMsgs = stmGet(channelId);
+  const personalCtx = await getPersonalCtx(msg.author.id);
   const brainOpts: BrainOpts = {
     model: ACTIVE_MODEL,
     sender, bond: 50, message: content,
     transcript: stmFormatWithMarker(liveMsgs, channelId),
-    thread: threadCtx, memCtx: '',
+    thread: threadCtx, memCtx: '', personalCtx,
     mentioned: true, isDM: true,
     statusLine: `mode: dm | speak: active | server: DM | channel: #dm`,
     inExchange, channelName: 'DM', serverName: 'DM',
@@ -2901,6 +3032,7 @@ async function respondToDM(msg: Message) {
 
   let decision = await brain(brainOpts);
   decision = await executeBrainDecision({ decision, brainOpts, channel: msg.channel, replyToMsg: msg, channelId, guildId: 'dm' });
+  if (decision.aboutSender) notePersonState(msg.author.id, decision.aboutSender, 'a DM');
   await sendDecision({ channel: msg.channel, decision, channelId, guildId: 'dm', replyToMsg: msg });
   advanceMarker(channelId, liveMsgs.map(m => m.id), decision);
 }
@@ -2963,9 +3095,10 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
     } catch {}
   }
 
-  const [memberData, memCtx] = await Promise.all([
+  const [memberData, memCtx, personalCtx] = await Promise.all([
     getMember(guildId, last.author.id),
     buildMemCtx(guildId),
+    getPersonalCtx(last.author.id),
   ]);
   const bond  = typeof memberData.bond === 'number' ? memberData.bond : 50;
   const state = getChState(channelId);
@@ -2994,7 +3127,7 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
     model: ACTIVE_MODEL,
     sender: tSender, bond, message: tContent,
     transcript: stmFormatWithMarker(liveMsgs, channelId),
-    thread: threadCtx, memCtx,
+    thread: threadCtx, memCtx, personalCtx,
     mentioned: anyMentioned, isDM: false, statusLine,
     inExchange, channelName: tChannelName, serverName: tServerName,
     everyonePing: tEveryonePing, endingConvo,
@@ -3013,6 +3146,7 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
   console.log(`[Brain] ${tSender}: ${decision.action}${decision.reply ? ` — "${decision.reply.slice(0, 50)}"` : decision.reaction ? ` — ${decision.reaction}` : ''}`);
 
   decision = await executeBrainDecision({ decision, brainOpts, channel: last.channel, replyToMsg: last, channelId, guildId });
+  if (decision.aboutSender) notePersonState(last.author.id, decision.aboutSender, tServerName);
 
   // bookkeeping only — NotABot's own call stands. this just keeps the "how
   // many in a row have I volunteered" number accurate for the NEXT call's
@@ -3501,13 +3635,16 @@ export async function startBot(token: string) {
       ].join('\n'));
     }
     if (c === '!memory') {
-      const m = await getMemory(guildId);
-      await msg.reply(
-        `facts(${m.facts.length}): ${m.facts.slice(-4).join(' | ') || 'none'}\n` +
-        `jokes(${m.jokes.length}): ${m.jokes.slice(-3).join(' | ') || 'none'}\n` +
-        `loops(${m.openLoops.length}): ${m.openLoops.slice(-3).join(' | ') || 'none'}\n` +
-        `arcs(${m.arcs.length}): ${m.arcs.slice(-3).join(' | ') || 'none'}`
+      const top = await getTopMemories('server', guildId, { limit: SERVER_MEM_CAP });
+      const byKind = new Map<string, Memory[]>();
+      for (const mem of top) {
+        if (!byKind.has(mem.kind)) byKind.set(mem.kind, []);
+        byKind.get(mem.kind)!.push(mem);
+      }
+      const lines = [...byKind.entries()].map(([kind, ms]) =>
+        `${kind}(${ms.length}): ${ms.slice(-4).map(x => x.text).join(' | ')}`
       );
+      await msg.reply(lines.length ? lines.join('\n') : 'nothing stored yet');
     }
     if (c.startsWith('!remember ')) { await addFact(guildId, c.slice(10).trim()); msg.reply('noted'); }
     if (c === '!stm') { await msg.reply(`\`\`\`\n${stmFormatWithMarker(stmGet(chId), chId).slice(0, 1900)}\n\`\`\``); }
