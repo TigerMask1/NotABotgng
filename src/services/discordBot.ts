@@ -3,8 +3,15 @@ import {
   Events, TextChannel, PermissionFlagsBits,
 } from 'discord.js';
 import { db } from './firebase.ts';
+import * as fs from 'node:fs';
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+// set DEBUG_LOG_REQUESTS=true in your env to write every exact Gemini request
+// body to ./debug_last_request.txt (overwritten each call) — flip it on when
+// you want to see live what's actually being sent, leave it off in normal
+// production runs so it's not doing disk I/O on every single message.
+const DEBUG_LOG_REQUESTS = process.env.DEBUG_LOG_REQUESTS === 'true';
 
 // ── MODELS ───────────────────────────────────────────────────────
 const ACTIVE_MODEL  = 'gemini-3.1-flash-lite'; // every msg while engaged + ping triage — fast, cheap, decides like a human would
@@ -68,6 +75,39 @@ class GeminiManager {
     const generationConfig: Record<string, any> = { temperature: temp, responseMimeType: 'application/json' };
     if (maxOutputTokens) generationConfig.maxOutputTokens = maxOutputTokens;
 
+    const requestBody = {
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+      contents: [{ role: 'user', parts: userParts }],
+      generationConfig,
+    };
+
+    if (DEBUG_LOG_REQUESTS) {
+      try {
+        // redact actual base64 image bytes — you want to see the shape of the
+        // request, not megabytes of encoded pixels in a text file.
+        const loggable = {
+          ...requestBody,
+          contents: [{
+            role: 'user',
+            parts: userParts.map((p: any) =>
+              p.inlineData ? { inlineData: { mimeType: p.inlineData.mimeType, data: `[base64 omitted, ${Math.round(p.inlineData.data.length * 0.75 / 1024)}kb]` } } : p
+            ),
+          }],
+        };
+        const dump = [
+          `── ${new Date().toISOString()} ──`,
+          `endpoint: https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+          `model: ${model} | temp: ${temp} | maxOutputTokens: ${maxOutputTokens ?? '(none)'}`,
+          '',
+          '--- FULL REQUEST BODY (what actually gets POSTed) ---',
+          JSON.stringify(loggable, null, 2),
+        ].join('\n');
+        fs.writeFileSync('./debug_last_request.txt', dump, 'utf8');
+      } catch (e: any) {
+        console.warn('[Debug] failed to write request dump:', e.message?.slice(0, 80));
+      }
+    }
+
     for (let attempt = 0; attempt < Math.max(this.keys.length, 1) * 2; attempt++) {
       const key = this.pickKey();
       if (!key) throw new Error('[Gemini] no keys available');
@@ -77,11 +117,7 @@ class GeminiManager {
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              systemInstruction: { parts: [{ text: systemPrompt }] },
-              contents: [{ role: 'user', parts: userParts }],
-              generationConfig,
-            }),
+            body: JSON.stringify(requestBody),
           }
         );
         if (res.status === 429) {
@@ -138,7 +174,7 @@ const gemini = new GeminiManager();
 // ── EMBEDDING MANAGER (Google text-embedding-004, same key pool as Gemini) ──
 // used for semantic memory recall — turns facts/jokes/arcs into vectors so
 // "remember the thing about X" can match by MEANING, not exact substring.
-const EMBED_MODEL = 'text-embedding-004';
+const EMBED_MODEL = 'gemini-embedding-001'; // text-embedding-004 was shut down by Google on Jan 14, 2026 — this is the current replacement
 
 class EmbeddingManager {
   // reuses gemini's key list — same Google AI Studio keys work for both endpoints.
@@ -152,7 +188,14 @@ class EmbeddingManager {
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: { parts: [{ text: text.slice(0, 2000) }] } }),
+          body: JSON.stringify({
+            content: { parts: [{ text: text.slice(0, 2000) }] },
+            // gemini-embedding-001 defaults to 3072 dims — fine for accuracy,
+            // but storing 60+ of those in one Firestore doc (memoryStore's
+            // shape) would blow past the 1MiB per-document limit. 768 keeps
+            // the same footprint the old text-embedding-004 vectors had.
+            outputDimensionality: 768,
+          }),
         }
       );
       if (!res.ok) {
@@ -822,7 +865,23 @@ async function loadMemories(scope: 'server' | 'person', scopeId: string): Promis
 async function saveMemories(scope: 'server' | 'person', scopeId: string, entries: Memory[]) {
   const key = memDocId(scope, scopeId);
   memStoreCache.delete(key);
-  await db.collection('memoryStore').doc(key).set({ entries }, { merge: false }).catch(() => {});
+  // Firestore throws a hard, uncaught-worthy error on ANY undefined field
+  // (not just top-level — nested too, like entries[].subjectUserId here).
+  // subjectUserId/sourceLabel/expiresAt are undefined on most entries, so
+  // every server-scoped write (which never sets subjectUserId) was one
+  // Firestore call away from crashing the entire process. JSON round-trip
+  // strips undefined keys cleanly since JSON.stringify just omits them —
+  // simplest fix that can't silently miss a nested field later.
+  const clean = JSON.parse(JSON.stringify(entries));
+  try {
+    await db.collection('memoryStore').doc(key).set({ entries: clean }, { merge: false });
+  } catch (e: any) {
+    // Firestore's .set() can throw SYNCHRONOUSLY on invalid data (validation
+    // runs before the promise exists) — a bare .catch() on the call doesn't
+    // protect against that, only try/catch around the call does. this is
+    // exactly the class of bug that just took the whole process down.
+    console.warn('[Mem] save failed:', e.message?.slice(0, 120));
+  }
 }
 
 // the one write path for everything the bot remembers.
