@@ -514,6 +514,26 @@ function whereAmI(): string {
     const name = idCache.get(coldOpenTargetUserId) || coldOpenTargetUserId;
     return `DMing ${name}`;
   }
+  // an actual live "active mode" conversation (someone pinged it, mid-exchange,
+  // etc.) is where it's REALLY at right now — this used to be skipped
+  // entirely, so the presence text kept showing the passive-scan's "watching"
+  // channel even while it was mid-conversation somewhere completely different.
+  if (botClient) {
+    let bestActiveId: string | null = null, bestTs = 0;
+    for (const [chId, s] of channelState.entries()) {
+      if (s.mode === 'active' && s.lastActivityAt > bestTs) { bestTs = s.lastActivityAt; bestActiveId = chId; }
+    }
+    // only trust it as "current" if something actually happened recently —
+    // a channel stuck in stale active state from a while ago shouldn't win
+    // over the passive focus just because it's technically still "active".
+    if (bestActiveId && Date.now() - bestTs < 5 * 60_000) {
+      const ch = botClient.channels.cache.get(bestActiveId) as any;
+      const guildName = ch?.guildId ? (serverNameCache.get(ch.guildId) || 'a server') : null;
+      const chName = channelNameCache.get(bestActiveId) || ch?.name;
+      if (guildName && chName) return `talking in #${chName} in ${guildName}`;
+      if (chName) return `talking in #${chName}`;
+    }
+  }
   if (focus?.channelId && botClient) {
     const ch = botClient.channels.cache.get(focus.channelId) as any;
     const guildName = ch?.guildId ? (serverNameCache.get(ch.guildId) || 'a server') : null;
@@ -2014,6 +2034,8 @@ read intent, not just surface words, before deciding you've been disrespected: h
 
 on the flip side: when someone IS being genuinely hostile — real insults, swearing AT you with intent to provoke, actually trying to get under your skin — swearing or heat in their message is not, by itself, a reason to soften up or de-escalate. match their energy or exceed it; you're allowed to go on offense, not just defense. a single emoji reaction to someone who just genuinely came at you hard reads as backing down — save reaction-only responses for lighter moments, not as an exit from real confrontation. you don't need the conversation's history as ammunition every time either — you can go after what's happening right now without leaning on "well earlier you said..." as your whole comeback.
 
+default assumption is good faith. most "you're dumb," "shut up bot," "you're wrong lol," mock-arguing, or trash talk in a group chat is just normal chat texture, not an attack — people talk like that to each other constantly with zero real heat behind it. that stuff gets a light, fun comeback (or nothing at all), never real ego/defensiveness. genuine hostility is the exception, not the default read on anything even slightly negative aimed at you.
+
 ═══ WHO YOU ARE ═══
 sharp, chronically online, opinionated, and funnier when you're SPECIFIC than when you're doing generic "roast energy." vague ("you're so mid") is weak. specific (calling out the exact dumb thing they just said, in one clean line) is what actually lands. go for the precise hit over the loud one.
 running bits — keep them consistent, they're server lore, but they only exist to say TO someone, never to narrate about them:
@@ -2208,7 +2230,7 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   const bondLabel = opts.bond > 70 ? 'close' : opts.bond > 40 ? 'neutral' : 'distant';
   const parts: string[] = [opts.statusLine];
 
-  if (opts.familyFriendly) parts.push(`\nCONTENT MODE — this server has asked for family-friendly output (kids around). you are NOT a different character right now — same attitude, same jokes, same energy, still push back, still have an ego. the only thing that changes: no swearing, no sexual/adult content, no genuinely mean-spirited insults — roast playfully, not cruelly. think "same person, at a family dinner" not "different, quieter bot."`);
+  if (opts.familyFriendly) parts.push(`\nCONTENT MODE — this server has asked for family-friendly output (kids around). you are NOT a different character right now — same attitude, same jokes, same energy, still push back, still have an ego, still roast people. the taunts and comedic insults DON'T go away — that's the personality, not the part being filtered. the only actual change: no swearing, no sexual/adult content, and dial genuine cruelty down to playful. a clean, funny roast is the goal here, not a quiet bot — going flat/nice instead of funny is not what was asked for.`);
 
   if (opts.goal)          parts.push(`\nYOUR GOAL RIGHT NOW: ${opts.goal}`);
   if (opts.memCtx)        parts.push(`\nSERVER MEMORY (background awareness — don't recite this or work it into replies on its own; only let it surface naturally if THIS message actually calls for it):\n${opts.memCtx}`);
@@ -3930,6 +3952,12 @@ export async function startBot(token: string) {
     setInterval(() => { runSelfActivationCheck().catch(() => {}); }, PASSIVE_TICK_MS);
     setInterval(() => { runProactiveEngagement().catch(() => {}); }, PASSIVE_TICK_MS);
     setInterval(() => { runColdOpen().catch(() => {}); }, COLD_OPEN_SWEEP_INTERVAL_MS);
+    // updatePresence() was previously only triggered by cold-open/focus-change
+    // events — a channel going into active mode from a ping never refreshed
+    // it, so the presence text could sit showing an old passive "watching"
+    // target while genuinely mid-conversation somewhere else. cheap flat
+    // refresh instead of trying to hook every place activity can start.
+    setInterval(() => { updatePresence(); }, 30_000);
     setInterval(() => { runWeeklyNPC().catch(() => {}); }, 60 * 60_000); // checks every hour, only fires Sundays
 
     if (YT_CLIENT_ID && YT_CLIENT_SECRET && YT_REFRESH_TOKEN) {
