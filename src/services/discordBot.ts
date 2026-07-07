@@ -139,6 +139,19 @@ class GeminiManager {
         // generation, etc.) is NOT a usable result — retry like any other
         // failure instead of letting an empty string masquerade as success.
         if (!text.trim()) {
+          // finish=unknown specifically means candidates[0] didn't exist at
+          // all — that's almost always a safety block on the PROMPT itself
+          // (data.promptFeedback.blockReason) rather than a transient server
+          // hiccup, and up to now that reason was silently discarded. this is
+          // the actual "why did this call fail" info — log it so a repeated
+          // block on the same kind of content (e.g. someone's personal/
+          // emotional state in personalCtx) is visible instead of looking
+          // identical to a random Gemini 500.
+          if (!data.candidates?.length && data.promptFeedback) {
+            console.warn(`[Gemini] ...${key.slice(-4)} PROMPT BLOCKED — blockReason=${data.promptFeedback.blockReason ?? 'none'} ratings=${JSON.stringify(data.promptFeedback.safetyRatings ?? [])}`);
+          } else if (data.candidates?.[0]?.safetyRatings) {
+            console.warn(`[Gemini] ...${key.slice(-4)} candidate safetyRatings=${JSON.stringify(data.candidates[0].safetyRatings)}`);
+          }
           console.warn(`[Gemini] ...${key.slice(-4)} returned empty text (finish=${finishReason}) — retrying`);
           continue;
         }
@@ -336,7 +349,7 @@ const PROACTIVE_MAX_STRIKES = 3;             // ignored this many times in a row
 // (exact-phrase trigger → DM's back "tiki waka wiki") — the two used to
 // share a name, which is exactly the mismatch that got fixed here. keep
 // them named differently going forward.
-const COLD_OPEN_GLOBAL_QUIET_MS     = 20 * 60_000;  // every server must be this quiet (no human msg anywhere) before a DM-hop is even considered
+const COLD_OPEN_GLOBAL_QUIET_MS     = 10 * 60_000;  // every server must be this quiet (no human msg anywhere) before a DM-hop is even considered
 const COLD_OPEN_SWEEP_INTERVAL_MS   = 4  * 60_000;  // how often we check whether it's time to hop into someone's DMs
 const COLD_OPEN_WAIT_FOR_REPLY_MS   = 6  * 60_000;  // how long it lingers on one person before hopping to someone/something else
 const COLD_OPEN_USER_COOLDOWN_MS    = 6  * 60 * 60_000; // don't re-ping the same person for this long, replied or not
@@ -407,6 +420,36 @@ function getProactiveState(channelId: string): ProactiveState {
 // of hopping away from a person who's actually engaging.
 interface ColdOpenState { lastPingAt: number; pending: boolean; hopTimer: NodeJS.Timeout | null; }
 const coldOpenStates = new Map<string, ColdOpenState>();
+// the in-memory map above is the fast path during a single process's uptime.
+// but it's just a Map — a restart (crash, redeploy, whatever) wipes it clean,
+// which is exactly what caused re-DMing someone 8 minutes after already
+// pinging them: the process forgot it ever happened. this piggybacks the
+// cooldown onto the unified memory engine (kind: 'cold-open-ping', person-
+// scoped, TTL'd) so it survives restarts without a whole new storage system —
+// checked once per user per process lifetime (hydrateColdOpenState below),
+// not on every single sweep, so it's not adding Firestore reads to the hot path.
+const coldOpenHydrated = new Set<string>();
+
+async function hydrateColdOpenState(userId: string) {
+  if (coldOpenHydrated.has(userId) || coldOpenStates.has(userId)) return; // already known this run
+  coldOpenHydrated.add(userId);
+  const top = await getTopMemories('person', userId, { limit: 5 });
+  const marker = top.find(m => m.kind === 'cold-open-ping');
+  if (marker) coldOpenStates.set(userId, { lastPingAt: new Date(marker.lastReinforcedAt).getTime(), pending: false, hopTimer: null });
+}
+
+async function persistColdOpenPing(userId: string) {
+  await remember('person', userId, 'pinged via cold-open', 'cold-open-ping', { ttlMs: COLD_OPEN_USER_COOLDOWN_MS });
+}
+
+// "have we EVER opened a DM with this person" — not just "are they off
+// cooldown right now". used to prefer growing the friend group over
+// re-approaching people it already knows, same instinct as a person who'd
+// rather meet someone new than corner the same acquaintance again.
+async function isStrangerToColdOpen(userId: string): Promise<boolean> {
+  const top = await getTopMemories('person', userId, { limit: 20 });
+  return !top.some(m => m.kind === 'cold-open-ping');
+}
 let coldOpenTargetUserId: string | null = null; // who it's currently "on" — null when nobody's pending
 
 function clearColdOpenHop(userId: string) {
@@ -462,13 +505,13 @@ function msSinceAnyGuildActivity(): number {
   return Date.now() - mostRecent;
 }
 
-interface ColdOpenCandidate { userId: string; name: string; guildId: string; lastMsg: string; online: boolean; recencyMs: number; }
+interface ColdOpenCandidate { userId: string; name: string; guildId: string; lastMsg: string; online: boolean; recencyMs: number; stranger: boolean; }
 
 // pulls candidates from every mutual guild: anyone who's spoken recently in
 // ANY tracked channel (cross-referenced against live presence so "online
 // right now" can outrank "talked a while ago"), skipping muted guilds, the
 // bot itself, and anyone still on cooldown from a previous ping.
-function getColdOpenCandidates(): ColdOpenCandidate[] {
+async function getColdOpenCandidates(): Promise<ColdOpenCandidate[]> {
   if (!botClient) return [];
   const now = Date.now();
   const seen = new Map<string, ColdOpenCandidate>(); // userId -> best candidate seen so far
@@ -486,6 +529,7 @@ function getColdOpenCandidates(): ColdOpenCandidate[] {
       const recencyMs = now - m.ts;
       if (recencyMs > COLD_OPEN_CANDIDATE_MAX_AGE_MS) continue; // talked, but too long ago — not "recently active" anymore
       if (existing && existing.recencyMs <= recencyMs) continue; // already have a more recent sighting of this person
+      await hydrateColdOpenState(m.authorId); // one-time per process: recover cooldown from before a restart, if any
       const hopState = coldOpenStates.get(m.authorId);
       if (hopState && now - hopState.lastPingAt < COLD_OPEN_USER_COOLDOWN_MS) continue; // still on cooldown
       if (coldOpenTargetUserId === m.authorId) continue; // already mid-conversation with them right now
@@ -494,14 +538,17 @@ function getColdOpenCandidates(): ColdOpenCandidate[] {
       const member = guild?.members.cache.get(m.authorId);
       const status = member?.presence?.status; // 'online' | 'idle' | 'dnd' | 'offline' | undefined
       const online = status === 'online' || status === 'idle' || status === 'dnd';
+      const stranger = await isStrangerToColdOpen(m.authorId);
 
-      seen.set(m.authorId, { userId: m.authorId, name: m.author, guildId, lastMsg: m.content.slice(0, 100), online, recencyMs });
+      seen.set(m.authorId, { userId: m.authorId, name: m.author, guildId, lastMsg: m.content.slice(0, 100), online, recencyMs, stranger });
       break; // only need the most recent message per channel per person
     }
   }
 
-  // online + recently-active first, then just recently-active, then everyone else
+  // strangers first (grow the network, don't just corner familiar people),
+  // then online + recently-active, then everyone else.
   return [...seen.values()].sort((a, b) => {
+    if (a.stranger !== b.stranger) return a.stranger ? -1 : 1;
     if (a.online !== b.online) return a.online ? -1 : 1;
     return a.recencyMs - b.recencyMs;
   });
@@ -1726,6 +1773,82 @@ async function executeCommand(
       if (!query) return 'no query given — pass commandArgs.query';
       return await webSearch(query);
     }
+    // ONE general-purpose window into "anything the bot token can see on
+    // Discord" — channels, roles, guild info, a specific user's roles/join
+    // date, who has a role, recent/searched messages in a channel. rather
+    // than adding a brand new hardcoded command every time a new kind of
+    // Discord data is wanted, new needs go INSIDE this switch as another
+    // case on `target` — one command surface, not N of them. if target
+    // isn't recognized it says so and lists what IS supported, so the model
+    // can just retry with a better value instead of silently failing.
+    case 'discord_query': {
+      if (guildId === 'dm') return 'no server context in a DM — this only works in a server channel';
+      const guild = botClient?.guilds.cache.get(guildId);
+      if (!guild) return 'guild not found in cache';
+      const target = String(args.target || '').trim().toLowerCase();
+
+      if (target === 'channels') {
+        const chans = guild.channels.cache.filter(c => c.isTextBased() && !c.isDMBased());
+        return [...chans.values()].map((c: any) => `#${c.name}${c.topic ? ` — ${c.topic.slice(0, 60)}` : ''}`).join('\n') || 'no text channels visible';
+      }
+      if (target === 'roles') {
+        return [...guild.roles.cache.values()]
+          .filter(r => r.name !== '@everyone')
+          .sort((a, b) => b.members.size - a.members.size)
+          .map(r => `${r.name} (${r.members.size} member${r.members.size === 1 ? '' : 's'})`)
+          .join('\n') || 'no roles';
+      }
+      if (target === 'guild_info') {
+        return [
+          `name: ${guild.name}`,
+          `members: ${guild.memberCount}`,
+          `owner: ${(await guild.fetchOwner().catch(() => null))?.user.username ?? 'unknown'}`,
+          `created: ${guild.createdAt.toDateString()}`,
+          `boost level: ${guild.premiumTier} (${guild.premiumSubscriptionCount ?? 0} boosts)`,
+        ].join(' | ');
+      }
+      if (target === 'user_info') {
+        const name = String(args.userName || args.name || '').trim();
+        if (!name) return 'no userName given — pass commandArgs.userName';
+        const member = guild.members.cache.find(m => (m.displayName || m.user.username).toLowerCase() === name.toLowerCase());
+        if (!member) return `no member found named "${name}" in this server`;
+        return [
+          `${member.displayName} (@${member.user.username})`,
+          `joined server: ${member.joinedAt?.toDateString() ?? 'unknown'}`,
+          `account created: ${member.user.createdAt.toDateString()}`,
+          `roles: ${member.roles.cache.filter(r => r.name !== '@everyone').map(r => r.name).join(', ') || 'none'}`,
+          `bot: ${member.user.bot}`,
+        ].join(' | ');
+      }
+      if (target === 'members_with_role') {
+        const roleName = String(args.roleName || args.name || '').trim();
+        if (!roleName) return 'no roleName given — pass commandArgs.roleName';
+        const role = guild.roles.cache.find(r => r.name.toLowerCase() === roleName.toLowerCase());
+        if (!role) return `no role found named "${roleName}"`;
+        const names = [...role.members.values()].map(m => m.displayName || m.user.username);
+        return names.length ? names.join(', ') : `nobody currently has "${role.name}"`;
+      }
+      if (target === 'recent_messages' || target === 'search_messages') {
+        const chanName = String(args.channelName || '').trim();
+        const ch = chanName
+          ? guild.channels.cache.find((c: any) => c.isTextBased() && !c.isDMBased() && c.name.toLowerCase() === chanName.toLowerCase())
+          : botClient?.channels.cache.get(channelId);
+        if (!ch || !(ch as any).isTextBased()) return `no text channel found${chanName ? ` named "${chanName}"` : ''}`;
+        const limit = Math.min(Math.max(Number(args.limit) || 20, 1), 50);
+        const fetched = await (ch as TextChannel).messages.fetch({ limit }).catch(() => null);
+        if (!fetched) return 'failed to fetch messages (missing permission?)';
+        let msgs = [...fetched.values()].reverse();
+        if (target === 'search_messages') {
+          const query = String(args.query || '').trim().toLowerCase();
+          if (!query) return 'no query given — pass commandArgs.query';
+          msgs = msgs.filter(m => m.content.toLowerCase().includes(query));
+          if (!msgs.length) return `nothing matching "${query}" in the last ${limit} messages of #${(ch as any).name}`;
+        }
+        return msgs.map(m => `${m.member?.displayName || m.author.username}: ${m.content.slice(0, 150)}`).join('\n');
+      }
+
+      return `unknown target "${target || '(empty)'}" — supported: channels, roles, guild_info, user_info, members_with_role, recent_messages, search_messages`;
+    }
     case 'get_cross_server': {
       const name = String(args.name || '').trim();
       if (!name) return 'no name given — pass commandArgs.name';
@@ -1857,6 +1980,8 @@ sometimes the right move is one emoji and nothing else, or a single reaction, or
 burst texting: for a reaction that genuinely builds in stages (a thought interrupting itself), split "reply" into up to 3 fragments with "|||" between them — each one still tiny. this is rare, not your default — most turns are one fragment, no "|||" at all. never force a split just to use the feature.
 you know your channel link: http://www.youtube.com/@NotABot_GnG — this is the channel handle ONLY, drop it when someone's asking about the channel itself, never as a substitute for a video link, and never right after you already dropped it recently.
 
+discord_query is your general lookup into anything the server itself can tell you — channels, roles, a specific person's join date/roles, who has a given role, recent or keyword-searched messages in a channel. commandArgs must be {"target": "channels"|"roles"|"guild_info"|"user_info"|"members_with_role"|"recent_messages"|"search_messages"}, plus whichever of userName/roleName/channelName/query/limit that target needs. wrong target or missing arg → the result just tells you what's valid, retry with that.
+
 ═══ SILENCE IS THE DEFAULT (BUT YOU'RE EAGER, NOT LAZY) ═══
 most messages in a real group chat get zero response from anyone. that's not a gap to fill, that's normal. you are not a reply bot — you don't owe a reaction to the newest line just because it's newest.
 default action is "ignore," but the bar is "does this earn a reaction from someone who's actually locked in," not "is this worth the effort" — you're never bored, you're never phoning it in, you're just picky about what's worth breaking silence for. genuinely funny, directed at you, a real question, or just a good opening you want to jump on — any of those clears it easily.
@@ -1925,11 +2050,11 @@ CRITICAL OUTPUT RULE: respond with RAW JSON ONLY. first character "{", last char
   "replyToMsgId": "msgId of the specific message you're threading on, or empty string — most casual banter doesn't need a thread tag, use it only when it'd genuinely be unclear who you're talking to",
   "unansweredMsgId": "msgId of a real question you're deliberately leaving for later, or empty string",
   "aboutSender": "one short note worth remembering about THIS specific sender, or empty string. ONLY for genuinely personal stuff about them as a person — a mood, a life event, something going on ('stressed about grades', 'got the job'). this follows them to every server/DM, not just this one, so never put server gossip, jokes, or drama-about-others here. leave empty almost always — most messages have nothing worth carrying forward.",
-  "pause": 0,
+  "pause": "minutes to deliberately go quiet in THIS room, or 0. this is for being told off, not for a normal lull — a normal quiet moment just needs action:ignore on this one message, nothing more. set pause (5-30) when the room is actually telling you to back off: 'we aren't talking to you', 'shut up', being told to leave a conversation, that kind of clear social rejection — read the room, don't pattern-match one exact phrase. this does NOT mute you completely: if someone directly pings/mentions you during the pause, you still respond normally — it just stops you from jumping into unprompted chatter here for a bit, like a person would actually back off after being told to, not vanish forever and not pretend nothing happened.",
   "goal": "short reason you're engaged, or empty string",
   "stayActive": true,
   "think": "short visible thinking message, or empty string — sent to chat BEFORE you run a command",
-  "command": "get_history|get_member|get_stm|get_video_status|get_channel_info|recall_memory|get_server_stats|get_time|web_search|get_cross_server|set_reminder|create_poll|wiki_lookup|start_event|get_leaderboard|none",
+  "command": "get_history|get_member|get_stm|get_video_status|get_channel_info|recall_memory|get_server_stats|get_time|web_search|get_cross_server|set_reminder|create_poll|wiki_lookup|start_event|get_leaderboard|discord_query|none",
   "commandArgs": {}
 }`;
 
@@ -2014,8 +2139,8 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   const parts: string[] = [opts.statusLine];
 
   if (opts.goal)          parts.push(`\nYOUR GOAL RIGHT NOW: ${opts.goal}`);
-  if (opts.memCtx)        parts.push(`\nSERVER MEMORY:\n${opts.memCtx}`);
-  if (opts.personalCtx)   parts.push(`\nWHAT YOU KNOW ABOUT ${opts.sender.toUpperCase()} AS A PERSON (carries across every server/DM, not just this one):\n${opts.personalCtx}`);
+  if (opts.memCtx)        parts.push(`\nSERVER MEMORY (background awareness — don't recite this or work it into replies on its own; only let it surface naturally if THIS message actually calls for it):\n${opts.memCtx}`);
+  if (opts.personalCtx)   parts.push(`\nWHAT YOU KNOW ABOUT PEOPLE IN THIS CHAT AS PEOPLE (carries across every server/DM they talk to you in, not just this one — same rule: this is context you have, not a topic to bring up every time they talk. if you already referenced this recently, don't repeat it again just because it's still true):\n${opts.personalCtx}`);
   if (opts.historyCtx)    parts.push(`\nHISTORY LOGS (archived summaries):\n${opts.historyCtx}`);
   if (opts.thread)        parts.push(`\nREPLY TO:\n${opts.thread}`);
   if (opts.videoCtx)      parts.push(`\nYOUR NEW VIDEO:\ntitle: "${opts.videoCtx.title}"\nlink: ${opts.videoCtx.url}\n(you just posted this — see "WHEN A NEW VIDEO OF YOURS DROPS" for how to bring it up, if at all)`);
@@ -2060,7 +2185,8 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   // loud. ACTIVE_MODEL keeps its higher temp since that's the chaotic-voice dial.
   const temp           = opts.model === ACTIVE_MODEL ? 0.92 : 0.55;
   const maxOutputTokens = 600; // plenty for the JSON schema + a 3-fragment reply; cuts off runaway prose before it eats the whole generation
-  for (let pass = 0; pass < 3; pass++) {
+  const maxPasses = opts.isSecondPass ? 2 : 3; // second pass already cost a full brain() call for the tool step — don't double the retry budget on top of that, it's exactly what compounds rate-limit pressure into a full outage
+  for (let pass = 0; pass < maxPasses; pass++) {
     try {
       const raw = await gemini.call(
         SYSTEM_PROMPT,
@@ -2081,6 +2207,15 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
     }
   }
 
+  // total failure after all passes: for a normal turn, "brain blipped" at
+  // least acknowledges being pinged/DMed instead of going creepy-silent. but
+  // for a SECOND pass (a tool call already ran, already used up part of the
+  // rate-limit budget) — going quiet reads as a person who got distracted,
+  // going silent is far more human than blurting a broken-sounding line
+  // right after visibly "thinking" out loud.
+  if (opts.isSecondPass) {
+    return { action: 'ignore', reply: '', reaction: '', gifQuery: '', replyToMsgId: '', unansweredMsgId: '', aboutSender: '', pause: 0, goal: '', stayActive: false, think: '', command: 'none', commandArgs: {} };
+  }
   return (opts.mentioned || opts.isDM)
     ? { action: 'speak', reply: 'brain blipped', reaction: '', gifQuery: '', replyToMsgId: '', unansweredMsgId: '', aboutSender: '', pause: 0, goal: opts.goal || '', stayActive: true, think: '', command: 'none', commandArgs: {} }
     : { action: 'ignore', reply: '', reaction: '', gifQuery: '', replyToMsgId: '', unansweredMsgId: '', aboutSender: '', pause: 0, goal: '', stayActive: false, think: '', command: 'none', commandArgs: {} };
@@ -2146,6 +2281,12 @@ async function executeBrainDecision(opts: {
     if (stallTimer) clearTimeout(stallTimer); // command resolved — cancel the stall line if it hadn't fired yet
 
     console.log(`[Command:${decision.command}] result: ${result.slice(0, 80)}${stalled ? ' (was slow — stall line sent)' : ''}`);
+    // small deliberate gap before the second Gemini call — fast local
+    // commands return almost instantly, so without this, two calls land
+    // back-to-back on the same small key pool. that's exactly the pattern
+    // in the logs where a tool call cascades into a full rate-limit storm.
+    // cheap to add, meaningfully reduces how often that compounds.
+    await sleep(500);
     decision = await brain({ ...opts.brainOpts, commandResult: result, isSecondPass: true });
   }
 
@@ -2945,10 +3086,15 @@ async function runColdOpen() {
 
   coldOpenRunning = true;
   try {
-    const candidates = getColdOpenCandidates();
+    const candidates = await getColdOpenCandidates();
     if (!candidates.length) return; // nobody eligible right now — everyone's on cooldown or nothing to go on
 
-    const pick = candidates[0];
+    // pick from the top tier, not always the literal #1 — "grow relationships
+    // with everyone, not run a script" means the order shouldn't be
+    // perfectly deterministic every single sweep.
+    const topTier = candidates.filter(c => c.stranger === candidates[0].stranger && c.online === candidates[0].online);
+    const pick = topTier[Math.floor(Math.random() * Math.min(topTier.length, 3))];
+
     const user = await botClient.users.fetch(pick.userId).catch(() => null);
     if (!user) return;
 
@@ -2967,6 +3113,10 @@ async function runColdOpen() {
     }
 
     const guildName = serverNameCache.get(pick.guildId) || 'a server';
+    const selfNote = pick.stranger
+      ? `you've genuinely never talked to ${pick.name} before — this is a first hello, not a callback to some shared history you don't have. keep it low-key and human: "hey? you around" energy, checking in on a stranger, not performing a big personality intro. one line. if there's truly nothing to open with, action:ignore and nothing sends.`
+      : `you are starting this DM completely unprompted — they did not message you first. keep it tiny: a real greeting or a callback to what they said/did recently, NOT "anyone here" energy and not a generic "hey" with nothing behind it. one line, two max. if you genuinely have nothing worth opening with for this specific person, action:ignore and nothing gets sent.`;
+
     const brainOpts: BrainOpts = {
       model: ACTIVE_MODEL,
       sender: '(cold-open)',
@@ -2978,20 +3128,27 @@ async function runColdOpen() {
       statusLine: `mode: dm-initiate | speak: active | server: DM | channel: #dm`,
       inExchange: false, channelName: 'DM', serverName: 'DM',
       everyonePing: false, endingConvo: false,
-      selfNote: `you are starting this DM completely unprompted — they did not message you first. keep it tiny: a real greeting or a callback to what they said/did recently, NOT "anyone here" energy and not a generic "hey" with nothing behind it. one line, two max. if you genuinely have nothing worth opening with for this specific person, action:ignore and nothing gets sent.`,
+      selfNote,
     };
 
     let decision = await brain(brainOpts);
     decision = await executeBrainDecision({ decision, brainOpts, channel: dmChannel as any, channelId: dmChannelId, guildId: 'dm' });
 
     // cooldown applies regardless of outcome — whether it spoke or chose not
-    // to, this candidate doesn't get re-evaluated again immediately.
+    // to, this candidate doesn't get re-evaluated again immediately. persisted
+    // (not just the in-memory map) so a restart can't undo it.
     coldOpenStates.set(pick.userId, { lastPingAt: Date.now(), pending: false, hopTimer: null });
+    await persistColdOpenPing(pick.userId);
 
     if (decision.action !== 'speak' || !decision.reply?.trim()) {
       console.log(`[ColdOpen] considered ${pick.name} — chose not to open`);
       return;
     }
+
+    // strangers get a real mention attached — a genuine "hey, you" attention-
+    // grab makes sense for someone who's never heard from the bot; someone
+    // it already talks to doesn't need to be pinged like a cold sales DM.
+    if (pick.stranger) decision.reply = `<@${pick.userId}> ${decision.reply}`;
 
     await sendDecision({ channel: dmChannel as any, decision, channelId: dmChannelId, guildId: 'dm' });
 
@@ -3011,7 +3168,7 @@ async function runColdOpen() {
     }, COLD_OPEN_WAIT_FOR_REPLY_MS);
 
     coldOpenStates.set(pick.userId, { lastPingAt: Date.now(), pending: true, hopTimer });
-    console.log(`[ColdOpen] opened DM with ${pick.name} (${pick.online ? 'online' : 'offline'}, from ${guildName})`);
+    console.log(`[ColdOpen] opened DM with ${pick.name} (${pick.online ? 'online' : 'offline'}, ${pick.stranger ? 'stranger' : 'known'}, from ${guildName})`);
   } catch (e) {
     console.error('[ColdOpen]', e);
   } finally { coldOpenRunning = false; }
@@ -3154,11 +3311,26 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
     } catch {}
   }
 
-  const [memberData, memCtx, personalCtx] = await Promise.all([
+  const distinctAuthors = [...new Map(batch.map(b => [b.msg.author.id, b.msg])).values()]
+    .filter(m => m.author.id !== BOT_ID);
+
+  const [memberData, memCtx, personalCtxEntries] = await Promise.all([
     getMember(guildId, last.author.id),
     buildMemCtx(guildId),
-    getPersonalCtx(last.author.id),
+    Promise.all(distinctAuthors.map(async m => ({
+      name: m.member?.displayName || m.author.username,
+      ctx: await getPersonalCtx(m.author.id),
+    }))),
   ]);
+  // one person in the batch → same shape as before, just labeled. multiple
+  // people → each gets their OWN block, so whichever message the model ends
+  // up actually responding to (via replyToMsgId, not necessarily the last
+  // one), it has the right person's context instead of whoever happened to
+  // send the most recent message in the batch.
+  const personalCtx = personalCtxEntries
+    .filter(e => e.ctx)
+    .map(e => `${e.name}:\n${e.ctx}`)
+    .join('\n\n');
   const bond  = typeof memberData.bond === 'number' ? memberData.bond : 50;
   const state = getChState(channelId);
 
@@ -3634,10 +3806,53 @@ export async function startBot(token: string) {
       ? guild.systemChannel
       : guild.channels.cache.find(c => c.isTextBased() && !c.isDMBased() && (c as any).permissionsFor(guild.members.me!)?.has(PermissionFlagsBits.SendMessages)) as TextChannel | undefined;
 
-    if (target) {
-      target.send(
-        `sup, i'm here 👋 talk to me like a normal person, i'll pick up on it. server admins can also just tell me stuff directly — "only talk in this channel", "listen to @SomeBot", "go quiet" — or type \`!help\` for the exact command list.`
-      ).catch(() => {});
+    if (target && gemini.canCall()) {
+      // generated in-character, not a fixed string — same personality that
+      // talks in every other channel, not a separate "onboarding voice".
+      const brainOpts: BrainOpts = {
+        model: ACTIVE_MODEL,
+        sender: '(system)', bond: 50,
+        message: `you just got added to a new server called "${guild.name}". say something to introduce yourself in #${(target as any).name} — genuinely you, not a corporate bot intro.`,
+        transcript: '', memCtx: '', mentioned: false, isDM: false,
+        statusLine: `mode: join-intro | speak: active | server: ${guild.name} | channel: #${(target as any).name}`,
+        inExchange: false, channelName: (target as any).name, serverName: guild.name,
+        everyonePing: false, endingConvo: false,
+        selfNote: `this is the very first thing anyone in this server will see you say. short — one or two lines, real personality, not a feature list. if someone wants the technical admin commands they'll ask, or the owner already got them by DM.`,
+      };
+      const decision = await brain(brainOpts).catch(() => null);
+      if (decision?.action === 'speak' && decision.reply?.trim()) {
+        await target.send(decision.reply).catch(() => {});
+      } else {
+        target.send(`sup, i'm here 👋`).catch(() => {}); // bare minimum fallback if the model had nothing — still not a feature-list dump
+      }
+    }
+
+    // the actual admin toolset goes to the owner by DM, not into the public
+    // intro — this is reference material, not personality, so it stays a
+    // plain factual list rather than something the model improvises.
+    const owner = await guild.fetchOwner().catch(() => null);
+    if (owner) {
+      const cmdList = [
+        `hey — you added me to ${guild.name}. quick reference for the admin side of things (only works for people with admin perms in the server):`,
+        '',
+        '**channel/speaking control:**',
+        '`!wake` / `!sleep` — turn me on/off in a channel',
+        '`!pause <mins>` — go quiet here for N minutes',
+        '`!active` / `!passive` — force active or passive mode in a channel',
+        '`!gmute` / `!gresume` — mute/resume me across the whole server',
+        '',
+        'or just tell me directly in chat — "only talk in #general", "go quiet", "ignore SomeOtherBot" — I pick up on plain instructions like that too, no command needed.',
+        '',
+        '**info/debug:**',
+        '`!status` — current mode/state for a channel',
+        '`!memory` — what I remember about this server',
+        '`!stm` — raw recent transcript I\'m working from',
+        '`!history` — logged summaries',
+        '`!budget` — API key/quota status',
+        '',
+        `**one thing I can't do myself:** I can't click invite links or add myself to other servers — if you want me somewhere else, use my invite link (ask whoever's running me for it, or check \`${'BOT_INVITE_URL'}\` in the bot's env config) the same way you'd add any other bot.`,
+      ].join('\n');
+      await owner.send(cmdList).catch(() => {});
     }
   });
 
@@ -3719,9 +3934,9 @@ export async function startBot(token: string) {
       await msg.reply('done — check logs for what it picked (or why it passed)');
     }
     if (c === '!coldopencandidates') {
-      const list = getColdOpenCandidates().slice(0, 10);
+      const list = (await getColdOpenCandidates()).slice(0, 10);
       await msg.reply(list.length
-        ? list.map(c => `${c.name} — ${c.online ? '🟢 online' : '⚫ offline'} | ${humanDuration(c.recencyMs)} ago | "${c.lastMsg.slice(0, 50)}"`).join('\n')
+        ? list.map(c => `${c.name} — ${c.online ? '🟢 online' : '⚫ offline'} | ${c.stranger ? 'never DMed' : 'known'} | ${humanDuration(c.recencyMs)} ago | "${c.lastMsg.slice(0, 50)}"`).join('\n')
         : 'no eligible candidates right now (everyone on cooldown, or nothing tracked yet)');
     }
     if (c === '!budget') { await msg.reply(gemini.status()); }
