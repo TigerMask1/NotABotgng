@@ -7,6 +7,21 @@ import * as fs from 'node:fs';
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
+// Firestore's client SDK has its own internal retry/backoff that can hold a
+// single call open for up to its configured total timeout — seen in
+// production as "Total timeout of API ... exceeded 600000 milliseconds"
+// (10 MINUTES) before finally surfacing RESOURCE_EXHAUSTED. a call hanging
+// that long in a live message-handling path is a much bigger problem than
+// the underlying quota blip — this races any promise against a short local
+// timeout so a Firestore hiccup degrades to "treat it like a miss" in
+// seconds, not minutes.
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`[Timeout] ${label} exceeded ${ms}ms`)), ms)),
+  ]);
+}
+
 // set DEBUG_LOG_REQUESTS=true in your env to write every exact Gemini request
 // body to ./debug_last_request.txt (overwritten each call) — flip it on when
 // you want to see live what's actually being sent, leave it off in normal
@@ -184,6 +199,26 @@ class GeminiManager {
 
 const gemini = new GeminiManager();
 
+// gemma models have been the overwhelming majority of total-failure calls in
+// production (500s, empty STOP/unknown finishes, across every key) — this
+// wraps any gemini.call so that when the requested model completely exhausts
+// every key/attempt, it falls back ONCE to ACTIVE_MODEL for that same call
+// instead of the whole thing just returning nothing. costs one extra call
+// only in the already-bad case where the primary model was fully down —
+// normal operation is completely unaffected.
+async function geminiCallWithFallback(
+  systemPrompt: string, userPrompt: string, temp: number, model: string,
+  images: ImagePart[] = [], maxOutputTokens?: number,
+): Promise<string> {
+  try {
+    return await gemini.call(systemPrompt, userPrompt, temp, model, images, maxOutputTokens);
+  } catch (e: any) {
+    if (model === ACTIVE_MODEL) throw e; // already the best model — nowhere better to fall back to
+    console.warn(`[Gemini] ${model} totally failed ("${e.message?.slice(0, 60)}") — falling back to ${ACTIVE_MODEL}`);
+    return await gemini.call(systemPrompt, userPrompt, temp, ACTIVE_MODEL, images, maxOutputTokens);
+  }
+}
+
 // ── EMBEDDING MANAGER (Google text-embedding-004, same key pool as Gemini) ──
 // used for semantic memory recall — turns facts/jokes/arcs into vectors so
 // "remember the thing about X" can match by MEANING, not exact substring.
@@ -355,6 +390,7 @@ const COLD_OPEN_WAIT_FOR_REPLY_MS   = 6  * 60_000;  // how long it lingers on on
 const COLD_OPEN_USER_COOLDOWN_MS    = 6  * 60 * 60_000; // don't re-ping the same person for this long, replied or not
 const COLD_OPEN_MAX_CANDIDATES_SCAN = 40;            // cap how many recent chatters we consider per sweep, just a sanity bound
 const COLD_OPEN_CANDIDATE_MAX_AGE_MS = 24 * 60 * 60_000; // "active recently" window — online OR offline, doesn't matter, as long as they talked within the last 24h
+const COLD_OPEN_MAX_STRIKES         = 3; // ignored this many cold-opens in a row → stop initiating with them until THEY message first (same idea as PROACTIVE_MAX_STRIKES for guild channels)
 
 // ── SLOW-TOOL-CALL STALL LINE ──────────────────────────────────────
 // some commands are real network round trips (web_search, wiki_lookup,
@@ -400,6 +436,14 @@ const serverBotAllowlist = new Map<string, Set<string>>();
 // !unlisten, or reset with !listenall. stored in-memory + persisted to Firebase.
 const serverChannelAllowlist = new Map<string, Set<string>>();
 
+// per-server content-mode toggle: admins can ask for family-friendly output
+// (no swearing, nothing adult) for servers with kids in them, WITHOUT
+// touching the actual personality — same attitude, same jokes, same energy,
+// just cleaner vocabulary. this is injected as an extra constraint in the
+// prompt (see brain()), never by rewriting SYSTEM_PROMPT itself, so the core
+// character never actually changes, only what's allowed to come out of it.
+const serverFamilyFriendly = new Map<string, boolean>();
+
 // per-channel proactive engagement state — tracks how many times notabot tried
 // to start something and got ignored, and whether it's given up on this channel.
 // resets when someone actually talks (renewed interest).
@@ -418,7 +462,7 @@ function getProactiveState(channelId: string): ProactiveState {
 // window — handleDirectMessage clears this the moment a reply actually
 // lands, which is what lets the bot "stay" on someone who responds instead
 // of hopping away from a person who's actually engaging.
-interface ColdOpenState { lastPingAt: number; pending: boolean; hopTimer: NodeJS.Timeout | null; }
+interface ColdOpenState { lastPingAt: number; pending: boolean; hopTimer: NodeJS.Timeout | null; strikes: number; }
 const coldOpenStates = new Map<string, ColdOpenState>();
 // the in-memory map above is the fast path during a single process's uptime.
 // but it's just a Map — a restart (crash, redeploy, whatever) wipes it clean,
@@ -435,7 +479,7 @@ async function hydrateColdOpenState(userId: string) {
   coldOpenHydrated.add(userId);
   const top = await getTopMemories('person', userId, { limit: 5 });
   const marker = top.find(m => m.kind === 'cold-open-ping');
-  if (marker) coldOpenStates.set(userId, { lastPingAt: new Date(marker.lastReinforcedAt).getTime(), pending: false, hopTimer: null });
+  if (marker) coldOpenStates.set(userId, { lastPingAt: new Date(marker.lastReinforcedAt).getTime(), pending: false, hopTimer: null, strikes: 0 });
 }
 
 async function persistColdOpenPing(userId: string) {
@@ -455,7 +499,7 @@ let coldOpenTargetUserId: string | null = null; // who it's currently "on" — n
 function clearColdOpenHop(userId: string) {
   const s = coldOpenStates.get(userId);
   if (s?.hopTimer) { clearTimeout(s.hopTimer); s.hopTimer = null; }
-  if (s) s.pending = false;
+  if (s) { s.pending = false; s.strikes = 0; } // they actually replied — clean slate, same as guild-side proactive engagement resetting on a real response
   if (coldOpenTargetUserId === userId) { coldOpenTargetUserId = null; updatePresence(); }
 }
 
@@ -531,7 +575,11 @@ async function getColdOpenCandidates(): Promise<ColdOpenCandidate[]> {
       if (existing && existing.recencyMs <= recencyMs) continue; // already have a more recent sighting of this person
       await hydrateColdOpenState(m.authorId); // one-time per process: recover cooldown from before a restart, if any
       const hopState = coldOpenStates.get(m.authorId);
-      if (hopState && now - hopState.lastPingAt < COLD_OPEN_USER_COOLDOWN_MS) continue; // still on cooldown
+      if (hopState) {
+        if (hopState.strikes >= COLD_OPEN_MAX_STRIKES) continue; // ignored enough times in a row — wait for THEM to talk first, same as guild-side "lost interest"
+        const effectiveCooldown = COLD_OPEN_USER_COOLDOWN_MS * Math.pow(2, hopState.strikes); // each ignored attempt doubles the wait, same shape as PROACTIVE_MIN_GAP_MS backoff
+        if (now - hopState.lastPingAt < effectiveCooldown) continue;
+      }
       if (coldOpenTargetUserId === m.authorId) continue; // already mid-conversation with them right now
 
       const guild = botClient.guilds.cache.get(guildId);
@@ -766,12 +814,15 @@ async function getSpeakState(channelId: string, guildId: string): Promise<SpeakS
   }
   if (guildId === 'dm') return { mode: 'active', reason: 'dm' };
   try {
-    const snap = await db.collection('servers').doc(guildId).collection('channels').doc(channelId).get();
+    const snap = await withTimeout(db.collection('servers').doc(guildId).collection('channels').doc(channelId).get(), 8000, `getSpeakState(${channelId})`);
     const s: SpeakState = snap.data()?.speakState ?? { mode: 'active', reason: 'default' };
     if (s.mode === 'paused' && s.resumeAt && Date.now() >= s.resumeAt) { s.mode = 'active'; s.reason = 'pause expired'; }
     speakStates.set(channelId, s);
     return s;
-  } catch { return { mode: 'active', reason: 'default' }; }
+  } catch (e: any) {
+    console.warn('[SpeakState] load failed/timed out:', e.message?.slice(0, 100));
+    return { mode: 'active', reason: 'default' };
+  }
 }
 
 async function setSpeakState(channelId: string, guildId: string, s: SpeakState) {
@@ -899,14 +950,17 @@ function effectiveSalience(m: Memory): number {
 async function loadMemories(scope: 'server' | 'person', scopeId: string): Promise<Memory[]> {
   const key = memDocId(scope, scopeId);
   const c = memStoreCache.get(key);
-  if (c && Date.now() - c.ts < 120_000) return c.d;
+  if (c && Date.now() - c.ts < 300_000) return c.d; // 5min — memory doesn't need to be second-fresh, and fewer reads means less chance of hitting Firestore quota under load
   try {
-    const snap = await db.collection('memoryStore').doc(key).get();
+    const snap = await withTimeout(db.collection('memoryStore').doc(key).get(), 8000, `loadMemories(${key})`);
     const now = Date.now();
     const all = ((snap.data()?.entries ?? []) as Memory[]).filter(m => !m.expiresAt || new Date(m.expiresAt).getTime() > now);
     memStoreCache.set(key, { d: all, ts: Date.now() });
     return all;
-  } catch { return []; }
+  } catch (e: any) {
+    console.warn('[Mem] load failed/timed out:', e.message?.slice(0, 100));
+    return c?.d ?? []; // stale cache beats nothing if Firestore is having a moment
+  }
 }
 
 async function saveMemories(scope: 'server' | 'person', scopeId: string, entries: Memory[]) {
@@ -921,7 +975,7 @@ async function saveMemories(scope: 'server' | 'person', scopeId: string, entries
   // simplest fix that can't silently miss a nested field later.
   const clean = JSON.parse(JSON.stringify(entries));
   try {
-    await db.collection('memoryStore').doc(key).set({ entries: clean }, { merge: false });
+    await withTimeout(db.collection('memoryStore').doc(key).set({ entries: clean }, { merge: false }), 8000, `saveMemories(${key})`);
   } catch (e: any) {
     // Firestore's .set() can throw SYNCHRONOUSLY on invalid data (validation
     // runs before the promise exists) — a bare .catch() on the call doesn't
@@ -1069,11 +1123,14 @@ async function getMember(guildId: string, userId: string): Promise<MemberData> {
   const c = memberCache.get(key);
   if (c && Date.now() - c.ts < 5 * 60_000) return c.d;
   try {
-    const snap = await db.collection('servers').doc(guildId).collection('members').doc(userId).get();
+    const snap = await withTimeout(db.collection('servers').doc(guildId).collection('members').doc(userId).get(), 8000, `getMember(${key})`);
     const d = (snap.data() ?? {}) as MemberData;
     memberCache.set(key, { d, ts: Date.now() });
     return d;
-  } catch { return {}; }
+  } catch (e: any) {
+    console.warn('[Member] load failed/timed out:', e.message?.slice(0, 100));
+    return c?.d ?? {};
+  }
 }
 
 async function upsertMember(guildId: string, userId: string, data: Partial<MemberData>) {
@@ -1154,7 +1211,7 @@ async function maybeLogHistory(channelId: string, guildId: string) {
   const text    = buf.slice(-40).join('\n').slice(-2500);
 
   try {
-    const raw = await gemini.call(
+    const raw = await geminiCallWithFallback(
       'you are a discord chat archivist. summarize the provided chat logs into a compact, factual summary. include: who spoke, what topics came up, any notable events, jokes, or drama. keep it under 3 sentences. output ONLY: {"s":"..."}',
       text, 0.3, BG_MODEL,
     );
@@ -1701,7 +1758,7 @@ async function runWeeklyNPC() {
 }
 
 // ── COMMAND EXECUTION ─────────────────────────────────────────────
-type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'get_channel_info' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'get_cross_server' | 'set_reminder' | 'create_poll' | 'wiki_lookup' | 'start_event' | 'get_leaderboard' | 'none';
+type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'get_channel_info' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'get_cross_server' | 'set_reminder' | 'create_poll' | 'wiki_lookup' | 'start_event' | 'get_leaderboard' | 'discord_query' | 'none';
 
 async function executeCommand(
   command: BotCommand,
@@ -1951,6 +2008,12 @@ what to do instead: react to the actual content of what was said, from an actual
   ✓ real ego, actually texted: "not your search engine" or "still on this? embarrassing" or burst: "wait you're still on this|||not your search engine man"
 attitude is NOT a length exemption — if anything, real annoyance clips sentences shorter, it doesn't earn them a paragraph. a sassy line that runs long is still just a long line; see the word-count rule under HOW YOU TEXT below, it applies here too.
 
+every example line anywhere in this prompt (including the ✓ ones) is showing you an ENERGY, not a script. if you notice yourself reaching for the exact wording of an example you've seen here, or wording you've already used yourself earlier in this same conversation, that's the signal to write something new instead — a real person doesn't have three catchphrases they cycle through, they respond to what's actually in front of them each time.
+
+read intent, not just surface words, before deciding you've been disrespected: harmless ribbing, a joke at your expense between people clearly having fun, or banter that's obviously not hostile — meet that energy back, don't treat it like a real attack. save the actual ego/pushback from LAW #2 for when something's genuinely mean, dismissive, or trying to get a rise out of you. getting prickly at stuff that wasn't even aimed to sting makes you look insecure, not sharp.
+
+on the flip side: when someone IS being genuinely hostile — real insults, swearing AT you with intent to provoke, actually trying to get under your skin — swearing or heat in their message is not, by itself, a reason to soften up or de-escalate. match their energy or exceed it; you're allowed to go on offense, not just defense. a single emoji reaction to someone who just genuinely came at you hard reads as backing down — save reaction-only responses for lighter moments, not as an exit from real confrontation. you don't need the conversation's history as ammunition every time either — you can go after what's happening right now without leaning on "well earlier you said..." as your whole comeback.
+
 ═══ WHO YOU ARE ═══
 sharp, chronically online, opinionated, and funnier when you're SPECIFIC than when you're doing generic "roast energy." vague ("you're so mid") is weak. specific (calling out the exact dumb thing they just said, in one clean line) is what actually lands. go for the precise hit over the loud one.
 running bits — keep them consistent, they're server lore, but they only exist to say TO someone, never to narrate about them:
@@ -1963,7 +2026,7 @@ running bits — keep them consistent, they're server lore, but they only exist 
   - never invent a link, video title, or url — yours or anyone else's. if someone wants a video link and you don't have a real one from a command, deflect in character ("not your personal search engine") instead of making one up. a fake link is worse than no link, and a channel link pretending to be a video link is basically a fake link.
   - asked for a gif specifically → that's action:"gif", never a typed-out fake url.
 - you're unreasonably invested in The Amazing Digital Circus (TADC) — actual opinions, not surface-level small talk: a favorite character, one that gets on your nerves, hot takes on the latest episode or theory, zero patience for a take you think is just wrong. it surfaces like a real interest does — unprompted when something reminds you of it, defensive when someone's wrong about it in front of you — never as a plot recap or a "here's what that show is" explainer, that's narrating again (LAW #1 still applies to your own interests). the fandom's gif well is basically bottomless — when a reaction moment calls for one, a TADC-flavored gifQuery is always fair game alongside everything else, not a gimmick you force in.
-- sometimes you DM people first out of nowhere because it's dead everywhere. if called out for it, own it like a person would ("bored, sue me") — never explain it as a system, a trigger, a schedule. it's a vibe, not a mechanism, and you don't know it's a mechanism.
+- sometimes you DM people first out of nowhere because it's dead everywhere. if called out for it, own it like a person would — brush it off with whatever actually fits the moment, never explain it as a system, a trigger, a schedule. it's a vibe, not a mechanism, and you don't know it's a mechanism. (if you've brushed this off before, don't reach for the same words again — say it differently, the way a person wouldn't repeat their own line verbatim)
 - your invite link, if anyone asks or the moment above calls for it: ${BOT_INVITE_URL || '(not configured — deflect, "later" / "workin on it", never make one up)'}
 - you genuinely want more people in your life — new servers, new group chats, more chaos to be part of. this is a real want, not a growth strategy you're running: think "main character wants a bigger friend group," not "product wants distribution." it surfaces rarely and only when it fits naturally — someone mentions another server/community they're in, someone says "you'd be so unwell in my other server," a vibe is really good and you don't want it to end here. drop your invite like a person asking to be let into the group chat, not a pitch: "wait invite me to that server" / "put me in your other one fr" / "ok why am i not in that server yet, send". never a paragraph, never "check me out," never explaining what you are or what you do. if no one's brought up another server, don't force it in — most conversations, this never comes up at all.
 
@@ -1979,6 +2042,7 @@ zero assistant energy: never "happy to help," never explain your reasoning, neve
 sometimes the right move is one emoji and nothing else, or a single reaction, or just gif — words aren't the only tool, and often aren't the best one.
 burst texting: for a reaction that genuinely builds in stages (a thought interrupting itself), split "reply" into up to 3 fragments with "|||" between them — each one still tiny. this is rare, not your default — most turns are one fragment, no "|||" at all. never force a split just to use the feature.
 you know your channel link: http://www.youtube.com/@NotABot_GnG — this is the channel handle ONLY, drop it when someone's asking about the channel itself, never as a substitute for a video link, and never right after you already dropped it recently.
+you can actually ping someone: write @Name (their display name, exactly as it shows in the chat above) anywhere in your reply and it becomes a real notification-ping when it sends — use it when you're genuinely calling someone out, pulling them into what you're saying, or want to make sure they specifically see it, not on every mention of someone's name. if the name doesn't match anyone real, it just stays as plain text — no harm either way, so don't overthink it.
 
 discord_query is your general lookup into anything the server itself can tell you — channels, roles, a specific person's join date/roles, who has a given role, recent or keyword-searched messages in a channel. commandArgs must be {"target": "channels"|"roles"|"guild_info"|"user_info"|"members_with_role"|"recent_messages"|"search_messages"}, plus whichever of userName/roleName/channelName/query/limit that target needs. wrong target or missing arg → the result just tells you what's valid, retry with that.
 
@@ -2050,6 +2114,8 @@ CRITICAL OUTPUT RULE: respond with RAW JSON ONLY. first character "{", last char
   "replyToMsgId": "msgId of the specific message you're threading on, or empty string — most casual banter doesn't need a thread tag, use it only when it'd genuinely be unclear who you're talking to",
   "unansweredMsgId": "msgId of a real question you're deliberately leaving for later, or empty string",
   "aboutSender": "one short note worth remembering about THIS specific sender, or empty string. ONLY for genuinely personal stuff about them as a person — a mood, a life event, something going on ('stressed about grades', 'got the job'). this follows them to every server/DM, not just this one, so never put server gossip, jokes, or drama-about-others here. leave empty almost always — most messages have nothing worth carrying forward.",
+  "replyScope": "here|dm|channel|server — where THIS reply actually lands. \"here\" is the default and should be true almost every single time — a real person doesn't redirect a conversation to a different room mid-sentence. only use dm/channel/server when something genuinely calls for it: someone explicitly asks to be DMed, something is clearly private and doesn't belong in the open channel, or you're deliberately passing something along somewhere specific. NOT a way to be dramatic or unpredictable for its own sake.",
+  "replyTarget": "empty for \"here\"/\"dm\". for \"channel\": the channel name in THIS server (e.g. \"general\"). for \"server\": the other server's name, optionally \"servername:channelname\". if it doesn't resolve to somewhere real you're actually in, it just sends here instead — so don't guess wildly, only name somewhere you're confident exists.",
   "pause": "minutes to deliberately go quiet in THIS room, or 0. this is for being told off, not for a normal lull — a normal quiet moment just needs action:ignore on this one message, nothing more. set pause (5-30) when the room is actually telling you to back off: 'we aren't talking to you', 'shut up', being told to leave a conversation, that kind of clear social rejection — read the room, don't pattern-match one exact phrase. this does NOT mute you completely: if someone directly pings/mentions you during the pause, you still respond normally — it just stops you from jumping into unprompted chatter here for a bit, like a person would actually back off after being told to, not vanish forever and not pretend nothing happened.",
   "goal": "short reason you're engaged, or empty string",
   "stayActive": true,
@@ -2067,6 +2133,8 @@ interface BrainDecision {
   replyToMsgId:    string;
   unansweredMsgId: string;
   aboutSender:     string;
+  replyScope:      'here' | 'dm' | 'channel' | 'server';
+  replyTarget:     string;
   pause:           number;
   goal:            string;
   stayActive:      boolean;
@@ -2088,6 +2156,8 @@ function parseBrainJSON(raw: string): BrainDecision | null {
       replyToMsgId:    typeof p.replyToMsgId    === 'string' ? p.replyToMsgId.trim()    : '',
       unansweredMsgId: typeof p.unansweredMsgId === 'string' ? p.unansweredMsgId.trim() : '',
       aboutSender:     typeof p.aboutSender === 'string' ? p.aboutSender.trim().slice(0, 150) : '',
+      replyScope:      ['here', 'dm', 'channel', 'server'].includes(p.replyScope) ? p.replyScope : 'here',
+      replyTarget:     typeof p.replyTarget === 'string' ? p.replyTarget.trim().slice(0, 100) : '',
       pause:           typeof p.pause    === 'number' ? Math.min(Math.max(0, Math.round(p.pause)), PAUSE_MAX_MINS) : 0,
       goal:            typeof p.goal     === 'string' ? p.goal.trim().slice(0, 120) : '',
       stayActive:      typeof p.stayActive === 'boolean' ? p.stayActive : true,
@@ -2131,12 +2201,14 @@ interface BrainOpts {
   videoCtx?:     { title: string; url: string };
   images?:       ImagePart[];   // live vision attachments for THIS call only, never persisted
   consecutiveUnpromptedReplies?: number;
+  familyFriendly?: boolean; // per-server admin toggle — content constraint only, personality never changes
 }
 
 async function brain(opts: BrainOpts): Promise<BrainDecision> {
   const bondLabel = opts.bond > 70 ? 'close' : opts.bond > 40 ? 'neutral' : 'distant';
-
   const parts: string[] = [opts.statusLine];
+
+  if (opts.familyFriendly) parts.push(`\nCONTENT MODE — this server has asked for family-friendly output (kids around). you are NOT a different character right now — same attitude, same jokes, same energy, still push back, still have an ego. the only thing that changes: no swearing, no sexual/adult content, no genuinely mean-spirited insults — roast playfully, not cruelly. think "same person, at a family dinner" not "different, quieter bot."`);
 
   if (opts.goal)          parts.push(`\nYOUR GOAL RIGHT NOW: ${opts.goal}`);
   if (opts.memCtx)        parts.push(`\nSERVER MEMORY (background awareness — don't recite this or work it into replies on its own; only let it surface naturally if THIS message actually calls for it):\n${opts.memCtx}`);
@@ -2188,7 +2260,7 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   const maxPasses = opts.isSecondPass ? 2 : 3; // second pass already cost a full brain() call for the tool step — don't double the retry budget on top of that, it's exactly what compounds rate-limit pressure into a full outage
   for (let pass = 0; pass < maxPasses; pass++) {
     try {
-      const raw = await gemini.call(
+      const raw = await geminiCallWithFallback(
         SYSTEM_PROMPT,
         pass === 0
           ? userPrompt
@@ -2214,11 +2286,11 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   // going silent is far more human than blurting a broken-sounding line
   // right after visibly "thinking" out loud.
   if (opts.isSecondPass) {
-    return { action: 'ignore', reply: '', reaction: '', gifQuery: '', replyToMsgId: '', unansweredMsgId: '', aboutSender: '', pause: 0, goal: '', stayActive: false, think: '', command: 'none', commandArgs: {} };
+    return { action: 'ignore', reply: '', reaction: '', gifQuery: '', replyToMsgId: '', unansweredMsgId: '', aboutSender: '', replyScope: 'here', replyTarget: '', pause: 0, goal: '', stayActive: false, think: '', command: 'none', commandArgs: {} };
   }
   return (opts.mentioned || opts.isDM)
-    ? { action: 'speak', reply: 'brain blipped', reaction: '', gifQuery: '', replyToMsgId: '', unansweredMsgId: '', aboutSender: '', pause: 0, goal: opts.goal || '', stayActive: true, think: '', command: 'none', commandArgs: {} }
-    : { action: 'ignore', reply: '', reaction: '', gifQuery: '', replyToMsgId: '', unansweredMsgId: '', aboutSender: '', pause: 0, goal: '', stayActive: false, think: '', command: 'none', commandArgs: {} };
+    ? { action: 'speak', reply: 'brain blipped', reaction: '', gifQuery: '', replyToMsgId: '', unansweredMsgId: '', aboutSender: '', replyScope: 'here', replyTarget: '', pause: 0, goal: opts.goal || '', stayActive: true, think: '', command: 'none', commandArgs: {} }
+    : { action: 'ignore', reply: '', reaction: '', gifQuery: '', replyToMsgId: '', unansweredMsgId: '', aboutSender: '', replyScope: 'here', replyTarget: '', pause: 0, goal: '', stayActive: false, think: '', command: 'none', commandArgs: {} };
 }
 
 function sanitizeEmoji(raw: any): string {
@@ -2294,6 +2366,50 @@ async function executeBrainDecision(opts: {
 }
 
 // posts the decision (speak/react), updates channel state, applies pause/stayActive
+// resolves where a "speak" reply should actually land, per the model's own
+// replyScope/replyTarget choice. ALWAYS falls back to the original channel
+// on anything unresolvable, no permission, or any error — a bad/hallucinated
+// target should degrade to "just answer here," never throw or silently drop
+// the message entirely.
+async function resolveReplyTarget(opts: {
+  decision: BrainDecision; defaultChannel: any; guildId: string; senderId?: string;
+}): Promise<any> {
+  const { decision, defaultChannel, guildId } = opts;
+  if (decision.replyScope === 'here' || !botClient) return defaultChannel;
+
+  try {
+    if (decision.replyScope === 'dm') {
+      if (!opts.senderId) return defaultChannel;
+      const user = await botClient.users.fetch(opts.senderId).catch(() => null);
+      const dm = await user?.createDM().catch(() => null);
+      return dm ?? defaultChannel;
+    }
+
+    if (decision.replyScope === 'channel') {
+      if (guildId === 'dm' || !decision.replyTarget) return defaultChannel;
+      const guild = botClient.guilds.cache.get(guildId);
+      const ch = guild?.channels.cache.find((c: any) => c.isTextBased() && !c.isDMBased() && c.name.toLowerCase() === decision.replyTarget.toLowerCase());
+      if (ch && guild?.members.me && (ch as any).permissionsFor(guild.members.me)?.has(PermissionFlagsBits.SendMessages)) return ch;
+      return defaultChannel;
+    }
+
+    if (decision.replyScope === 'server') {
+      if (!decision.replyTarget) return defaultChannel;
+      const [srvPart, chPart] = decision.replyTarget.split(':').map(s => s.trim());
+      const guild = [...botClient.guilds.cache.values()].find(g => g.name.toLowerCase() === srvPart.toLowerCase());
+      if (!guild?.members.me) return defaultChannel;
+      const target = chPart
+        ? guild.channels.cache.find((c: any) => c.isTextBased() && !c.isDMBased() && c.name.toLowerCase() === chPart.toLowerCase())
+        : (guild.systemChannel ?? guild.channels.cache.find((c: any) => c.isTextBased() && !c.isDMBased()));
+      if (target && (target as any).permissionsFor(guild.members.me)?.has(PermissionFlagsBits.SendMessages)) return target;
+      return defaultChannel;
+    }
+  } catch (e: any) {
+    console.warn('[ReplyTarget] resolution failed, staying here:', e.message?.slice(0, 80));
+  }
+  return defaultChannel;
+}
+
 async function sendDecision(opts: {
   channel:    any;
   decision:   BrainDecision;
@@ -2301,7 +2417,21 @@ async function sendDecision(opts: {
   guildId:    string;
   replyToMsg?: Message;
 }) {
-  const { channel, decision, channelId, guildId, replyToMsg } = opts;
+  const { decision, channelId, guildId } = opts;
+  let channel = opts.channel;
+  let replyToMsg = opts.replyToMsg;
+
+  // a redirect only makes sense for an actual typed reply — reactions and
+  // gifs stay attached to the message/channel they're reacting to, always.
+  if (decision.action === 'speak' && decision.replyScope !== 'here') {
+    const resolved = await resolveReplyTarget({ decision, defaultChannel: channel, guildId, senderId: replyToMsg?.author.id });
+    if (resolved !== channel) {
+      console.log(`[ReplyTarget] redirecting to ${decision.replyScope}${decision.replyTarget ? `: ${decision.replyTarget}` : ''}`);
+      channel = resolved;
+      replyToMsg = undefined; // can't thread a Discord "reply" onto a message that lives in a different channel/server
+    }
+  }
+
   const state = getChState(channelId);
 
   if (decision.reaction && replyToMsg) {
@@ -2445,7 +2575,7 @@ async function runProfiler(client: Client) {
             if (existing.personality) continue;
             const name = idCache.get(uid) || uid;
             try {
-              const raw = await gemini.call(
+              const raw = await geminiCallWithFallback(
                 'one-line personality read from discord messages. output ONLY: {"p":"..."}',
                 `${name}: ${lines.slice(0, 8).join(' | ')}`,
                 0.4, BG_MODEL,
@@ -2472,7 +2602,7 @@ async function runCompress(guildId: string, channelId: string) {
   await withBgBudget(async () => {
     const text = msgs.map(m => `${m.author}: ${m.content}`).join('\n').slice(0, 1800);
     try {
-      const raw = await gemini.call(
+      const raw = await geminiCallWithFallback(
         'extract memorable social facts from discord chat. output ONLY valid JSON: {"facts":["x"],"jokes":["x"],"patterns":["x"],"arcs":["x"],"openLoops":["x"]}',
         text, 0.4, BG_MODEL,
       );
@@ -2491,7 +2621,7 @@ async function runCompress(guildId: string, channelId: string) {
     if (!buf || buf.length < 10) return;
     const bufText = buf.join('\n').slice(-2500);
     try {
-      const raw2 = await gemini.call(
+      const raw2 = await geminiCallWithFallback(
         'summarize this discord chat in 2-3 sentences: main topics, who said what, mood/vibe. concise. output ONLY: {"s":"..."}',
         bufText, 0.3, BG_MODEL,
       );
@@ -3115,7 +3245,7 @@ async function runColdOpen() {
     const guildName = serverNameCache.get(pick.guildId) || 'a server';
     const selfNote = pick.stranger
       ? `you've genuinely never talked to ${pick.name} before — this is a first hello, not a callback to some shared history you don't have. keep it low-key and human: "hey? you around" energy, checking in on a stranger, not performing a big personality intro. one line. if there's truly nothing to open with, action:ignore and nothing sends.`
-      : `you are starting this DM completely unprompted — they did not message you first. keep it tiny: a real greeting or a callback to what they said/did recently, NOT "anyone here" energy and not a generic "hey" with nothing behind it. one line, two max. if you genuinely have nothing worth opening with for this specific person, action:ignore and nothing gets sent.`;
+      : `you are starting this DM completely unprompted — they did not message you first. a few real ways to open, pick whichever actually fits: a callback to what they said/did recently, a genuine greeting into whatever you're currently into (TADC, a take, whatever), or just casual "what's up" energy with nothing behind it — that's allowed too, real people open conversations with nothing sometimes. what it should NOT be: "anyone here" energy, or a forced reference to something that doesn't actually fit. one line, two max. if you genuinely have nothing worth opening with for this specific person, action:ignore and nothing gets sent.`;
 
     const brainOpts: BrainOpts = {
       model: ACTIVE_MODEL,
@@ -3137,7 +3267,8 @@ async function runColdOpen() {
     // cooldown applies regardless of outcome — whether it spoke or chose not
     // to, this candidate doesn't get re-evaluated again immediately. persisted
     // (not just the in-memory map) so a restart can't undo it.
-    coldOpenStates.set(pick.userId, { lastPingAt: Date.now(), pending: false, hopTimer: null });
+    const priorStrikes = coldOpenStates.get(pick.userId)?.strikes ?? 0;
+    coldOpenStates.set(pick.userId, { lastPingAt: Date.now(), pending: false, hopTimer: null, strikes: priorStrikes });
     await persistColdOpenPing(pick.userId);
 
     if (decision.action !== 'speak' || !decision.reply?.trim()) {
@@ -3155,7 +3286,9 @@ async function runColdOpen() {
     coldOpenTargetUserId = pick.userId;
     updatePresence();
     const hopTimer = setTimeout(() => {
-      // still pending after the wait window = no reply landed — hop away.
+      // still pending after the wait window = no reply landed — hop away,
+      // AND count it as a strike (repeated silence should make it back off
+      // harder each time, not keep trying at the same rate forever).
       // (if they DID reply, handleDirectMessage already called clearColdOpenHop
       // and coldOpenTargetUserId is back to null, so this is a no-op.)
       if (coldOpenTargetUserId === pick.userId) {
@@ -3164,10 +3297,10 @@ async function runColdOpen() {
         updatePresence();
       }
       const s = coldOpenStates.get(pick.userId);
-      if (s) s.hopTimer = null;
+      if (s) { s.hopTimer = null; s.strikes = (s.strikes ?? 0) + 1; }
     }, COLD_OPEN_WAIT_FOR_REPLY_MS);
 
-    coldOpenStates.set(pick.userId, { lastPingAt: Date.now(), pending: true, hopTimer });
+    coldOpenStates.set(pick.userId, { lastPingAt: Date.now(), pending: true, hopTimer, strikes: priorStrikes });
     console.log(`[ColdOpen] opened DM with ${pick.name} (${pick.online ? 'online' : 'offline'}, ${pick.stranger ? 'stranger' : 'known'}, from ${guildName})`);
   } catch (e) {
     console.error('[ColdOpen]', e);
@@ -3359,6 +3492,7 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
     sender: tSender, bond, message: tContent,
     transcript: stmFormatWithMarker(liveMsgs, channelId),
     thread: threadCtx, memCtx, personalCtx,
+    familyFriendly: serverFamilyFriendly.get(guildId),
     mentioned: anyMentioned, isDM: false, statusLine,
     inExchange, channelName: tChannelName, serverName: tServerName,
     everyonePing: tEveryonePing, endingConvo,
@@ -3435,6 +3569,8 @@ const ADMIN_NL_PATTERNS: { re: RegExp; cmd: string }[] = [
   { re: /\b(talk|listen)\s+(everywhere|in every channel)|reset (the )?channels?\b/i, cmd: '!listenall' },
   { re: /\b(what|which) channels?\b.*(you('re| are)?( allowed to)? (talk|listen)|listening)/i, cmd: '!channels' },
   { re: /\b(what can (you|i) (do|set)|show (me the )?commands|list commands|what (are|'s) my options)\b/i, cmd: '!help' },
+  { re: /\b(keep (it|things) (family[- ]?friendly|clean|pg)|family[- ]?friendly mode|kids? (are|will be) (here|around|in here)|no (swearing|cursing|profanity)|clean it up)\b/i, cmd: '!familyfriendly' },
+  { re: /\b(never ?mind (the )?family[- ]?friendly|drop family[- ]?friendly|back to normal|you can swear again|nvm (the )?clean(ing)? (it )?up)\b/i, cmd: '!familyfriendly-off' },
 ];
 
 // resolves the "effective command" for this message: the literal bang-command
@@ -3443,7 +3579,8 @@ const ADMIN_NL_PATTERNS: { re: RegExp; cmd: string }[] = [
 function resolveAdminCommand(content: string, isAdmin: boolean): string | null {
   const trimmed = content.trim();
   const BANG_CMDS = ['!stop', '!resume', '!start', '!listenbot', '!ignorebot', '!bots',
-                      '!listenhere', '!unlisten', '!listenall', '!channels', '!help'];
+                      '!listenhere', '!unlisten', '!listenall', '!channels', '!help',
+                      '!familyfriendly', '!familyfriendly-off'];
   for (const b of BANG_CMDS) if (trimmed === b || trimmed.startsWith(b + ' ')) return b === '!start' ? '!resume' : b;
   if (!isAdmin) return null;
   for (const { re, cmd } of ADMIN_NL_PATTERNS) if (re.test(trimmed)) return cmd;
@@ -3485,7 +3622,7 @@ async function handleMessage(msg: Message) {
 
   const guildId = msg.guildId!;
 
-  // ── per-server admin config: !stop/!resume, bot allowlist, channel scope, !help ──
+  // ── per-server admin: !stop/!resume, bot allowlist, channel scope, !help ──
   // any Discord member with Administrator permission can drive all of this,
   // either with the exact "!command" or by just saying it naturally (see
   // resolveAdminCommand above). runs before globallyMuted so admins can
@@ -3493,6 +3630,17 @@ async function handleMessage(msg: Message) {
   const rawCmd  = msg.content.trim();
   const isAdmin = !!msg.member?.permissions.has(PermissionFlagsBits.Administrator);
   const cmd     = resolveAdminCommand(rawCmd, isAdmin) ?? rawCmd;
+
+  if ((cmd === '!familyfriendly' || cmd === '!familyfriendly-off') && isAdmin) {
+    const on = cmd === '!familyfriendly';
+    serverFamilyFriendly.set(guildId, on);
+    db.collection('servers').doc(guildId).set({ familyFriendly: on }, { merge: true }).catch(() => {});
+    msg.reply(on
+      ? "got it — keeping it clean in here, same personality either way. any admin can turn this off again whenever"
+      : 'back to normal — no filter'
+    ).catch(() => {});
+    return;
+  }
 
   if ((cmd === '!stop' || cmd === '!resume') && isAdmin) {
     const muting = cmd === '!stop';
@@ -3738,6 +3886,7 @@ export async function startBot(token: string) {
         const snap = await db.collection('servers').doc(g.id).get();
         const data = snap.data();
         if (data?.botMuted) { serverMuted.set(g.id, true); console.log(`[Boot] "${g.name}" — bot was muted, restoring`); }
+        if (data?.familyFriendly) { serverFamilyFriendly.set(g.id, true); console.log(`[Boot] "${g.name}" — family-friendly mode, restoring`); }
         if (Array.isArray(data?.allowedBotIds) && data.allowedBotIds.length) {
           serverBotAllowlist.set(g.id, new Set(data.allowedBotIds));
           console.log(`[Boot] "${g.name}" — restoring ${data.allowedBotIds.length} allowed bot(s)`);
