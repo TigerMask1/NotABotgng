@@ -1,271 +1,230 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Bot, Power, ShieldAlert, Cpu, Database, Ghost, MessageSquare, Zap } from 'lucide-react';
+import { Power, ShieldAlert, Radio, Database, KeyRound, Gauge, Ghost } from 'lucide-react';
+
+const FONT_IMPORT = `
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+`;
+
+interface KeyStat {
+  key: string;
+  requestsToday: number;
+  errorsToday: number;
+  rate429sToday: number;
+  onCooldown: boolean;
+  cooldownSecondsLeft: number;
+}
+interface ModelStat {
+  model: string;
+  requests: number;
+  promptTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+interface GeminiStats {
+  day: string;
+  keys: KeyStat[];
+  models: ModelStat[];
+}
+interface MemoryEntry {
+  guildId: string;
+  entryCount: number;
+  byKind: Record<string, string[]>;
+}
 
 export default function App() {
   const [status, setStatus] = useState<any>(null);
+  const [gemini, setGemini] = useState<GeminiStats | null>(null);
+  const [memory, setMemory] = useState<MemoryEntry[]>([]);
   const [token, setToken] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [memory, setMemory] = useState<any[]>([]);
+  const [pulseHistory, setPulseHistory] = useState<number[]>(Array(40).fill(0));
+  const lastTotal = useRef(0);
 
   const fetchStatus = async () => {
+    try { setStatus(await (await fetch('/api/status')).json()); }
+    catch (err) { console.error('status fetch failed', err); }
+  };
+
+  const fetchGemini = async () => {
     try {
-      const res = await fetch('/api/status');
-      const data = await res.json();
-      setStatus(data);
-    } catch (err) {
-      console.error("Failed to fetch status", err);
-    }
+      const data: GeminiStats = await (await fetch('/api/gemini/stats')).json();
+      setGemini(data);
+      const total = data.models.reduce((sum, m) => sum + m.requests, 0);
+      const delta = Math.max(0, total - lastTotal.current);
+      lastTotal.current = total;
+      setPulseHistory(h => [...h.slice(1), delta]);
+    } catch (err) { console.error('gemini stats fetch failed', err); }
   };
 
   const fetchMemory = async () => {
-    try {
-      const res = await fetch('/api/memory');
-      const data = await res.json();
-      setMemory(data);
-    } catch (err) {
-      console.error("Failed to fetch memory", err);
-    }
+    try { setMemory(await (await fetch('/api/memory')).json()); }
+    catch (err) { console.error('memory fetch failed', err); }
   };
 
   useEffect(() => {
-    fetchStatus();
-    fetchMemory();
-    const interval = setInterval(() => {
-      fetchStatus();
-      fetchMemory();
-    }, 10000);
-    return () => clearInterval(interval);
+    fetchStatus(); fetchMemory(); fetchGemini();
+    const slow = setInterval(() => { fetchStatus(); fetchMemory(); }, 10000);
+    const fast = setInterval(fetchGemini, 5000);
+    return () => { clearInterval(slow); clearInterval(fast); };
   }, []);
 
   const handleToggle = async () => {
-    setLoading(true);
-    setError('');
+    setLoading(true); setError('');
     const endpoint = status?.botStatus === 'running' ? '/api/bot/stop' : '/api/bot/start';
     try {
       const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: token || undefined })
+        body: JSON.stringify({ token: token || undefined }),
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
       await fetchStatus();
-    } catch (err: any) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
+    } catch (err: any) { setError(err.message); }
+    finally { setLoading(false); }
   };
 
   const isRunning = status?.botStatus === 'running';
+  const totalTokensToday = gemini?.models.reduce((s, m) => s + m.totalTokens, 0) ?? 0;
+  const totalReqToday = gemini?.models.reduce((s, m) => s + m.requests, 0) ?? 0;
 
   return (
-    <div className="min-h-screen bg-neutral-950 text-neutral-100 font-sans selection:bg-purple-500/30">
-      {/* Abstract Background Decor */}
-      <div className="fixed inset-0 overflow-hidden pointer-events-none">
-        <div className="absolute -top-24 -left-24 w-96 h-96 bg-purple-600/10 rounded-full blur-3xl animate-pulse" />
-        <div className="absolute top-1/2 -right-24 w-64 h-64 bg-blue-600/10 rounded-full blur-3xl" />
-      </div>
+    <div
+      className="min-h-screen"
+      style={{ background: '#0A0C10', color: '#F2EFE9', fontFamily: "'Space Grotesk', sans-serif" }}
+    >
+      <style>{FONT_IMPORT}</style>
 
-      <main className="relative z-10 max-w-4xl mx-auto px-6 py-12 lg:py-24">
+      <main className="max-w-5xl mx-auto px-6 py-10 lg:py-16">
         {/* Header */}
-        <header className="mb-16 flex items-center justify-between">
-          <div className="flex items-center gap-4">
-            <div className="p-3 bg-purple-500/20 rounded-2xl border border-purple-500/20">
-              <Ghost className="w-8 h-8 text-purple-400" />
-            </div>
-            <div>
-              <h1 className="text-3xl font-bold tracking-tight text-white mb-1">ChaosBot</h1>
-              <div className="flex items-center gap-2">
-                <p className="text-neutral-400 text-sm font-medium">The Sentient Discord Troll</p>
-                <span className="px-1.5 py-0.5 rounded-md bg-blue-500/10 border border-blue-500/20 text-[10px] text-blue-400 font-bold tracking-widest uppercase">Web Service</span>
-              </div>
-            </div>
-          </div>
+        <header className="mb-10 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <span className={`flex h-2 w-2 rounded-full ${isRunning ? 'bg-green-500 animate-ping' : 'bg-red-500'}`} />
-            <span className="text-xs font-mono uppercase tracking-widest text-neutral-500">
-              {isRunning ? 'System Operational' : 'Offline'}
+            <span className="relative flex h-3 w-3">
+              {isRunning && (
+                <span
+                  className="animate-ping absolute inline-flex h-full w-full rounded-full opacity-60"
+                  style={{ background: '#E8A33D' }}
+                />
+              )}
+              <span
+                className="relative inline-flex rounded-full h-3 w-3"
+                style={{ background: isRunning ? '#E8A33D' : '#E24B4B' }}
+              />
             </span>
+            <div>
+              <h1 className="text-2xl font-semibold tracking-tight" style={{ color: '#F2EFE9' }}>NotABot</h1>
+              <p className="text-xs uppercase tracking-[0.2em]" style={{ color: '#8A8F98' }}>
+                {isRunning ? 'alive' : 'offline'} · operator console
+              </p>
+            </div>
           </div>
+
+          <button
+            onClick={handleToggle}
+            disabled={loading || (!status?.hasToken && !token && !isRunning)}
+            className="px-5 py-2.5 rounded-xl text-sm font-medium tracking-wide flex items-center gap-2 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            style={{
+              background: isRunning ? '#14171C' : '#E8A33D',
+              color: isRunning ? '#F2EFE9' : '#0A0C10',
+              border: `1px solid ${isRunning ? '#262B33' : '#E8A33D'}`,
+            }}
+          >
+            {loading
+              ? <div className="w-4 h-4 border-2 rounded-full animate-spin" style={{ borderColor: 'rgba(255,255,255,0.3)', borderTopColor: '#F2EFE9' }} />
+              : <Power className="w-4 h-4" />}
+            {isRunning ? 'Stop' : 'Start'}
+          </button>
         </header>
 
-        {/* Dashboard Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-12">
-          {/* Main Control Card */}
-          <motion.div 
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="lg:col-span-2 p-8 rounded-3xl bg-neutral-900 border border-neutral-800 shadow-2xl relative overflow-hidden group"
-          >
-            <div className="absolute inset-0 bg-gradient-to-br from-purple-500/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
-            <div className="relative z-10">
-              <h2 className="text-xl font-semibold mb-6 flex items-center gap-2">
-                <Power className="w-5 h-5 text-purple-400" />
-                Vitals
-              </h2>
+        {!status?.hasToken && !isRunning && (
+          <div className="mb-8">
+            <input
+              type="password"
+              value={token}
+              onChange={e => setToken(e.target.value)}
+              placeholder="Discord bot token"
+              className="w-full rounded-xl px-4 py-3 text-sm focus:outline-none"
+              style={{ background: '#14171C', border: '1px solid #262B33', color: '#F2EFE9' }}
+            />
+          </div>
+        )}
 
-              {!status?.hasToken && !isRunning && (
-                <div className="mb-6">
-                  <label className="block text-xs font-mono text-neutral-500 uppercase mb-2 tracking-wider">Discord Bot Token</label>
-                  <input 
-                    type="password"
-                    value={token}
-                    onChange={(e) => setToken(e.target.value)}
-                    placeholder="Enter token..."
-                    className="w-full bg-neutral-950 border border-neutral-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-purple-500 transition-colors"
-                  />
-                </div>
-              )}
+        <AnimatePresence>
+          {error && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }}
+              className="mb-8 p-4 rounded-xl text-sm flex items-start gap-2"
+              style={{ background: 'rgba(226,75,75,0.1)', border: '1px solid rgba(226,75,75,0.3)', color: '#E24B4B' }}
+            >
+              <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5" />
+              <span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{error}</span>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
-              <button 
-                onClick={handleToggle}
-                disabled={loading || (!status?.hasToken && !token && !isRunning)}
-                className={`w-full py-4 rounded-xl font-bold text-sm tracking-wide transition-all flex items-center justify-center gap-2 shadow-lg shadow-black/20 ${
-                  isRunning 
-                    ? 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300' 
-                    : 'bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white'
-                } disabled:opacity-50 disabled:cursor-not-allowed`}
-              >
-                {loading ? (
-                  <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                ) : (
-                  <>
-                    <Power className="w-4 h-4" />
-                    {isRunning ? 'Kill Switch' : 'Ignite System'}
-                  </>
-                )}
-              </button>
-
-              <AnimatePresence>
-                {error && (
-                  <motion.div 
-                    initial={{ height: 0, opacity: 0 }}
-                    animate={{ height: 'auto', opacity: 1 }}
-                    exit={{ height: 0, opacity: 0 }}
-                    className="mt-4 p-4 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-xs flex items-start gap-2"
-                  >
-                    <ShieldAlert className="w-4 h-4 shrink-0" />
-                    <span>{error}</span>
-                  </motion.div>
-                )}
-              </AnimatePresence>
+        {/* Vitals strip — signature element: a live pulse line built from real
+            request deltas each poll. flatlines when nothing's happening,
+            spikes on activity — the thing this console exists to show. */}
+        <section
+          className="mb-8 rounded-2xl p-6"
+          style={{ background: '#14171C', border: '1px solid #262B33' }}
+        >
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <Radio className="w-4 h-4" style={{ color: '#E8A33D' }} />
+              <span className="text-xs uppercase tracking-[0.2em]" style={{ color: '#8A8F98' }}>Vitals</span>
             </div>
-          </motion.div>
-
-          {/* Stats/Status Card */}
-            <div className="flex flex-col gap-4">
-              <StatusTile 
-                title="AI Intelligence" 
-                value={status?.botStats?.model || 'Searching...'} 
-                icon={<Zap className={status?.hasAiKey ? 'text-yellow-400' : 'text-neutral-600'} />}
-                active={!!status?.hasAiKey}
-              />
-              <StatusTile 
-                title="Brain State" 
-                value={status?.botStats?.state?.toUpperCase() || 'OFFLINE'} 
-                icon={<Cpu className={status?.botStats?.state === 'online' ? 'text-green-400' : 'text-red-400'} />}
-                active={isRunning}
-              />
-              <div className="p-6 rounded-3xl border bg-neutral-900 border-neutral-800">
-                <p className="text-neutral-500 text-[10px] font-mono uppercase tracking-widest mb-3">Today's Energy</p>
-                <div className="flex items-end justify-between mb-2">
-                  <span className="text-xl font-bold text-white">{status?.botStats?.dailyUsage || 0}</span>
-                  <span className="text-[10px] text-neutral-500">msgs sent</span>
-                </div>
-                <div className="w-full h-1.5 bg-neutral-800 rounded-full overflow-hidden">
-                  <motion.div 
-                    initial={{ width: 0 }}
-                    animate={{ width: '100%' }}
-                    className="h-full bg-green-500"
-                  />
-                </div>
-                <p className="mt-3 text-[10px] text-neutral-400 flex items-center gap-1">
-                  <MessageSquare className="w-3 h-3" />
-                  {status?.botStats?.rpm || 0} messages per minute
-                </p>
-              </div>
-            </div>
-        </div>
-
-        {/* Memory Grid */}
-        <section className="mb-12">
-          <div className="flex items-center justify-between mb-6">
-            <h3 className="text-xl font-bold flex items-center gap-2">
-              <Database className="w-5 h-5 text-blue-400" />
-              Learned Memory
-            </h3>
-            <span className="text-[10px] font-mono text-neutral-500 uppercase tracking-widest">Real-time Sync</span>
+            <span className="text-[11px]" style={{ fontFamily: "'IBM Plex Mono', monospace", color: '#8A8F98' }}>
+              {gemini?.day ? `day: ${gemini.day} · resets midnight PT` : '—'}
+            </span>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {memory.length > 0 ? memory.map((s) => (
-              <div key={s.guildId} className="p-6 rounded-3xl bg-neutral-900 border border-neutral-800">
-                <p className="text-[10px] font-mono text-neutral-500 uppercase mb-3 truncate">ID: {s.guildId}</p>
-                <div className="mb-4">
-                  <span className="text-xs text-neutral-400 block mb-2 font-medium">Inside Jokes:</span>
-                  <div className="flex flex-wrap gap-2">
-                    {s.jokes.length > 0 ? s.jokes.map((j: string, i: number) => (
-                      <span key={i} className="px-2 py-1 bg-blue-500/10 border border-blue-500/20 text-blue-400 text-[10px] rounded-lg">
-                        {j}
-                      </span>
-                    )) : <span className="text-xs text-neutral-600 italic">No jokes learned yet.</span>}
-                  </div>
-                </div>
-                <div>
-                  <span className="text-xs text-neutral-400 block mb-1 font-medium">Intent / Mood:</span>
-                  <p className="text-sm font-bold text-white capitalize">{s.intent || 'chill'}</p>
-                </div>
-              </div>
-            )) : (
-              <div className="col-span-full py-12 text-center border border-dashed border-neutral-800 rounded-3xl">
-                <Ghost className="w-8 h-8 text-neutral-800 mx-auto mb-3" />
-                <p className="text-neutral-500 text-sm">No servers found. Ignite the bot to start learning.</p>
-              </div>
+          <PulseLine values={pulseHistory} color="#E8A33D" />
+
+          <div className="grid grid-cols-3 gap-4 mt-5">
+            <Metric label="requests today" value={totalReqToday.toLocaleString()} accent="#E8A33D" />
+            <Metric label="tokens today" value={totalTokensToday.toLocaleString()} accent="#4FA8C9" />
+            <Metric label="keys active" value={`${gemini?.keys.filter(k => !k.onCooldown).length ?? 0} / ${gemini?.keys.length ?? 0}`} accent="#F2EFE9" />
+          </div>
+        </section>
+
+        {/* Per-key live status */}
+        <section className="mb-8">
+          <SectionHeader icon={<KeyRound className="w-4 h-4" />} title="API Keys" sub={`${gemini?.keys.length ?? 0} loaded`} />
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {gemini?.keys.length ? gemini.keys.map(k => <KeyCard key={k.key} k={k} />) : (
+              <EmptyState text="No key data yet — start the bot to see live usage." />
             )}
           </div>
         </section>
 
-        <section className="mt-8 p-8 rounded-3xl bg-purple-500/10 border border-purple-500/20">
-          <h3 className="text-lg font-semibold mb-4 text-purple-300">Quick Start Guide</h3>
-          <ol className="list-decimal list-inside space-y-4 text-sm text-neutral-300">
-            <li>
-              <strong>Invite the Bot:</strong> Use the Discord Developer Portal to generate an invite link with <code className="bg-black/40 px-1.5 py-0.5 rounded">bot</code> and <code className="bg-black/40 px-1.5 py-0.5 rounded">applications.commands</code> scopes, and <code className="bg-black/40 px-1.5 py-0.5 rounded">Administrator</code> permissions.
-            </li>
-            <li>
-              <strong>Interaction:</strong> Ping the bot with <code className="bg-black/40 px-1.5 py-0.5 rounded">@ChaosBot</code> to start chatting. It will also randomly chime in on 3% of all messages.
-            </li>
-            <li>
-              <strong>Learning:</strong> The more people chat, the more the bot learns. It will automatically start assigning nicknames and using inside jokes after a few interactions.
-            </li>
-          </ol>
-        </section>
-
-        {/* Info Section */}
-        <section className="mt-12 p-8 rounded-3xl bg-neutral-900/50 border border-neutral-800/50 backdrop-blur-sm">
-          <div className="flex items-center gap-3 mb-6">
-            <div className="p-2 bg-neutral-800 rounded-lg">
-              <Cpu className="w-5 h-5 text-neutral-400" />
-            </div>
-            <h3 className="text-lg font-semibold">Bot Capabilities</h3>
-          </div>
-          
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
-            <FeatureItem title="Contextual Memory" desc="Learns names, nicknames, and how people interact in the server." />
-            <FeatureItem title="Inside Joke Engine" desc="Identifies repetative patterns and starts using them against members." />
-            <FeatureItem title="Synthetic Emotion" desc="Responses designed to sound like a real person having a bad (but funny) day." />
-            <FeatureItem title="Proactive Trolling" desc="Doesn't just wait for pings—occasionally interrupts with random nonsense." />
-            <FeatureItem title="Smart Tokens" desc="Optimized context management to keep interactions sharp and cost-effective." />
-            <FeatureItem title="Rich Media" desc="Automated GIF discovery and emoji-heavy vernacular." />
+        {/* Per-model token usage */}
+        <section className="mb-8">
+          <SectionHeader icon={<Gauge className="w-4 h-4" />} title="Models" sub="requests & tokens today" />
+          <div className="rounded-2xl overflow-hidden" style={{ border: '1px solid #262B33' }}>
+            {gemini?.models.length ? gemini.models.map((m, i) => (
+              <ModelRow key={m.model} m={m} isLast={i === gemini.models.length - 1} maxTokens={Math.max(...gemini.models.map(x => x.totalTokens), 1)} />
+            )) : (
+              <div className="p-6"><EmptyState text="No model activity recorded today." /></div>
+            )}
           </div>
         </section>
 
-        {/* Footer */}
-        <footer className="mt-24 text-center border-t border-neutral-900 pt-12">
-          <p className="text-neutral-500 text-xs font-mono tracking-widest uppercase">
-            ChaosBot Framework v1.0.4 // Sentient Intelligence Module
+        {/* Memory */}
+        <section className="mb-8">
+          <SectionHeader icon={<Database className="w-4 h-4" />} title="Memory" sub="per server, by kind" />
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {memory.length ? memory.map(s => <MemoryCard key={s.guildId} s={s} />) : (
+              <EmptyState text="No memory recorded yet." />
+            )}
+          </div>
+        </section>
+
+        <footer className="mt-16 pt-8 text-center" style={{ borderTop: '1px solid #262B33' }}>
+          <p className="text-[11px] tracking-[0.2em] uppercase" style={{ color: '#8A8F98', fontFamily: "'IBM Plex Mono', monospace" }}>
+            NotABot · gemini multi-key runtime
           </p>
         </footer>
       </main>
@@ -273,24 +232,124 @@ export default function App() {
   );
 }
 
-function StatusTile({ title, value, icon, active }: { title: string, value: string, icon: any, active: boolean }) {
+function SectionHeader({ icon, title, sub }: { icon: any; title: string; sub: string }) {
   return (
-    <div className={`p-6 rounded-3xl border transition-all ${active ? 'bg-neutral-900 border-neutral-800' : 'bg-neutral-950 border-neutral-900 grayscale opacity-40'}`}>
-      <div className="mb-4">{icon}</div>
-      <p className="text-neutral-500 text-[10px] font-mono uppercase tracking-widest mb-1">{title}</p>
-      <p className="font-bold text-white tracking-tight">{value}</p>
+    <div className="flex items-center justify-between mb-4">
+      <div className="flex items-center gap-2" style={{ color: '#F2EFE9' }}>
+        <span style={{ color: '#4FA8C9' }}>{icon}</span>
+        <h2 className="text-sm font-semibold tracking-wide">{title}</h2>
+      </div>
+      <span className="text-[11px]" style={{ color: '#8A8F98' }}>{sub}</span>
     </div>
   );
 }
 
-function FeatureItem({ title, desc }: { title: string, desc: string }) {
+function Metric({ label, value, accent }: { label: string; value: string; accent: string }) {
   return (
     <div>
-      <h4 className="text-neutral-200 font-medium mb-1 flex items-center gap-2">
-        <span className="w-1.5 h-1.5 rounded-full bg-purple-500" />
-        {title}
-      </h4>
-      <p className="text-neutral-500 text-sm leading-relaxed">{desc}</p>
+      <p className="text-[10px] uppercase tracking-[0.15em] mb-1" style={{ color: '#8A8F98' }}>{label}</p>
+      <p className="text-xl font-semibold" style={{ fontFamily: "'IBM Plex Mono', monospace", color: accent }}>{value}</p>
     </div>
+  );
+}
+
+function EmptyState({ text }: { text: string }) {
+  return (
+    <div className="col-span-full py-10 text-center rounded-2xl" style={{ border: '1px dashed #262B33' }}>
+      <Ghost className="w-6 h-6 mx-auto mb-2" style={{ color: '#262B33' }} />
+      <p className="text-sm" style={{ color: '#8A8F98' }}>{text}</p>
+    </div>
+  );
+}
+
+function KeyCard({ k }: { k: KeyStat }) {
+  return (
+    <div className="p-5 rounded-2xl" style={{ background: '#14171C', border: `1px solid ${k.onCooldown ? 'rgba(226,75,75,0.4)' : '#262B33'}` }}>
+      <div className="flex items-center justify-between mb-3">
+        <span className="text-sm" style={{ fontFamily: "'IBM Plex Mono', monospace", color: '#F2EFE9' }}>{k.key}</span>
+        <span
+          className="text-[10px] px-2 py-0.5 rounded-full uppercase tracking-wide"
+          style={{
+            background: k.onCooldown ? 'rgba(226,75,75,0.12)' : 'rgba(232,163,61,0.12)',
+            color: k.onCooldown ? '#E24B4B' : '#E8A33D',
+          }}
+        >
+          {k.onCooldown ? `cooldown ${k.cooldownSecondsLeft}s` : 'ready'}
+        </span>
+      </div>
+      <div className="grid grid-cols-3 gap-2 text-center">
+        <MiniStat label="reqs" value={k.requestsToday} />
+        <MiniStat label="429s" value={k.rate429sToday} warn={k.rate429sToday > 0} />
+        <MiniStat label="errs" value={k.errorsToday} warn={k.errorsToday > 0} />
+      </div>
+    </div>
+  );
+}
+
+function MiniStat({ label, value, warn }: { label: string; value: number; warn?: boolean }) {
+  return (
+    <div>
+      <p className="text-base font-medium" style={{ fontFamily: "'IBM Plex Mono', monospace", color: warn ? '#E24B4B' : '#F2EFE9' }}>{value}</p>
+      <p className="text-[9px] uppercase tracking-wide" style={{ color: '#8A8F98' }}>{label}</p>
+    </div>
+  );
+}
+
+function ModelRow({ m, isLast, maxTokens }: { m: ModelStat; isLast: boolean; maxTokens: number }) {
+  const pct = Math.max(2, Math.round((m.totalTokens / maxTokens) * 100));
+  return (
+    <div className="p-5" style={{ background: '#14171C', borderBottom: isLast ? 'none' : '1px solid #262B33' }}>
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-sm font-medium" style={{ color: '#F2EFE9' }}>{m.model}</span>
+        <span className="text-xs" style={{ fontFamily: "'IBM Plex Mono', monospace", color: '#8A8F98' }}>
+          {m.requests.toLocaleString()} req · {m.promptTokens.toLocaleString()} in / {m.outputTokens.toLocaleString()} out
+        </span>
+      </div>
+      <div className="w-full h-1.5 rounded-full overflow-hidden" style={{ background: '#0A0C10' }}>
+        <motion.div
+          initial={{ width: 0 }} animate={{ width: `${pct}%` }} transition={{ duration: 0.6 }}
+          className="h-full rounded-full" style={{ background: '#4FA8C9' }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function MemoryCard({ s }: { s: MemoryEntry }) {
+  const kinds = Object.entries(s.byKind);
+  return (
+    <div className="p-5 rounded-2xl" style={{ background: '#14171C', border: '1px solid #262B33' }}>
+      <p className="text-[10px] uppercase tracking-wide mb-3 truncate" style={{ fontFamily: "'IBM Plex Mono', monospace", color: '#8A8F98' }}>
+        {s.guildId} · {s.entryCount} entries
+      </p>
+      {kinds.length ? kinds.map(([kind, texts]) => (
+        <div key={kind} className="mb-3 last:mb-0">
+          <p className="text-xs mb-1.5 font-medium capitalize" style={{ color: '#4FA8C9' }}>{kind}</p>
+          <div className="flex flex-wrap gap-1.5">
+            {texts.slice(0, 4).map((t, i) => (
+              <span key={i} className="px-2 py-0.5 rounded-md text-[10px] truncate max-w-[160px]" style={{ background: 'rgba(79,168,201,0.1)', border: '1px solid rgba(79,168,201,0.2)', color: '#F2EFE9' }}>
+                {t}
+              </span>
+            ))}
+          </div>
+        </div>
+      )) : <p className="text-xs italic" style={{ color: '#8A8F98' }}>Nothing stored yet.</p>}
+    </div>
+  );
+}
+
+// the signature element: a live sparkline built from actual request deltas,
+// polled every 5s. this is a vitals monitor for a thing pretending to be
+// alive — so the chart IS a pulse, not a decorative flourish.
+function PulseLine({ values, color }: { values: number[]; color: string }) {
+  const max = Math.max(...values, 1);
+  const w = 600, h = 60;
+  const step = w / (values.length - 1);
+  const points = values.map((v, i) => `${i * step},${h - (v / max) * (h - 8) - 4}`).join(' ');
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className="w-full" style={{ height: 60 }} preserveAspectRatio="none">
+      <polyline points={points} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" opacity={0.9} />
+      <polyline points={`0,${h} ${points} ${w},${h}`} fill={color} opacity={0.08} stroke="none" />
+    </svg>
   );
 }
