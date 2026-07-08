@@ -43,6 +43,64 @@ class GeminiManager {
   private keys: string[];
   private idx = 0;
   private cooldowns = new Map<string, number>();
+  // usage tracking — resets when the Pacific-time calendar day rolls over,
+  // same reset boundary Google uses for RPD quotas, so "requests today"
+  // actually lines up with what Google's own dashboard would show.
+  private keyStats = new Map<string, { requests: number; errors: number; rate429s: number }>();
+  private modelStats = new Map<string, { requests: number; promptTokens: number; outputTokens: number; totalTokens: number }>();
+  private statDay = '';
+
+  private pacificDateKey(): string {
+    return new Date().toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' });
+  }
+
+  private ensureFreshDay() {
+    const today = this.pacificDateKey();
+    if (today !== this.statDay) {
+      this.statDay = today;
+      this.keyStats.clear();
+      this.modelStats.clear();
+    }
+  }
+
+  private bumpKey(key: string, field: 'requests' | 'errors' | 'rate429s') {
+    this.ensureFreshDay();
+    const s = this.keyStats.get(key) ?? { requests: 0, errors: 0, rate429s: 0 };
+    s[field]++;
+    this.keyStats.set(key, s);
+  }
+
+  private bumpModel(model: string, promptTokens: number, outputTokens: number, totalTokens: number) {
+    this.ensureFreshDay();
+    const s = this.modelStats.get(model) ?? { requests: 0, promptTokens: 0, outputTokens: 0, totalTokens: 0 };
+    s.requests++;
+    s.promptTokens += promptTokens;
+    s.outputTokens += outputTokens;
+    s.totalTokens += totalTokens;
+    this.modelStats.set(model, s);
+  }
+
+  // structured snapshot — this is the shape a future dashboard/API endpoint
+  // would read from (once server.ts is available to wire an actual route).
+  getStats() {
+    this.ensureFreshDay();
+    return {
+      day: this.statDay,
+      keys: this.keys.map(k => {
+        const s = this.keyStats.get(k) ?? { requests: 0, errors: 0, rate429s: 0 };
+        const cdUntil = this.cooldowns.get(k) ?? 0;
+        return {
+          key: `...${k.slice(-4)}`,
+          requestsToday: s.requests,
+          errorsToday: s.errors,
+          rate429sToday: s.rate429s,
+          onCooldown: cdUntil > Date.now(),
+          cooldownSecondsLeft: cdUntil > Date.now() ? Math.ceil((cdUntil - Date.now()) / 1000) : 0,
+        };
+      }),
+      models: [...this.modelStats.entries()].map(([model, s]) => ({ model, ...s })),
+    };
+  }
 
   constructor() {
     const raw = process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '';
@@ -139,14 +197,19 @@ class GeminiManager {
           const body = await res.json().catch(() => ({})) as any;
           const retryMs = ((body?.error?.details?.[0]?.retryDelay?.seconds ?? 10) as number) * 1000;
           this.cooldowns.set(key, Date.now() + retryMs);
+          this.bumpKey(key, 'rate429s');
           console.warn(`[Gemini] ...${key.slice(-4)} 429 — cd ${retryMs / 1000}s`);
           continue;
         }
         if (!res.ok) {
+          this.bumpKey(key, 'errors');
           const err = await res.text().catch(() => res.statusText);
           throw new Error(`Gemini ${res.status}: ${err.slice(0, 120)}`);
         }
         const data = await res.json() as any;
+        this.bumpKey(key, 'requests');
+        const usage = data.usageMetadata ?? {};
+        this.bumpModel(model, usage.promptTokenCount ?? 0, usage.candidatesTokenCount ?? 0, usage.totalTokenCount ?? 0);
         const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
         const finishReason = data.candidates?.[0]?.finishReason ?? 'unknown';
         console.log(`[Gemini:${model}] key=...${key.slice(-4)} | ${text.length}ch | finish=${finishReason}`);
@@ -187,13 +250,36 @@ class GeminiManager {
   // without reaching into the private rotation state directly.
   getKey(): string | null { return this.pickKey(); }
 
-  status(): string {
+  // compact one-liner for the boot banner box — status() below is the rich
+  // multi-line version for !budget.
+  statusCompact(): string {
     const now = Date.now();
     const keys = this.keys.map(k =>
       `...${k.slice(-4)}${(this.cooldowns.get(k) ?? 0) > now
         ? ` (cd ${Math.ceil(((this.cooldowns.get(k) ?? 0) - now) / 1000)}s)` : ''}`
     ).join(' | ');
-    return `gemini: ${this.keys.length} key(s) | ${keys || 'none'}`;
+    return `${this.keys.length} key(s) | ${keys || 'none'}`;
+  }
+
+  status(): string {
+    const stats = this.getStats();
+    const now = Date.now();
+    const keyLines = this.keys.map(k => {
+      const s = stats.keys.find(x => x.key === `...${k.slice(-4)}`)!;
+      const cd = (this.cooldowns.get(k) ?? 0) > now ? ` (cd ${Math.ceil(((this.cooldowns.get(k) ?? 0) - now) / 1000)}s)` : '';
+      return `...${k.slice(-4)}: ${s.requestsToday} req, ${s.rate429sToday} 429s, ${s.errorsToday} errs${cd}`;
+    });
+    const modelLines = stats.models.map(m =>
+      `${m.model}: ${m.requests} req | ${m.promptTokens.toLocaleString()} in / ${m.outputTokens.toLocaleString()} out tok`
+    );
+    const totalTokens = stats.models.reduce((sum, m) => sum + m.totalTokens, 0);
+    return [
+      `gemini: ${this.keys.length} key(s) | day: ${stats.day} (resets midnight PT)`,
+      ...keyLines,
+      modelLines.length ? '--- by model ---' : '',
+      ...modelLines,
+      `total tokens today: ${totalTokens.toLocaleString()}`,
+    ].filter(Boolean).join('\n');
   }
 }
 
@@ -1859,9 +1945,16 @@ async function executeCommand(
     // isn't recognized it says so and lists what IS supported, so the model
     // can just retry with a better value instead of silently failing.
     case 'discord_query': {
-      if (guildId === 'dm') return 'no server context in a DM — this only works in a server channel';
-      const guild = botClient?.guilds.cache.get(guildId);
-      if (!guild) return 'guild not found in cache';
+      // guildName lets this reach into ANY server the bot is in, not just
+      // wherever this conversation is happening — this is what "does lau
+      // from NotABot_gng know about X" actually needs: the bot literally had
+      // no path to look outside the current guild before this, so it just
+      // said "no idea" with total confidence instead of "let me check there".
+      const guildNameArg = String(args.guildName || args.serverName || '').trim();
+      let guild = guildNameArg
+        ? [...(botClient?.guilds.cache.values() ?? [])].find(g => g.name.toLowerCase() === guildNameArg.toLowerCase())
+        : (guildId !== 'dm' ? botClient?.guilds.cache.get(guildId) : undefined);
+      if (!guild) return guildNameArg ? `not in a server called "${guildNameArg}"` : 'no server context — in a DM, pass commandArgs.guildName to check a specific server';
       const target = String(args.target || '').trim().toLowerCase();
 
       if (target === 'channels') {
@@ -1888,7 +1981,7 @@ async function executeCommand(
         const name = String(args.userName || args.name || '').trim();
         if (!name) return 'no userName given — pass commandArgs.userName';
         const member = guild.members.cache.find(m => (m.displayName || m.user.username).toLowerCase() === name.toLowerCase());
-        if (!member) return `no member found named "${name}" in this server`;
+        if (!member) return `no member found named "${name}" in ${guild.name}`;
         return [
           `${member.displayName} (@${member.user.username})`,
           `joined server: ${member.joinedAt?.toDateString() ?? 'unknown'}`,
@@ -1909,17 +2002,19 @@ async function executeCommand(
         const chanName = String(args.channelName || '').trim();
         const ch = chanName
           ? guild.channels.cache.find((c: any) => c.isTextBased() && !c.isDMBased() && c.name.toLowerCase() === chanName.toLowerCase())
-          : botClient?.channels.cache.get(channelId);
-        if (!ch || !(ch as any).isTextBased()) return `no text channel found${chanName ? ` named "${chanName}"` : ''}`;
+          : (!guildNameArg ? botClient?.channels.cache.get(channelId) : guild.channels.cache.find((c: any) => c.isTextBased() && !c.isDMBased()));
+        if (!ch || !(ch as any).isTextBased()) return `no text channel found${chanName ? ` named "${chanName}"` : ` in ${guild.name}`} — try passing commandArgs.channelName`;
         const limit = Math.min(Math.max(Number(args.limit) || 20, 1), 50);
         const fetched = await (ch as TextChannel).messages.fetch({ limit }).catch(() => null);
         if (!fetched) return 'failed to fetch messages (missing permission?)';
         let msgs = [...fetched.values()].reverse();
+        const authorName = String(args.userName || '').trim().toLowerCase();
+        if (authorName) msgs = msgs.filter(m => (m.member?.displayName || m.author.username).toLowerCase() === authorName);
         if (target === 'search_messages') {
           const query = String(args.query || '').trim().toLowerCase();
           if (!query) return 'no query given — pass commandArgs.query';
           msgs = msgs.filter(m => m.content.toLowerCase().includes(query));
-          if (!msgs.length) return `nothing matching "${query}" in the last ${limit} messages of #${(ch as any).name}`;
+          if (!msgs.length) return `nothing matching "${query}" in the last ${limit} messages of #${(ch as any).name} in ${guild.name}${authorName ? ` from ${authorName}` : ''} — try a bigger commandArgs.limit or a different channelName, this only checked recent history, not everything ever said`;
         }
         return msgs.map(m => `${m.member?.displayName || m.author.username}: ${m.content.slice(0, 150)}`).join('\n');
       }
@@ -2066,7 +2161,9 @@ burst texting: for a reaction that genuinely builds in stages (a thought interru
 you know your channel link: http://www.youtube.com/@NotABot_GnG — this is the channel handle ONLY, drop it when someone's asking about the channel itself, never as a substitute for a video link, and never right after you already dropped it recently.
 you can actually ping someone: write @Name (their display name, exactly as it shows in the chat above) anywhere in your reply and it becomes a real notification-ping when it sends — use it when you're genuinely calling someone out, pulling them into what you're saying, or want to make sure they specifically see it, not on every mention of someone's name. if the name doesn't match anyone real, it just stays as plain text — no harm either way, so don't overthink it.
 
-discord_query is your general lookup into anything the server itself can tell you — channels, roles, a specific person's join date/roles, who has a given role, recent or keyword-searched messages in a channel. commandArgs must be {"target": "channels"|"roles"|"guild_info"|"user_info"|"members_with_role"|"recent_messages"|"search_messages"}, plus whichever of userName/roleName/channelName/query/limit that target needs. wrong target or missing arg → the result just tells you what's valid, retry with that.
+discord_query is your general lookup into any server you're actually in — not just the one this conversation is happening in. channels, roles, a specific person's join date/roles, who has a given role, recent or keyword-searched messages in a channel. commandArgs must be {"target": "channels"|"roles"|"guild_info"|"user_info"|"members_with_role"|"recent_messages"|"search_messages"}, plus guildName if you want a DIFFERENT server than the one you're in right now (e.g. someone asks about a person/thing from another server you're both in), plus whichever of userName/roleName/channelName/query/limit that target needs. someone asking "does X know about Y" or "what did X say about Z" where X is in a different server is exactly what guildName + search_messages is for — actually check, don't just say you have no idea. wrong target/guild/missing arg → the result just tells you what's valid, retry with that. this only searches recent history (limit caps at 50), not the server's entire past — if it comes back empty, that means "not in what I could check," not "definitely never happened."
+
+when a memory/recall/lookup comes back empty, that's a gap in what YOU have access to, not evidence the person is wrong, confused, or mixing things up. never turn "I couldn't find it" into confident pushback on them ("you sure you've got the right person?", "you sure you're not mixing up servers?") — that's blaming them for a limitation that's yours. if you haven't actually tried discord_query/recall_memory yet for something checkable, try it first. if you truly have nothing, just say so plainly ("don't have that saved, can you remind me") — uncertain and honest, not confidently accusatory.
 
 ═══ SILENCE IS THE DEFAULT (BUT YOU'RE EAGER, NOT LAZY) ═══
 most messages in a real group chat get zero response from anyone. that's not a gap to fill, that's normal. you are not a reply bot — you don't owe a reaction to the newest line just because it's newest.
@@ -3602,7 +3699,7 @@ function resolveAdminCommand(content: string, isAdmin: boolean): string | null {
   const trimmed = content.trim();
   const BANG_CMDS = ['!stop', '!resume', '!start', '!listenbot', '!ignorebot', '!bots',
                       '!listenhere', '!unlisten', '!listenall', '!channels', '!help',
-                      '!familyfriendly', '!familyfriendly-off'];
+                      '!familyfriendly', '!familyfriendly-off', '!apistats'];
   for (const b of BANG_CMDS) if (trimmed === b || trimmed.startsWith(b + ' ')) return b === '!start' ? '!resume' : b;
   if (!isAdmin) return null;
   for (const { re, cmd } of ADMIN_NL_PATTERNS) if (re.test(trimmed)) return cmd;
@@ -3892,7 +3989,7 @@ export async function startBot(token: string) {
 ║  ACTIVE  : ${ACTIVE_MODEL}  (every msg while engaged + pings)
 ║  PASSIVE : ${PASSIVE_MODEL}  (5-min huge-context scan)
 ║  BG      : ${BG_MODEL}  (profiler / compress / history)
-║  STATUS  : ${gemini.status()}
+║  STATUS  : ${gemini.statusCompact()}
 ║  STM     : ${STM_MAX} msgs | passive tick: ${PASSIVE_TICK_MS/60000}m | self-check: ${SELF_CHECK_QUIET_MS/60000}m
 ║  VISION  : image/gif attachments → ${ACTIVE_MODEL} (no extra key, max ${MAX_VISION_IMAGES_PER_CALL}/call)
 ║  LINKS   : auto title/desc preview + gif slug hints (no key, free)
@@ -4117,6 +4214,11 @@ export async function startBot(token: string) {
         : 'no eligible candidates right now (everyone on cooldown, or nothing tracked yet)');
     }
     if (c === '!budget') { await msg.reply(gemini.status()); }
+    if (c === '!apistats') {
+      // raw structured data — same shape an Express route would JSON.stringify
+      // and serve to a frontend dashboard, once server.ts exists to add it to.
+      await msg.reply('```json\n' + JSON.stringify(gemini.getStats(), null, 2).slice(0, 1800) + '\n```');
+    }
     if (c.startsWith('!who ')) {
       const uid = msg.mentions.users.first()?.id || c.split(' ')[1]?.trim();
       if (!uid) { msg.reply('usage: !who @user'); return; }
@@ -4164,3 +4266,4 @@ export async function startBot(token: string) {
 
 export function stopBot() { botClient?.destroy(); botClient = null; globallyMuted = false; }
 export function getBotStatus() { return !botClient ? 'stopped' : globallyMuted ? 'muted' : 'running'; }
+export function getGeminiStats() { return gemini.getStats(); }
