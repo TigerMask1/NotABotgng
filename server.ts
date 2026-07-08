@@ -2,7 +2,7 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
-import { startBot, stopBot, getBotStatus } from "./src/services/discordBot.ts";
+import { startBot, stopBot, getBotStatus, getGeminiStats } from "./src/services/discordBot.ts";
 import { db } from "./src/services/firebase.ts";
 import dotenv from "dotenv";
 
@@ -40,18 +40,38 @@ async function startServer() {
     }
   });
 
+  // live per-key request/error/429 counts and per-model token usage, straight
+  // from GeminiManager's in-memory tracking — resets at midnight Pacific,
+  // same boundary Google uses for RPD, so this should track what AI Studio
+  // shows. poll this on an interval from the frontend (5-10s is plenty;
+  // there's no websocket here, just cheap in-memory reads).
+  app.get("/api/gemini/stats", (req, res) => {
+    try {
+      res.json(getGeminiStats());
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // memory is stored as one doc per scope in `memoryStore`, keyed
+  // "server:{guildId}" or "person:{userId}", each holding an `entries` array
+  // of { kind, text, salience, ... }. this used to read old insideJokes/
+  // currentMood fields that no longer exist anywhere in the current bot —
+  // stale leftover from before the memory engine rewrite.
   app.get("/api/memory", async (req, res) => {
     try {
-      const querySnapshot = await db.collection('servers').limit(10).get();
+      const snapshot = await db.collection('memoryStore').limit(50).get();
       const memory: any[] = [];
-      
-      for (const doc of querySnapshot.docs) {
-        const data = doc.data();
-        memory.push({
-          guildId: doc.id,
-          jokes: data.insideJokes || [],
-          mood: data.currentMood || 'neutral'
-        });
+
+      for (const doc of snapshot.docs) {
+        if (!doc.id.startsWith('server:')) continue; // person: entries aren't tied to one guild, skip for this per-server view
+        const guildId = doc.id.slice('server:'.length);
+        const entries: any[] = doc.data()?.entries ?? [];
+        const byKind: Record<string, string[]> = {};
+        for (const e of entries) {
+          (byKind[e.kind] ??= []).push(e.text);
+        }
+        memory.push({ guildId, entryCount: entries.length, byKind });
       }
       res.json(memory);
     } catch (e: any) {
