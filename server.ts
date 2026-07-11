@@ -1,9 +1,7 @@
 import express from "express";
-import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
 import { startBot, stopBot, getBotStatus } from "./src/services/discordBot.ts";
-import { db } from "./src/services/firebase.ts";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -11,85 +9,115 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-async function startServer() {
-  const app = express();
-  const PORT = process.env.PORT || 3000;
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-  app.use(express.json());
+app.use(express.json());
 
-  // API Routes
-  app.get("/api/status", (req, res) => {
-    res.json({ 
-      status: "ok", 
-      botStatus: getBotStatus(),
-      hasToken: !!process.env.DISCORD_TOKEN,
-      hasAiKey: !!process.env.GEMINI_API_KEY
-    });
-  });
-
-  app.post("/api/bot/start", async (req, res) => {
-    try {
-      const token = process.env.DISCORD_TOKEN || req.body.token;
-      if (!token) {
-        return res.status(400).json({ error: "Discord token missing" });
-      }
-      await startBot(token);
-      res.json({ message: "Bot started" });
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
+// Simple HTML status page — "we're definitely a web service" mask
+app.get("/", (_req, res) => {
+  const status = getBotStatus();
+  res.setHeader("Content-Type", "text/html");
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NotABot Service</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #0d0d0f;
+      color: #e2e2e2;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
     }
-  });
-
-  app.get("/api/memory", async (req, res) => {
-    try {
-      const querySnapshot = await db.collection('servers').limit(10).get();
-      const memory: any[] = [];
-      
-      for (const doc of querySnapshot.docs) {
-        const data = doc.data();
-        memory.push({
-          guildId: doc.id,
-          jokes: data.insideJokes || [],
-          mood: data.currentMood || 'neutral'
-        });
-      }
-      res.json(memory);
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
+    .card {
+      background: #1a1a1f;
+      border: 1px solid #2a2a35;
+      border-radius: 16px;
+      padding: 48px 56px;
+      text-align: center;
+      max-width: 420px;
+      box-shadow: 0 0 60px rgba(88, 101, 242, 0.08);
     }
-  });
+    .dot {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: ${status === "running" ? "#23c55e" : "#ef4444"};
+      margin-right: 8px;
+      box-shadow: 0 0 8px ${status === "running" ? "#23c55e88" : "#ef444488"};
+    }
+    h1 { font-size: 1.6rem; font-weight: 700; margin-bottom: 8px; }
+    .subtitle { color: #666; font-size: 0.9rem; margin-bottom: 32px; }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      background: #0d0d0f;
+      border: 1px solid #2a2a35;
+      border-radius: 999px;
+      padding: 8px 20px;
+      font-size: 0.85rem;
+      font-weight: 500;
+    }
+    .footer { margin-top: 32px; font-size: 0.75rem; color: #444; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>NotABot</h1>
+    <p class="subtitle">Discord Service — Web Interface</p>
+    <div class="status-badge">
+      <span class="dot"></span>
+      Service ${status === "running" ? "Online" : "Offline"}
+    </div>
+    <p class="footer">© ${new Date().getFullYear()} NotABot · All systems nominal</p>
+  </div>
+</body>
+</html>`);
+});
 
-  app.post("/api/bot/stop", (req, res) => {
-    stopBot();
-    res.json({ message: "Bot stopped" });
+// Health / status API
+app.get("/api/status", (_req, res) => {
+  res.json({
+    status: "ok",
+    botStatus: getBotStatus(),
+    timestamp: new Date().toISOString(),
   });
+});
 
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
+// Start / stop endpoints (optional, handy for manual control)
+app.post("/api/bot/start", async (req, res) => {
+  try {
+    const token = process.env.DISCORD_TOKEN || req.body?.token;
+    if (!token) return res.status(400).json({ error: "DISCORD_TOKEN missing" });
+    await startBot(token);
+    res.json({ message: "Bot started" });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
   }
+});
 
-  app.listen(Number(PORT), "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-    
-    // Auto-start bot if token is in env
-    if (process.env.DISCORD_TOKEN) {
-      console.log("Auto-starting Discord bot...");
-      startBot(process.env.DISCORD_TOKEN).catch(err => {
-        console.error("Auto-start failed:", err.message);
-      });
-    }
-  });
-}
+app.post("/api/bot/stop", (_req, res) => {
+  stopBot();
+  res.json({ message: "Bot stopped" });
+});
 
-startServer();
+// Boot
+app.listen(Number(PORT), "0.0.0.0", () => {
+  console.log(`[server] Running on http://localhost:${PORT}`);
+
+  if (process.env.DISCORD_TOKEN) {
+    console.log("[server] Auto-starting Discord bot...");
+    startBot(process.env.DISCORD_TOKEN).catch((err) =>
+      console.error("[server] Bot start failed:", err.message)
+    );
+  } else {
+    console.warn("[server] DISCORD_TOKEN not set — bot not started.");
+  }
+});
