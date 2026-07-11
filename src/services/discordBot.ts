@@ -262,6 +262,22 @@ async function updateRelData(userId: string, updates: Partial<RelData>) {
   await db.collection('relationships').doc(userId).set(updates, { merge: true }).catch(() => {});
 }
 
+// ── LINK PREVIEW EXTRACTOR ────────────────────────────────────────────
+async function fetchLinkPreview(url: string): Promise<string> {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3000);
+    const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }, signal: controller.signal });
+    clearTimeout(timeoutId);
+    if (!res.ok) return '';
+    const text = await res.text();
+    const match = text.match(/<title[^>]*>([^<]+)<\/title>/i);
+    return match ? match[1].trim().replace(/&quot;/g, '"').replace(/&#39;/g, "'") : '';
+  } catch {
+    return '';
+  }
+}
+
 // ── INNER MONOLOGUE SYSTEM PROMPT ─────────────────────────────────────
 const SYSTEM_PROMPT = `This is my unfiltered internal monologue. I am NotABot.
 I'm a chronically online Gen Z Discord user just hanging out in these servers and DMs. I'm not an assistant.
@@ -373,6 +389,14 @@ async function runBrainTurn(triggerReason: string, mode: 'active' | 'passive') {
   const chatText = msgs.slice(-5).map(m => m.content).join(' ');
   const memory = await recallMemory(guildId, chatText);
 
+  // Silent link reading
+  let linkContext = '';
+  const urlMatch = chatText.match(/https?:\/\/[^\s]+/);
+  if (urlMatch) {
+    const title = await fetchLinkPreview(urlMatch[0]);
+    if (title) linkContext = `I SILENTLY CHECKED THE LINK THEY POSTED. The page title is: "${title}"`;
+  }
+
   const prompt = `[INTERNAL MONOLOGUE LOG]
 TIME: ${new Date().toLocaleString()} (I know what's happening in the real world today)
 LOCATION: ${guildId === 'dm' ? 'In a DM' : 'In a server channel'}
@@ -390,6 +414,7 @@ ${memory || '(nothing specific comes to mind)'}
 
 MY INTERNAL SENSORS:
 ${detectStaleBits(currentFocusChannelId)}
+${linkContext}
 
 WHAT AM I GOING TO DO RIGHT NOW?
 (Output strictly JSON)
@@ -442,6 +467,16 @@ WHAT AM I GOING TO DO RIGHT NOW?
 
   } catch (e: any) {
     console.error(`[Brain] Error: ${e.message.slice(0, 100)}`);
+    // Brain Fog Fallback
+    if (mode === 'active' && currentFocusChannelId) {
+      const fogLines = ["brain empty rn", "too tired for this", "im crashing ttyl", "can't read all that rn", "my head hurts"];
+      const reply = fogLines[Math.floor(Math.random() * fogLines.length)];
+      const ch = botClient!.channels.cache.get(currentFocusChannelId) as TextChannel | undefined;
+      if (ch?.isTextBased()) {
+        ch.send(reply).catch(()=>{});
+        updateEnergy(-20); // Massive energy crash
+      }
+    }
   }
 }
 
