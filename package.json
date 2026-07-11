@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
+    "build": "tsc",
     "start": "tsx server.ts"
   },
   "dependencies": {

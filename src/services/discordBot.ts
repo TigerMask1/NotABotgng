@@ -278,6 +278,27 @@ async function fetchLinkPreview(url: string): Promise<string> {
   }
 }
 
+async function fetchYouTubeOEmbed(url: string): Promise<string> {
+  try {
+    const res = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`);
+    if (!res.ok) return '';
+    const data = await res.json() as any;
+    return `${data.title} (by ${data.author_name})`;
+  } catch { return ''; }
+}
+
+// ── GIF FETCHER ───────────────────────────────────────────────────────
+async function fetchTenorGif(query: string): Promise<string> {
+  const key = process.env.TENOR_API_KEY || process.env.GIPHY_API_KEY;
+  if (!key) return '';
+  try {
+    const res = await fetch(`https://tenor.googleapis.com/v2/search?q=${encodeURIComponent(query)}&key=${key}&limit=1`);
+    if (!res.ok) return '';
+    const data = await res.json() as any;
+    return data.results?.[0]?.url || '';
+  } catch { return ''; }
+}
+
 // ── INNER MONOLOGUE SYSTEM PROMPT ─────────────────────────────────────
 const SYSTEM_PROMPT = `This is my unfiltered internal monologue. I am NotABot.
 I'm a chronically online Gen Z Discord user just hanging out in these servers and DMs. I'm not an assistant.
@@ -364,9 +385,9 @@ function detectStaleBits(channelId: string): string {
 }
 
 // ── BRAIN TURN BUILDER ────────────────────────────────────────────────
-interface BrainDecision { action: 'speak'|'react'|'gif'|'ignore'|'hop'|'lurk'; reply: string; reaction: string; targetId?: string; }
+interface BrainDecision { action: 'speak'|'react'|'gif'|'ignore'|'hop'|'lurk'; reply: string; reaction: string; gifSearch: string; targetId?: string; }
 
-async function runBrainTurn(triggerReason: string, mode: 'active' | 'passive') {
+async function runBrainTurn(triggerReason: string, mode: 'active' | 'passive', imageParts: ImagePart[] = []) {
   if (!gemini.canCall() || !currentFocusChannelId) return;
   const msgs = stmGet(currentFocusChannelId);
   if (!msgs.length) return;
@@ -393,8 +414,14 @@ async function runBrainTurn(triggerReason: string, mode: 'active' | 'passive') {
   let linkContext = '';
   const urlMatch = chatText.match(/https?:\/\/[^\s]+/);
   if (urlMatch) {
-    const title = await fetchLinkPreview(urlMatch[0]);
-    if (title) linkContext = `I SILENTLY CHECKED THE LINK THEY POSTED. The page title is: "${title}"`;
+    const url = urlMatch[0];
+    if (url.includes('youtube.com') || url.includes('youtu.be')) {
+      const yt = await fetchYouTubeOEmbed(url);
+      if (yt) linkContext = `I SILENTLY CHECKED THE YOUTUBE LINK. It's a video: "${yt}"`;
+    } else {
+      const title = await fetchLinkPreview(url);
+      if (title) linkContext = `I SILENTLY CHECKED THE LINK THEY POSTED. The page title is: "${title}"`;
+    }
   }
 
   const prompt = `[INTERNAL MONOLOGUE LOG]
@@ -422,14 +449,15 @@ WHAT AM I GOING TO DO RIGHT NOW?
   "action": "speak|react|gif|ignore|hop|lurk",
   "reply": "what I will say (if speaking), lowercase, short",
   "reaction": "emoji (if reacting)",
+  "gifSearch": "search term (if gif)",
   "targetId": "msg id to reply to, or empty"
 }`;
 
   try {
-    const raw = await gemini.call(SYSTEM_PROMPT, prompt, mode === 'active' ? 0.95 : 0.7, mode === 'active' ? ACTIVE_MODEL : PASSIVE_MODEL);
+    const raw = await gemini.call(SYSTEM_PROMPT, prompt, mode === 'active' ? 0.95 : 0.7, mode === 'active' ? ACTIVE_MODEL : PASSIVE_MODEL, imageParts);
     const p = JSON.parse((raw.match(/\{[\s\S]*\}/) ?? ['{}'])[0]) as BrainDecision;
     
-    console.log(`[Monologue -> ${p.action}] ${p.reply?.slice(0, 50)}`);
+    console.log(`[Monologue -> ${p.action}] ${p.reply?.slice(0, 50) || p.gifSearch?.slice(0,50)}`);
 
     if (p.action === 'hop') {
       await hopFocus();
@@ -463,6 +491,16 @@ WHAT AM I GOING TO DO RIGHT NOW?
       const target = await ch.messages.fetch(p.targetId).catch(()=>null);
       if (target) await target.react(p.reaction).catch(()=>{});
       updateEnergy(5);
+    }
+
+    if (p.action === 'gif' && p.gifSearch) {
+      await ch.sendTyping().catch(() => {});
+      const gifUrl = await fetchTenorGif(p.gifSearch);
+      if (gifUrl) {
+        await sleep(500);
+        await ch.send(gifUrl).catch(()=>{});
+        updateEnergy(10);
+      }
     }
 
   } catch (e: any) {
@@ -511,11 +549,24 @@ async function handleMessage(msg: Message) {
 
   // Pull focus if mentioned or DMed
   const mentioned = msg.mentions.has(BOT_ID);
+
+  // Bandwidth-safe Vision (Images < 2MB, mention only)
+  let imageParts: ImagePart[] = [];
+  if (mentioned && msg.attachments.size > 0) {
+    const img = msg.attachments.first();
+    if (img && img.contentType?.startsWith('image/') && img.size < 2000000) {
+      try {
+        const buf = await (await fetch(img.url)).arrayBuffer();
+        imageParts.push({ mimeType: img.contentType, data: Buffer.from(buf).toString('base64') });
+      } catch (e) { console.error('[Vision] Failed to fetch image'); }
+    }
+  }
+
   if (mentioned || gId === 'dm') {
     currentFocusChannelId = chId;
     currentFocusGuildId = gId;
     updateEnergy(25); // Big energy spike
-    await runBrainTurn(`Directly engaged by ${sender}`, 'active');
+    await runBrainTurn(`Directly engaged by ${sender}`, 'active', imageParts);
     return;
   }
 
