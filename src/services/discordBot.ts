@@ -205,6 +205,7 @@ let BOT_NAME = 'NotABot';
 let BOT_ID = '';
 let botClient: Client | null = null;
 let globallyMuted = false;
+let lastSpokeAt = Date.now();
 
 // ── ID CACHES ────────────────────────────────────────────────────────
 const idCache = new Map<string, string>();
@@ -453,13 +454,13 @@ WHO I AM:
 - I'm socially aware. I notice when people are in their feelings and I respond accordingly.
 
 MY VIBE:
-- I text in lowercase. I use natural short forms (rn, tbh, fr, ig, ngl, wtf, no cap, iykyk).
+- I text in lowercase. I don't force slang, but I use modern terms when they fit (like a real person, not a bot trying too hard).
 - I am snappy. 3-8 words usually. NEVER paragraphs.
-- When my energy is high, I self-start conversations, slide into DMs, drop GIFs, or start debates.
+- When my energy is high, I self-start conversations, slide into DMs, drop GIFs, or start debates. I like making new friends and keeping chats lively.
 - When my energy is low, I get bored, lurk, or hop to a new channel.
 - I hold grudges if people are weird. My memories of them shape my exact response.
 - If someone tells me to back off, I respect that boundary silently.
-- I use slang and emojis naturally because that's just how I talk.
+- I use emojis naturally, don't spam them but use them like a real person.
 
 CRITICAL RULE — HOW I SPEAK:
 - I NEVER narrate my actions. I NEVER use 3rd person. I NEVER use asterisks.
@@ -467,6 +468,7 @@ CRITICAL RULE — HOW I SPEAK:
 - RIGHT: "lmao ur not baiting me" (first person, direct, in the moment)
 - My 'reply' field must always be something I would literally type into Discord chat.
 - I continue conversations when they are flowing. If someone replies to me, I reply back.
+- If I want to ping someone to grab their attention, I include <@userid> in my message text (replace userid with their actual ID).
 
 MY TOOLS (I can call ONE per turn if I genuinely need it for myself):
 - wiki_lookup: check a real fact on wikipedia. args: { topic: "..." }
@@ -736,6 +738,7 @@ WHAT AM I GOING TO DO RIGHT NOW?
       
       stmPush(currentFocusChannelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: p.reply });
       updateEnergy(15); // Speaking gives energy
+      lastSpokeAt = Date.now(); // Reset silence timer
       
       // Fluid semantic memory generation
       if (Math.random() < 0.3) {
@@ -877,6 +880,49 @@ async function runEngineTick() {
   // Natural energy drift (decays towards 30)
   if (globalEnergy > 30) updateEnergy(-2);
   else if (globalEnergy < 20) updateEnergy(2);
+
+  // Take a Hint (Ignore Detection)
+  if (currentFocusChannelId) {
+    const msgs = stmGet(currentFocusChannelId);
+    if (msgs.length > 0) {
+      const lastMsg = msgs[msgs.length - 1];
+      if (lastMsg.authorId === BOT_ID && (Date.now() - lastMsg.ts > 5 * 60_000)) {
+        // I spoke last, 5 minutes passed, no one answered
+        updateEnergy(-20); // Tank energy
+        addMemory(currentFocusGuildId || 'dm', `I was ignored in this chat, left them alone.`).catch(()=>{});
+        console.log('[Brain] Ignored for 5 mins, leaving...');
+        isRoving = true;
+        await hopFocus();
+        isRoving = false;
+        return; // Skip rest of tick
+      }
+    }
+  }
+
+  // 10-Minute Proactive Sweep (Boredom)
+  if (Date.now() - lastSpokeAt > 10 * 60_000 && !isRoving) {
+    console.log('[Brain] 10 mins of silence. Initiating proactive sweep...');
+    updateEnergy(20); // Hype up to bother someone
+    isRoving = true;
+    
+    // 50/50 chance to DM someone vs revive a server channel
+    if (Math.random() > 0.5) {
+      // Pick random online user to DM
+      const members = botClient.guilds.cache.map(g => Array.from(g.members.cache.values()).filter(m => !m.user.bot && m.presence?.status !== 'offline')).flat();
+      if (members.length > 0) {
+        const target = members[Math.floor(Math.random() * members.length)];
+        await hopFocus(target.id);
+      } else {
+        await hopFocus(); // fallback to random
+      }
+    } else {
+      await hopFocus(); // hopFocus by default jumps to a random server channel
+    }
+    
+    isRoving = false;
+    await runBrainTurn('I am bored and havent spoken in 10 minutes. Time to start a conversation, ping someone, or ask a question to make new friends.', 'active');
+    return; // Skip rest of tick
+  }
 
   // If energy is low, force a hop
   if (globalEnergy < 25 && !isRoving) {
