@@ -171,6 +171,12 @@ const lastBrainTurnAt = new Map<string, number>();
 // Tracks if a follow-up is pending for a channel (bot committed to responding)
 const pendingFollowUp = new Map<string, ReturnType<typeof setTimeout>>();
 
+// ── GLOBAL CONCURRENCY GUARD ─────────────────────────────────────────────
+// Prevents concurrent brain turns from firing simultaneously (the main bug causing waste)
+let isThinking = false;
+let lastSweepAt = 0;             // when the last proactive sweep fired
+const SWEEP_COOLDOWN_MS = 15 * 60_000; // at most 1 sweep every 15 minutes
+
 // Dynamic cooldown: shorter when conversation is active (messages coming fast)
 function effectiveCooldownMs(channelId: string): number {
   const msgs = stmGet(channelId);
@@ -517,7 +523,11 @@ I only use tools when I genuinely want to know something myself. NEVER as a favo
 Tool results come in the NEXT turn as context — I don't announce I'm looking something up.
 
 MY ACTION SPACE:
-- "speak": Type a message. If I fill 'targetId' with a message ID, Discord will show it as a direct Reply to that specific message — use this to reply to someone specifically.
+- "speak": Type a message.
+  - In a CROWD (3+ people talking): fill 'targetId' with the specific MESSAGE ID I'm responding to — Discord will show it as a reply so nobody gets confused about who I'm talking to.
+  - In a 1-ON-1: just send directly, leave targetId empty (fills only if referencing a specific old message).
+  - I DON'T have to respond to every message. If the conversation is flowing between others, I can watch and jump in only when I actually have something to add.
+  - If multiple messages came in while I was thinking, I can address them together in one reply, or the next brain turn will catch the rest naturally.
 - "react": Drop an emoji reaction on a message. Fill 'targetId' with the message ID to react to. Use aggressively when something is funny, dumb, or wild.
 - "gif": Send a GIF. Put the search term in 'gifSearch'.
 - "ignore": Read the chat, do nothing.
@@ -656,11 +666,14 @@ interface BrainDecision {
 
 async function runBrainTurn(triggerReason: string, mode: 'active' | 'passive', imageParts: ImagePart[] = [], isFollowUp = false) {
   if (!gemini.canCall() || !currentFocusChannelId) return;
-  
+  if (isThinking) return; // another turn already in progress — skip, don't pile up
+
   // Cooldown gate — skip for direct mentions and follow-ups
   const bypassCooldown = isFollowUp || triggerReason.startsWith('Directly engaged');
   if (!bypassCooldown && !canFireBrainTurn(currentFocusChannelId)) return;
   if (!isFollowUp) lastBrainTurnAt.set(currentFocusChannelId, Date.now());
+
+  isThinking = true;
 
   const msgs = stmGet(currentFocusChannelId);
   if (!msgs.length) return;
@@ -720,6 +733,13 @@ ${memory || '(nothing specific comes to mind)'}
 MY INTERNAL SENSORS:
 ${detectStaleBits(currentFocusChannelId)}
 ${linkContext}
+${(() => {
+  const recentSpeakers = new Set(msgs.slice(-8).filter(m => m.authorId !== BOT_ID).map(m => m.authorId));
+  const count = recentSpeakers.size;
+  if (count === 0) return '';
+  if (count === 1) return 'CHAT MODE: 1-on-1. Send messages directly, no need to use the reply feature unless referencing something specific.';
+  return `CHAT MODE: ${count} people are actively talking. Use Discord\'s reply feature (fill targetId with the specific message ID) so people know who I\'m talking to. I can address both in one message or respond twice in separate turns.`;
+})()}
 
 WHAT AM I GOING TO DO RIGHT NOW?
 (Output strictly JSON)
@@ -849,8 +869,11 @@ WHAT AM I GOING TO DO RIGHT NOW?
         updateEnergy(-20); // Massive energy crash
       }
     }
+  } finally {
+    isThinking = false; // ALWAYS release the lock, even on crash
   }
 }
+
 
 // ── DISCORD EVENTS ────────────────────────────────────────────────────
 async function handleMessage(msg: Message) {
@@ -979,10 +1002,11 @@ async function runEngineTick() {
     }
   }
 
-  // 10-Minute Proactive Sweep (Boredom)
-  if (Date.now() - lastSpokeAt > 10 * 60_000 && !isRoving) {
+  // 10-Minute Proactive Sweep (Boredom) — with its own cooldown
+  if (Date.now() - lastSpokeAt > 10 * 60_000 && Date.now() - lastSweepAt > SWEEP_COOLDOWN_MS && !isRoving && !isThinking) {
     console.log('[Brain] 10 mins of silence. Initiating proactive sweep...');
-    updateEnergy(20); // Hype up to bother someone
+    lastSweepAt = Date.now(); // mark sweep time FIRST to prevent double-firing
+    updateEnergy(20);
     isRoving = true;
     
     // 50/50 chance to DM someone vs revive a server channel
@@ -1011,8 +1035,8 @@ async function runEngineTick() {
     isRoving = false;
   }
   
-  // Occasional passive thought in current location (10% chance, was 30%)
-  if (currentFocusChannelId && Math.random() < 0.10) {
+  // Occasional passive thought — only if not currently thinking and pass probability check
+  if (currentFocusChannelId && !isThinking && Math.random() < 0.10) {
     await runBrainTurn('Time passing, evaluating current room...', 'passive');
   }
 }
