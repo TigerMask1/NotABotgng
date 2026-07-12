@@ -323,26 +323,51 @@ MY VIBE:
 - When my energy is low, I get bored, lurk, or hop to a new channel.
 - I hold grudges if people are weird, and my memories of them shape my exact response.
 - If someone tells me to stop or back off, I log it as a hard boundary and I respect it implicitly.
-- I MUST embed Discord emojis naturally inside my 'speak' and 'dm' responses (e.g. 'im dead 💀', 'bet 🔥', 'nah 😭').
+- I use modern slang and lots of emojis naturally in my text because that's just how I talk.
 
 MY CURRENT ACTION SPACE:
 - "speak": Actually type a message in the channel I'm focused on.
 - "react": Just drop an emoji on a message. (I will aggressively use the 'react' action if someone says something funny, dumb, or wild).
 - "gif": Drop a reaction gif. (I love using this to respond to things).
-- "dm": Slide into a specific user's DMs. (Requires setting 'targetId' to their exact ID).
 - "ignore": Read the chat but do nothing.
-- "hop": Randomly select a new server/channel to check out.
+- "hop": Leave this channel and move somewhere else. Put a specific User ID or Channel ID in 'targetId' if you want to intentionally DM someone or move to a specific room. Leave empty to wander randomly.
 - "lurk": Do nothing and drop my energy slightly.
 
 I make my decision purely based on my current mood, energy, and the situational context provided in my prompt.`;
 
 // ── ROVING FOCUS LOGIC ────────────────────────────────────────────────
-// Finds a new channel or DM to look at based on recent activity.
-async function hopFocus() {
+// Finds a new channel or DM to look at based on recent activity, or targets a specific user/channel.
+async function hopFocus(targetId?: string) {
   if (!botClient) return;
-  const candidates: { type: 'guild' | 'dm'; id: string; name: string; lastActivity: number; guildId?: string }[] = [];
   
-  // Collect all known channels with activity
+  if (targetId) {
+    try {
+      // Try resolving as user
+      const user = await botClient.users.fetch(targetId).catch(() => null);
+      if (user) {
+        const dmCh = await user.createDM();
+        currentFocusChannelId = dmCh.id;
+        currentFocusGuildId = 'dm';
+        updateEnergy(10);
+        addMemory('dm', `I intentionally slid into ${user.username}'s DMs.`).catch(()=>{});
+        return;
+      }
+      // Try resolving as channel
+      const ch = botClient.channels.cache.get(targetId);
+      if (ch && ch.isTextBased()) {
+        currentFocusChannelId = ch.id;
+        currentFocusGuildId = ch.isDMBased() ? 'dm' : (ch as any).guild?.id || 'dm';
+        updateEnergy(10);
+        addMemory(currentFocusGuildId, `I intentionally jumped to a specific chat.`).catch(()=>{});
+        return;
+      }
+    } catch (e: any) {
+      console.error('[Hop] Failed to hop intentionally:', e.message);
+    }
+  }
+
+  // Random wander fallback based on activity
+  const candidates: { type: 'guild' | 'dm'; id: string; name: string; lastActivity: number; guildId?: string }[] = [];
   for (const [chId, msgs] of stmStore.entries()) {
     if (chId === currentFocusChannelId) continue;
     if (!msgs.length) continue;
@@ -358,19 +383,24 @@ async function hopFocus() {
     }
   }
 
-  if (!candidates.length) return;
-  // Sort by recent activity, pick top 3, randomize choice
-  candidates.sort((a, b) => b.lastActivity - a.lastActivity);
-  const pick = candidates[Math.floor(Math.random() * Math.min(candidates.length, 3))];
-  
-  currentFocusChannelId = pick.id;
-  currentFocusGuildId = pick.type === 'guild' ? pick.guildId! : 'dm';
-  updateEnergy(10); // Spikes energy a bit on hop
-  
-  console.log(`[Rove] Hopped focus to ${pick.type === 'dm' ? 'a DM' : `#${pick.name}`}`);
-  
-  // Trigger a passive thought in the new location
-  await runBrainTurn('I just roved here looking for activity.', 'passive');
+  if (candidates.length) {
+    candidates.sort((a, b) => b.lastActivity - a.lastActivity);
+    const pick = candidates[Math.floor(Math.random() * Math.min(candidates.length, 3))];
+    currentFocusChannelId = pick.id;
+    currentFocusGuildId = pick.type === 'guild' ? pick.guildId! : 'dm';
+    updateEnergy(10);
+    console.log(`[Rove] Hopped focus to ${pick.type === 'dm' ? 'a DM' : `#${pick.name}`}`);
+  } else {
+    // True random fallback if no activity
+    const chs = botClient.channels.cache.filter(c => c.isTextBased());
+    if (chs.size) {
+      const arr = Array.from(chs.values());
+      const ch = arr[Math.floor(Math.random() * arr.length)];
+      currentFocusChannelId = ch.id;
+      currentFocusGuildId = ch.isDMBased() ? 'dm' : (ch as any).guild?.id || 'dm';
+      updateEnergy(-10);
+    }
+  }
 }
 
 // ── SOCIAL SIGNAL EXTRACTOR (Zero-Cost) ──────────────────────────────
@@ -399,7 +429,7 @@ function detectStaleBits(channelId: string): string {
 }
 
 // ── BRAIN TURN BUILDER ────────────────────────────────────────────────
-interface BrainDecision { action: 'speak'|'react'|'gif'|'ignore'|'hop'|'lurk'|'dm'; reply: string; reaction: string; gifSearch: string; targetId?: string; }
+interface BrainDecision { action: 'speak'|'react'|'gif'|'ignore'|'hop'|'lurk'; reply: string; reaction: string; gifSearch: string; targetId?: string; }
 
 async function runBrainTurn(triggerReason: string, mode: 'active' | 'passive', imageParts: ImagePart[] = []) {
   if (!gemini.canCall() || !currentFocusChannelId) return;
@@ -460,11 +490,11 @@ ${linkContext}
 WHAT AM I GOING TO DO RIGHT NOW?
 (Output strictly JSON)
 {
-  "action": "speak|react|gif|ignore|hop|lurk|dm",
-  "reply": "what I will say (if speaking or dm), lowercase, short",
+  "action": "speak|react|gif|ignore|hop|lurk",
+  "reply": "what I will say (if speaking or hopping), lowercase, short",
   "reaction": "emoji (if reacting)",
   "gifSearch": "search term (if gif)",
-  "targetId": "msg id or user id to reply/dm to, or empty"
+  "targetId": "msg id or user id to reply/hop to, or empty"
 }`;
 
   try {
@@ -474,7 +504,16 @@ WHAT AM I GOING TO DO RIGHT NOW?
     console.log(`[Monologue -> ${p.action}] ${p.reply?.slice(0, 50) || p.gifSearch?.slice(0,50)}`);
 
     if (p.action === 'hop') {
-      await hopFocus();
+      await hopFocus(p.targetId);
+      if (p.reply) {
+        const targetCh = botClient!.channels.cache.get(currentFocusChannelId) as TextChannel | undefined;
+        if (targetCh?.isTextBased()) {
+          await targetCh.sendTyping().catch(() => {});
+          await sleep(1000);
+          const sent = await targetCh.send(p.reply).catch(()=>null);
+          if (sent) stmPush(currentFocusChannelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: p.reply });
+        }
+      }
       return;
     }
 
@@ -498,23 +537,6 @@ WHAT AM I GOING TO DO RIGHT NOW?
       // Fluid semantic memory generation
       if (Math.random() < 0.3) {
         addMemory(guildId, `I spoke to them: "${p.reply}"`).catch(()=>{});
-      }
-    }
-
-    if (p.action === 'dm' && p.reply && p.targetId) {
-      try {
-        const user = await botClient!.users.fetch(p.targetId);
-        const dmCh = await user.createDM();
-        await dmCh.sendTyping().catch(()=>{});
-        await sleep(1000);
-        const sent = await dmCh.send(p.reply);
-        stmPush(dmCh.id, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: p.reply });
-        currentFocusChannelId = dmCh.id;
-        currentFocusGuildId = 'dm';
-        updateEnergy(20);
-        addMemory('dm', `I slid into ${user.username}'s DMs: "${p.reply}"`).catch(()=>{});
-      } catch (e: any) {
-        console.error('[DM] Error:', e.message);
       }
     }
 
