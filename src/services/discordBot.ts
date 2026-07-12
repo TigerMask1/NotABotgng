@@ -170,12 +170,23 @@ const BRAIN_COOLDOWN_MS  = 45_000; // Base cooldown between brain turns
 const lastBrainTurnAt = new Map<string, number>();
 // Tracks if a follow-up is pending for a channel (bot committed to responding)
 const pendingFollowUp = new Map<string, ReturnType<typeof setTimeout>>();
+// Queued direct engagement (ping while bot is thinking — don't drop it)
+const pendingDirectEngagement = new Map<string, { sender: string; chId: string; gId: string; imageParts: ImagePart[] }>();
 
 // ── GLOBAL CONCURRENCY GUARD ─────────────────────────────────────────────
 // Prevents concurrent brain turns from firing simultaneously (the main bug causing waste)
 let isThinking = false;
 let lastSweepAt = 0;             // when the last proactive sweep fired
 const SWEEP_COOLDOWN_MS = 15 * 60_000; // at most 1 sweep every 15 minutes
+
+// ── MOOD ENGINE ──────────────────────────────────────────────────────────
+function getMood(energy: number): { name: string; hint: string } {
+  if (energy >= 80) return { name: 'chaotic', hint: 'unhinged energy rn — react to everything, start debates, be loud' };
+  if (energy >= 60) return { name: 'hyped', hint: 'feeling good — drop GIFs, make jokes, keep the vibe going' };
+  if (energy >= 40) return { name: 'chill', hint: 'normal — responsive and conversational, not forcing anything' };
+  if (energy >= 20) return { name: 'bored', hint: 'losing interest — short replies, thinking about hopping somewhere else' };
+  return { name: 'drained', hint: 'totally cooked — one-word replies or bounce, recharge needed' };
+}
 
 // Dynamic cooldown: shorter when conversation is active (messages coming fast)
 function effectiveCooldownMs(channelId: string): number {
@@ -278,7 +289,8 @@ function formatMsgs(msgs: STMsg[]): string {
   return msgs.map(m => {
     const ago = Math.round((now - m.ts) / 1000);
     const t = ago < 60 ? `${ago}s ago` : `${Math.round(ago / 60)}m ago`;
-    return `[${t}] ${m.author}: ${m.content}`;
+    // Include message ID so brain can fill targetId for Discord replies
+    return `[${t}] [msgID:${m.id}] ${m.author}: ${m.content}`;
   }).join('\n');
 }
 
@@ -522,14 +534,14 @@ MY TOOLS (I can call ONE per turn if I genuinely need it for myself):
 I only use tools when I genuinely want to know something myself. NEVER as a favor.
 Tool results come in the NEXT turn as context — I don't announce I'm looking something up.
 
-MY ACTION SPACE:
-- "speak": Type a message.
-  - In a CROWD (3+ people talking): fill 'targetId' with the specific MESSAGE ID I'm responding to — Discord will show it as a reply so nobody gets confused about who I'm talking to.
-  - In a 1-ON-1: just send directly, leave targetId empty (fills only if referencing a specific old message).
-  - I DON'T have to respond to every message. If the conversation is flowing between others, I can watch and jump in only when I actually have something to add.
-  - If multiple messages came in while I was thinking, I can address them together in one reply, or the next brain turn will catch the rest naturally.
-- "react": Drop an emoji reaction on a message. Fill 'targetId' with the message ID to react to. Use aggressively when something is funny, dumb, or wild.
-- "gif": Send a GIF. Put the search term in 'gifSearch'.
+MY ACTION SPACE (in order of preference when the moment fits):
+- "react": ALWAYS consider this first. If something is funny, wild, cringe, relatable, or said anything quotable — react to it. Fill 'targetId' with the msgID from the chat history.
+- "gif": A GIF hits harder than a paragraph. If I'd respond with just a vibe, send a GIF instead. Put the search term in 'gifSearch'.
+- "speak": Only speak when I actually have something worth saying.
+  - In a CROWD (2+ different people talking): fill 'targetId' with the specific msgID from the chat history — Discord will show it as a reply so nobody's confused who I'm talking to.
+  - In a 1-ON-1: send directly, only fill targetId if referencing a specific old message.
+  - I DON'T respond to every single message. If others are talking and it doesn't need me, I watch.
+  - If multiple messages came in while I was thinking, I address them together or let the next turn catch them.
 - "ignore": Read the chat, do nothing.
 - "hop": Leave and move somewhere else. Fill 'targetId' with a User ID to slide into their DMs, or a Channel ID to jump to that room. Leave empty to wander randomly.
 - "lurk": Do nothing, drop energy slightly.
@@ -570,8 +582,10 @@ async function hopFocus(targetId?: string) {
     }
   }
 
-  // Random wander fallback based on activity
-  const candidates: { type: 'guild' | 'dm'; id: string; name: string; lastActivity: number; guildId?: string }[] = [];
+  // Split candidates by type — strongly prefer guild channels to avoid DM loops
+  const guildCandidates: { id: string; name: string; lastActivity: number; guildId: string }[] = [];
+  const dmCandidates: { id: string; lastActivity: number }[] = [];
+
   for (const [chId, msgs] of stmStore.entries()) {
     if (chId === currentFocusChannelId) continue;
     if (!msgs.length) continue;
@@ -579,32 +593,44 @@ async function hopFocus(targetId?: string) {
     const ch = botClient.channels.cache.get(chId);
     if (!ch) continue;
     if (ch.isDMBased()) {
-      candidates.push({ type: 'dm', id: chId, name: 'DM', lastActivity });
+      dmCandidates.push({ id: chId, lastActivity });
     } else {
       const gId = (ch as any).guildId;
       if (!gId) continue;
-      candidates.push({ type: 'guild', id: chId, name: (ch as any).name ?? chId, lastActivity, guildId: gId });
+      guildCandidates.push({ id: chId, name: (ch as any).name ?? chId, lastActivity, guildId: gId });
     }
   }
 
-  if (candidates.length) {
-    candidates.sort((a, b) => b.lastActivity - a.lastActivity);
-    const pick = candidates[Math.floor(Math.random() * Math.min(candidates.length, 3))];
+  // 80% prefer guild, 20% DM — prevents getting stuck in a DM loop
+  const preferGuild = guildCandidates.length > 0 && (dmCandidates.length === 0 || Math.random() < 0.8);
+
+  if (preferGuild) {
+    guildCandidates.sort((a, b) => b.lastActivity - a.lastActivity);
+    const pick = guildCandidates[Math.floor(Math.random() * Math.min(guildCandidates.length, 3))];
     currentFocusChannelId = pick.id;
-    currentFocusGuildId = pick.type === 'guild' ? pick.guildId! : 'dm';
+    currentFocusGuildId = pick.guildId;
     updateEnergy(10);
     updatePresence();
-    console.log(`[Rove] Hopped focus to ${pick.type === 'dm' ? 'a DM' : `#${pick.name}`}`);
+    console.log(`[Rove] Hopped to guild #${pick.name}`);
+  } else if (dmCandidates.length > 0) {
+    dmCandidates.sort((a, b) => b.lastActivity - a.lastActivity);
+    const pick = dmCandidates[0];
+    currentFocusChannelId = pick.id;
+    currentFocusGuildId = 'dm';
+    updateEnergy(5);
+    updatePresence();
+    console.log('[Rove] Hopped to a DM');
   } else {
-    // True random fallback if no activity
-    const chs = botClient.channels.cache.filter(c => c.isTextBased());
-    if (chs.size) {
-      const arr = Array.from(chs.values());
+    // True random fallback — ONLY guild text channels, never random DM
+    const guildChs = botClient.channels.cache.filter(c => c.isTextBased() && !c.isDMBased());
+    if (guildChs.size) {
+      const arr = Array.from(guildChs.values());
       const ch = arr[Math.floor(Math.random() * arr.length)];
       currentFocusChannelId = ch.id;
-      currentFocusGuildId = ch.isDMBased() ? 'dm' : (ch as any).guild?.id || 'dm';
-      updateEnergy(-10);
+      currentFocusGuildId = (ch as any).guild?.id || 'unknown';
+      updateEnergy(-5);
       updatePresence();
+      console.log('[Rove] True-random hopped to guild channel');
     }
   }
 }
@@ -731,6 +757,7 @@ RELEVANT MEMORIES PULLED FROM THE ETHER:
 ${memory || '(nothing specific comes to mind)'}
 
 MY INTERNAL SENSORS:
+CURRENT MOOD: ${getMood(globalEnergy).name} (energy ${globalEnergy}/100) — ${getMood(globalEnergy).hint}
 ${detectStaleBits(currentFocusChannelId)}
 ${linkContext}
 ${(() => {
@@ -871,6 +898,15 @@ WHAT AM I GOING TO DO RIGHT NOW?
     }
   } finally {
     isThinking = false; // ALWAYS release the lock, even on crash
+    // Fire any queued direct engagement (ping that came in while we were thinking)
+    const queued = pendingDirectEngagement.get(currentFocusChannelId ?? '');
+    if (queued) {
+      pendingDirectEngagement.delete(currentFocusChannelId ?? '');
+      currentFocusChannelId = queued.chId;
+      currentFocusGuildId = queued.gId;
+      updateEnergy(25);
+      setTimeout(() => runBrainTurn(`Directly engaged by ${queued.sender} (queued ping)`, 'active', queued.imageParts).catch(()=>{}), 500);
+    }
   }
 }
 
@@ -962,9 +998,15 @@ async function handleMessage(msg: Message) {
   }
 
   if (mentioned || gId === 'dm') {
+    if (isThinking) {
+      // Bot is mid-turn — queue this ping so it fires immediately after
+      pendingDirectEngagement.set(chId, { sender, chId, gId, imageParts });
+      console.log(`[Queue] Ping from ${sender} queued while thinking`);
+      return;
+    }
     currentFocusChannelId = chId;
     currentFocusGuildId = gId;
-    updateEnergy(25); // Big energy spike
+    updateEnergy(25);
     await runBrainTurn(`Directly engaged by ${sender}`, 'active', imageParts);
     return;
   }
@@ -1055,19 +1097,41 @@ export async function startBot(token: string) {
     partials: [Partials.Message, Partials.Channel, Partials.GuildMember],
   });
 
-  botClient.on(Events.ClientReady, () => {
+  botClient.on(Events.ClientReady, async () => {
     BOT_NAME = botClient!.user!.username;
     BOT_ID = botClient!.user!.id;
     console.log(`[Ready] I am ${BOT_NAME}. Core engine online.`);
-    
-    // Pick an initial focus randomly from available guilds
-    const g = botClient?.guilds.cache.first();
-    if (g) {
-      const ch = g.channels.cache.find(c => c.isTextBased());
-      if (ch) {
-        currentFocusChannelId = ch.id;
-        currentFocusGuildId = g.id;
-        console.log(`[Focus] Seeded on ${g.name}`);
+
+    // Cold-start STM scan: fetch recent messages from each guild's most active channel
+    // so the bot wakes up with context instead of being totally blind
+    for (const guild of botClient!.guilds.cache.values()) {
+      try {
+        const textChs = guild.channels.cache.filter(c => c.isTextBased() && !c.isDMBased());
+        const ch = textChs.find(c => (c as any).name?.includes('general') || (c as any).name?.includes('chat'))
+          ?? textChs.first();
+        if (!ch) continue;
+        const fetched = await (ch as TextChannel).messages.fetch({ limit: 15 }).catch(() => null);
+        if (!fetched) continue;
+        stmStore.set(ch.id, ([...fetched.values()] as Message[]).reverse().map(m => ({
+          ts: m.createdTimestamp, id: m.id, authorId: m.author.id,
+          author: m.author.id === BOT_ID ? '[me]' : (m.member?.displayName ?? m.author.username),
+          content: m.content.slice(0, 300)
+        })));
+        // Seed focus to first guild with content
+        if (!currentFocusChannelId) {
+          currentFocusChannelId = ch.id;
+          currentFocusGuildId = guild.id;
+          console.log(`[Focus] Seeded on #${(ch as any).name} in ${guild.name}`);
+        }
+      } catch { /* skip guild if fetch fails */ }
+    }
+
+    // Fallback seed if no messages fetched
+    if (!currentFocusChannelId) {
+      const g = botClient?.guilds.cache.first();
+      if (g) {
+        const ch = g.channels.cache.find(c => c.isTextBased());
+        if (ch) { currentFocusChannelId = ch.id; currentFocusGuildId = g.id; }
       }
     }
 
