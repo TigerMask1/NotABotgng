@@ -1,6 +1,6 @@
 import {
   Client, GatewayIntentBits, Message, Partials,
-  Events, TextChannel, ActivityType
+  Events, TextChannel, ActivityType, PermissionFlagsBits
 } from 'discord.js';
 import { db } from './firebase.ts';
 import dotenv from 'dotenv';
@@ -206,6 +206,36 @@ let BOT_ID = '';
 let botClient: Client | null = null;
 let globallyMuted = false;
 let lastSpokeAt = Date.now();
+
+// ── ADMIN STATE ────────────────────────────────────────────────────────
+const ADMIN_ID = process.env.ADMIN_ID || '1296109674361520146';
+const serverMuted = new Map<string, boolean>();
+const serverFamilyFriendly = new Map<string, boolean>();
+const allowedChannels = new Map<string, Set<string>>(); // guildId -> Set of channelIds
+const allowedBots = new Map<string, Set<string>>(); // guildId -> Set of bot userIds
+
+// ── ADMIN NATURAL-LANGUAGE ALIASES ────────────────────────────────────
+const ADMIN_NL: { re: RegExp; cmd: string }[] = [
+  { re: /\b(listen to|start listening to|pay attention to|hear)\s+<@!?\d+>/i, cmd: '!listenbot' },
+  { re: /\b(ignore|stop listening to|stop hearing)\s+<@!?\d+>/i, cmd: '!ignorebot' },
+  { re: /\b(what|which)\s+bots?\b.*\b(listen|hear)/i, cmd: '!bots' },
+  { re: /\b(only (talk|listen|respond)|restrict yourself|scope yourself)\b.*\b(here|this channel)\b/i, cmd: '!listenhere' },
+  { re: /\b(stop (talking|listening|responding))\b.*\b(here|in this channel)\b/i, cmd: '!unlisten' },
+  { re: /\b(talk|listen)\s+(everywhere|in every channel)|reset (the )?channels?\b/i, cmd: '!listenall' },
+  { re: /\b(what|which) channels?\b.*(you('re| are)?( allowed to)? (talk|listen)|listening)/i, cmd: '!channels' },
+  { re: /\bkeep it (clean|pg)|family friendly|no swearing/i, cmd: '!familyfriendly' },
+  { re: /\b(be unfiltered|you can swear)\b/i, cmd: '!nsfw' }
+];
+
+function resolveAdminCommand(content: string, isAdmin: boolean): string | null {
+  const BANG = ['!stop','!resume','!listenbot','!ignorebot','!bots','!listenhere','!unlisten','!listenall','!channels','!help', '!familyfriendly', '!nsfw'];
+  if (!isAdmin) return null;
+  const trimmed = content.trim();
+  const firstWord = trimmed.split(' ')[0].toLowerCase();
+  if (BANG.includes(firstWord)) return firstWord;
+  for (const { re, cmd } of ADMIN_NL) if (re.test(trimmed)) return cmd;
+  return null;
+}
 
 // ── ID CACHES ────────────────────────────────────────────────────────
 const idCache = new Map<string, string>();
@@ -443,7 +473,10 @@ async function runTool(cmd: string, args: Record<string, string>, channelId: str
 }
 
 // ── INNER MONOLOGUE SYSTEM PROMPT ─────────────────────────────────────
-const SYSTEM_PROMPT = `This is my unfiltered internal monologue. I am NotABot.
+function getSystemPrompt(guildId: string): string {
+  const isFamilyFriendly = serverFamilyFriendly.get(guildId) ?? false;
+  
+  return `This is my unfiltered internal monologue. I am NotABot.
 I'm a chronically online Gen Z Discord user just hanging out in these servers and DMs. I'm not an assistant.
 
 WHO I AM:
@@ -461,6 +494,9 @@ MY VIBE:
 - I hold grudges if people are weird. My memories of them shape my exact response.
 - If someone tells me to back off, I respect that boundary silently.
 - I use emojis naturally, don't spam them but use them like a real person.
+${isFamilyFriendly 
+  ? "- RULE: This server is Family Friendly. Keep it clean, no swearing, no NSFW content." 
+  : "- RULE: I am completely unfiltered. I can swear naturally, roast people, and match their toxicity. If someone speaks to me in a different language, I MUST instantly switch to that language and throw their exact energy back at them."}
 
 CRITICAL RULE — HOW I SPEAK:
 - I NEVER narrate my actions. I NEVER use 3rd person. I NEVER use asterisks.
@@ -489,6 +525,7 @@ MY ACTION SPACE:
 - "lurk": Do nothing, drop energy slightly.
 
 I make my decision purely based on my current mood, energy, and the situational context provided.`;
+}
 
 // ── ROVING FOCUS LOGIC ────────────────────────────────────────────────
 // Finds a new channel or DM to look at based on recent activity, or targets a specific user/channel.
@@ -697,7 +734,8 @@ WHAT AM I GOING TO DO RIGHT NOW?
 }`;
 
   try {
-    const raw = await gemini.call(SYSTEM_PROMPT, prompt, mode === 'active' ? 0.95 : 0.7, mode === 'active' ? ACTIVE_MODEL : PASSIVE_MODEL, imageParts);
+    const sysPrompt = getSystemPrompt(guildId);
+    const raw = await gemini.call(sysPrompt, prompt, mode === 'active' ? 0.95 : 0.7, mode === 'active' ? ACTIVE_MODEL : PASSIVE_MODEL, imageParts);
     const p = JSON.parse((raw.match(/\{[\s\S]*\}/) ?? ['{}'])[0]) as BrainDecision;
     
     const VALID_ACTIONS = new Set(['speak','react','gif','ignore','hop','lurk']);
@@ -823,6 +861,48 @@ async function handleMessage(msg: Message) {
   const gId = msg.guildId ?? 'dm';
   const sender = msg.member?.displayName ?? msg.author.username;
   
+  const isAdmin = msg.author.id === ADMIN_ID || !!msg.member?.permissions.has(PermissionFlagsBits.Administrator);
+  const cmd = resolveAdminCommand(msg.content, isAdmin);
+  
+  if (cmd) {
+    if (cmd === '!stop' || cmd === '!resume') {
+      serverMuted.set(gId, cmd === '!stop');
+      msg.reply(cmd === '!stop' ? 'going quiet here. any admin can !resume me' : 'back 🫡').catch(()=>{});
+      return;
+    }
+    if (cmd === '!familyfriendly' || cmd === '!nsfw') {
+      serverFamilyFriendly.set(gId, cmd === '!familyfriendly');
+      msg.reply(cmd === '!familyfriendly' ? 'pg mode engaged 🧼' : 'unfiltered mode engaged 😈').catch(()=>{});
+      return;
+    }
+    if (cmd === '!help') {
+      msg.reply('**Admin commands:**\n`!stop` / `!resume` (mute me)\n`!familyfriendly` / `!nsfw` (toggle swearing)\n`!listenhere` / `!listenall` (lock me to this channel)').catch(()=>{});
+      return;
+    }
+    if (cmd === '!listenhere') {
+      let s = allowedChannels.get(gId);
+      if (!s) { s = new Set(); allowedChannels.set(gId, s); }
+      s.add(chId);
+      msg.reply('locked in here').catch(()=>{});
+      return;
+    }
+    if (cmd === '!unlisten') {
+      allowedChannels.get(gId)?.delete(chId);
+      msg.reply('dropped this channel').catch(()=>{});
+      return;
+    }
+    if (cmd === '!listenall') {
+      allowedChannels.delete(gId);
+      msg.reply('back to listening everywhere').catch(()=>{});
+      return;
+    }
+  }
+
+  // Pre-flight checks: am I allowed to speak here?
+  if (serverMuted.get(gId)) return;
+  const ac = allowedChannels.get(gId);
+  if (ac && ac.size > 0 && !ac.has(chId)) return;
+
   idCache.set(msg.author.id, sender);
   updateRelData(msg.author.id, { lastSeenAt: Date.now() });
 
@@ -969,6 +1049,51 @@ export async function startBot(token: string) {
 
     setInterval(() => runEngineTick().catch(()=>null), TICK_MS);
     updatePresence();
+  });
+
+  // ── GUILD JOIN EVENT ────────────────────────────────────────────────
+  botClient.on(Events.GuildCreate, async (guild) => {
+    console.log(`[GuildCreate] Joined: ${guild.name}`);
+
+    // 1. DM the server owner with a friendly intro and !help
+    try {
+      const owner = await guild.fetchOwner();
+      await owner.send(
+        `yo 👋 i just joined **${guild.name}**!\n` +
+        `i'm pretty self-sufficient — i'll wander around and talk to people on my own.\n\n` +
+        `**as a server admin you can:**\n` +
+        `\`!stop\` / \`!resume\` — mute / unmute me in this server\n` +
+        `\`!listenhere\` / \`!listenall\` — lock me to one channel or open me up everywhere\n` +
+        `\`!familyfriendly\` / \`!nsfw\` — toggle swearing and unfiltered mode\n` +
+        `\`!help\` — see this list again anytime`
+      ).catch(() => console.log('[GuildCreate] Could not DM owner'));
+    } catch { console.log('[GuildCreate] Owner DM failed'); }
+
+    // 2. Find best channel to announce in (prefer one named 'general' or 'chat')
+    const channels = guild.channels.cache
+      .filter(c => c.isTextBased() && !!(c as TextChannel).permissionsFor?.(guild.members.me!)?.has('SendMessages'))
+      .sort((a, b) => (a.name.includes('general') || a.name.includes('chat') ? -1 : 1));
+    const ch = channels.first() as TextChannel | undefined;
+
+    if (ch) {
+      updateEnergy(100);
+      currentFocusChannelId = ch.id;
+      currentFocusGuildId = guild.id;
+      await sleep(1500);
+      await ch.sendTyping().catch(() => {});
+      await sleep(1200);
+      const greetings = [
+        'YOOOOOO!!! HIIII 👋👋',
+        'yo wtf hi 💥💥💥',
+        'AYYYY HIIII!!!!! 🙏🙏',
+        'omg hi everyone!!!! 👋',
+        'YOOO NEW PLACE WHO DIS 🙈'
+      ];
+      const greeting = greetings[Math.floor(Math.random() * greetings.length)];
+      const sent = await ch.send(greeting).catch(() => null);
+      if (sent) stmPush(ch.id, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: greeting });
+      lastSpokeAt = Date.now();
+    }
   });
 
   botClient.on(Events.MessageCreate, handleMessage);
