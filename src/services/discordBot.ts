@@ -163,7 +163,16 @@ const embedder = new EmbeddingManager();
 // ── CONSTANTS ────────────────────────────────────────────────────────
 const STM_MAX = 30; // Short term memory depth per channel
 const BRAIN_CONTEXT_MSGS = 12; // Messages sent to brain
-const TICK_MS = 60_000; // Background tick interval
+const TICK_MS            = 60_000; // Background tick interval
+const BRAIN_COOLDOWN_MS  = 45_000; // Min ms between brain turns per channel
+
+// Tracks the last time a brain turn was fired per channel
+const lastBrainTurnAt = new Map<string, number>();
+
+function canFireBrainTurn(channelId: string): boolean {
+  const last = lastBrainTurnAt.get(channelId) ?? 0;
+  return Date.now() - last >= BRAIN_COOLDOWN_MS;
+}
 
 // ── BOT GLOBALS ──────────────────────────────────────────────────────
 let BOT_NAME = 'NotABot';
@@ -462,6 +471,12 @@ interface BrainDecision { action: 'speak'|'react'|'gif'|'ignore'|'hop'|'lurk'; r
 
 async function runBrainTurn(triggerReason: string, mode: 'active' | 'passive', imageParts: ImagePart[] = []) {
   if (!gemini.canCall() || !currentFocusChannelId) return;
+  
+  // Cooldown gate — skip unless directly mentioned/DM (mode === 'active' from mention bypasses this)
+  const bypassCooldown = triggerReason.startsWith('Directly engaged');
+  if (!bypassCooldown && !canFireBrainTurn(currentFocusChannelId)) return;
+  lastBrainTurnAt.set(currentFocusChannelId, Date.now());
+
   const msgs = stmGet(currentFocusChannelId);
   if (!msgs.length) return;
 
@@ -530,7 +545,13 @@ WHAT AM I GOING TO DO RIGHT NOW?
     const raw = await gemini.call(SYSTEM_PROMPT, prompt, mode === 'active' ? 0.95 : 0.7, mode === 'active' ? ACTIVE_MODEL : PASSIVE_MODEL, imageParts);
     const p = JSON.parse((raw.match(/\{[\s\S]*\}/) ?? ['{}'])[0]) as BrainDecision;
     
-    console.log(`[Monologue -> ${p.action}] ${p.reply?.slice(0, 50) || p.gifSearch?.slice(0,50)}`);
+    const VALID_ACTIONS = new Set(['speak','react','gif','ignore','hop','lurk']);
+    if (!p.action || !VALID_ACTIONS.has(p.action)) {
+      console.log(`[Monologue -> invalid/empty response, ignoring]`);
+      return;
+    }
+    
+    console.log(`[Monologue -> ${p.action}] ${p.reply?.slice(0, 50) || p.gifSearch?.slice(0,50) || ''}`);
 
     if (p.action === 'hop') {
       await hopFocus(p.targetId);
@@ -683,8 +704,8 @@ async function runEngineTick() {
     isRoving = false;
   }
   
-  // Occasional passive thought in current location
-  if (currentFocusChannelId && Math.random() < 0.3) {
+  // Occasional passive thought in current location (10% chance, was 30%)
+  if (currentFocusChannelId && Math.random() < 0.10) {
     await runBrainTurn('Time passing, evaluating current room...', 'passive');
   }
 }
