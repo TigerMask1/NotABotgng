@@ -10,9 +10,9 @@ dotenv.config();
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 // ── MODELS ──────────────────────────────────────────────────────────
-const ACTIVE_MODEL  = 'gemini-2.0-flash-lite';
-const PASSIVE_MODEL = 'gemini-2.0-flash';
-const BG_MODEL      = 'gemini-2.0-flash-lite';
+const ACTIVE_MODEL  = 'gemini-3.1-flash-lite';
+const PASSIVE_MODEL = 'gemma-4-26b-a4b-it';
+const BG_MODEL      = 'gemma-4-31b-it';
 
 // ── VISION ──────────────────────────────────────────────────────────
 interface ImagePart { mimeType: string; data: string; }
@@ -70,6 +70,7 @@ class GeminiManager {
       maxOutputTokens,
     };
 
+    let lastError = '';
     const maxAttempts = Math.max(this.keys.length, 1) * 2;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const key = this.pickKey();
@@ -97,12 +98,13 @@ class GeminiManager {
           const body = await res.json().catch(() => ({})) as any;
           const retryMs = ((body?.error?.details?.[0]?.retryDelay?.seconds ?? 15) as number) * 1000;
           this.cooldowns.set(key, Date.now() + retryMs);
+          lastError = '429 Rate Limit';
           continue;
         }
 
         if (!res.ok) {
           const err = await res.text().catch(() => res.statusText);
-          throw new Error(`Gemini ${res.status}: ${err.slice(0, 120)}`);
+          throw new Error(`Gemini ${res.status}: ${err.slice(0, 150)}`);
         }
 
         const data = await res.json() as any;
@@ -110,11 +112,12 @@ class GeminiManager {
         if (!text.trim()) continue;
         return text;
       } catch (e: any) {
+        lastError = e.message;
         if (e.message?.includes('429')) continue;
         if (attempt < maxAttempts - 1) await sleep(Math.min(1500 * 2 ** attempt, 8000));
       }
     }
-    throw new Error('[Gemini] all attempts failed');
+    throw new Error(`[Gemini] all attempts failed. Last error: ${lastError}`);
   }
 
   canCall(): boolean { return this.keys.length > 0; }
