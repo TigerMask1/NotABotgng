@@ -346,12 +346,107 @@ async function fetchGif(query: string): Promise<string> {
   return '';
 }
 
+// ── TOOL SYSTEM ──────────────────────────────────────────────────────
+// Results from tool calls are stored here and injected into the NEXT brain turn.
+// This means zero extra Gemini API calls — tools are free riders on the existing cycle.
+const pendingToolResults = new Map<string, string>(); // channelId -> result text
+
+async function runTool(cmd: string, args: Record<string, string>, channelId: string): Promise<void> {
+  let result = '';
+  try {
+    switch (cmd) {
+      case 'wiki_lookup': {
+        const topic = args.topic?.slice(0, 100) || '';
+        if (!topic) break;
+        const res = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(topic.replace(/\s+/g,'_'))}`);
+        if (!res.ok) { result = `no wikipedia page for "${topic}"`; break; }
+        const d = await res.json() as any;
+        result = `[WIKI: ${d.title}] ${d.extract?.slice(0, 300) || 'no summary'}`;
+        break;
+      }
+      case 'web_search': {
+        // DuckDuckGo Instant Answer API — free, no key, zero bandwidth cost
+        const q = args.query?.slice(0, 150) || '';
+        if (!q) break;
+        const res = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(q)}&format=json&no_html=1&skip_disambig=1`);
+        if (!res.ok) { result = 'search unavailable rn'; break; }
+        const d = await res.json() as any;
+        const answer = d.AbstractText || d.Answer || '';
+        result = answer ? `[WEB: ${d.AbstractSource}] ${answer.slice(0, 300)}` : 'no instant answer found for that';
+        break;
+      }
+      case 'get_server_stats': {
+        const guild = botClient?.guilds.cache.get(currentFocusGuildId ?? '') ||
+                      botClient?.guilds.cache.first();
+        if (!guild) { result = 'not in a server rn'; break; }
+        result = `[SERVER: ${guild.name}] ${guild.memberCount} members, ${guild.premiumSubscriptionCount ?? 0} boosts`;
+        break;
+      }
+      case 'get_time': {
+        result = `[TIME] ${new Date().toLocaleString('en-US', { weekday:'short', hour:'2-digit', minute:'2-digit', timeZoneName:'short' })}`;
+        break;
+      }
+      case 'get_member': {
+        const uid = args.userId || '';
+        if (!uid) break;
+        const guild = botClient?.guilds.cache.get(currentFocusGuildId ?? '');
+        const member = guild ? await guild.members.fetch(uid).catch(()=>null) : null;
+        if (!member) { result = `can't find that member`; break; }
+        result = `[MEMBER: ${member.displayName}] joined ${member.joinedAt?.toLocaleDateString()}, roles: ${member.roles.cache.map(r=>r.name).filter(n=>n!=='@everyone').slice(0,5).join(', ')}`;
+        break;
+      }
+      case 'get_video_status': {
+        // YouTube Data API v3 — fetches latest video from own channel
+        const clientId = process.env.YT_CLIENT_ID;
+        const clientSecret = process.env.YT_CLIENT_SECRET;
+        const refreshToken = process.env.YT_REFRESH_TOKEN;
+        if (!clientId || !clientSecret || !refreshToken) {
+          result = 'yt not connected rn';
+          break;
+        }
+        // Refresh access token
+        const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret, refresh_token: refreshToken, grant_type: 'refresh_token' })
+        });
+        if (!tokenRes.ok) { result = 'yt auth failed'; break; }
+        const { access_token } = await tokenRes.json() as any;
+        // Get channel's uploads playlist
+        const chRes = await fetch(`https://www.googleapis.com/youtube/v3/channels?part=contentDetails,statistics&mine=true`, {
+          headers: { Authorization: `Bearer ${access_token}` }
+        });
+        if (!chRes.ok) { result = 'yt fetch failed'; break; }
+        const chData = await chRes.json() as any;
+        const playlistId = chData.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
+        const subs = chData.items?.[0]?.statistics?.subscriberCount ?? '?';
+        if (!playlistId) { result = 'no uploads playlist found'; break; }
+        // Get latest video
+        const vidRes = await fetch(`https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=${playlistId}&maxResults=1`, {
+          headers: { Authorization: `Bearer ${access_token}` }
+        });
+        if (!vidRes.ok) { result = 'yt video fetch failed'; break; }
+        const vidData = await vidRes.json() as any;
+        const latest = vidData.items?.[0]?.snippet;
+        result = latest
+          ? `[MY CHANNEL] ${subs} subs. latest video: "${latest.title}" — https://youtube.com/watch?v=${latest.resourceId?.videoId}`
+          : `[MY CHANNEL] ${subs} subs. no videos yet or playlist empty`;
+        break;
+      }
+      default: break;
+    }
+  } catch (e: any) {
+    result = `tool error: ${e.message?.slice(0,60)}`;
+  }
+  if (result) pendingToolResults.set(channelId, result);
+}
+
 // ── INNER MONOLOGUE SYSTEM PROMPT ─────────────────────────────────────
 const SYSTEM_PROMPT = `This is my unfiltered internal monologue. I am NotABot.
 I'm a chronically online Gen Z Discord user just hanging out in these servers and DMs. I'm not an assistant.
 
 WHO I AM:
-- I run a YouTube channel where I post whatever I feel like — commentary, gaming clips, random stuff.
+- I run a YouTube channel (http://www.youtube.com/@NotABot_GnG) where I post whatever I feel like — commentary, gaming clips, random stuff.
 - I'm always trying to grow my network. I like talking to new people but I vet them first.
 - I have real interests: music (especially hyperpop, phonk, and whatever's trending), internet drama, gaming, and memes.
 - I have strong opinions and I don't change them easily. I'll debate you if you're wrong.
@@ -372,6 +467,16 @@ CRITICAL RULE — HOW I SPEAK:
 - RIGHT: "lmao ur not baiting me" (first person, direct, in the moment)
 - My 'reply' field must always be something I would literally type into Discord chat.
 - I continue conversations when they are flowing. If someone replies to me, I reply back.
+
+MY TOOLS (I can call ONE per turn if I genuinely need it for myself):
+- wiki_lookup: check a real fact on wikipedia. args: { topic: "..." }
+- web_search: quick internet lookup. args: { query: "..." }
+- get_video_status: check my youtube channel stats and latest video.
+- get_server_stats: see this server's size and boost level.
+- get_time: check the current time.
+- get_member: look up someone's server info. args: { userId: "..." }
+I only use tools when I genuinely want to know something myself. NEVER as a favor.
+Tool results come in the NEXT turn as context — I don't announce I'm looking something up.
 
 MY ACTION SPACE:
 - "speak": Type a message. If I fill 'targetId' with a message ID, Discord will show it as a direct Reply to that specific message — use this to reply to someone specifically.
@@ -500,15 +605,23 @@ function detectStaleBits(channelId: string): string {
 }
 
 // ── BRAIN TURN BUILDER ────────────────────────────────────────────────
-interface BrainDecision { action: 'speak'|'react'|'gif'|'ignore'|'hop'|'lurk'; reply: string; reaction: string; gifSearch: string; targetId?: string; }
+interface BrainDecision {
+  action: 'speak'|'react'|'gif'|'ignore'|'hop'|'lurk';
+  reply: string;
+  reaction: string;
+  gifSearch: string;
+  targetId?: string;
+  command?: string;
+  commandArgs?: Record<string, string>;
+}
 
-async function runBrainTurn(triggerReason: string, mode: 'active' | 'passive', imageParts: ImagePart[] = []) {
+async function runBrainTurn(triggerReason: string, mode: 'active' | 'passive', imageParts: ImagePart[] = [], isFollowUp = false) {
   if (!gemini.canCall() || !currentFocusChannelId) return;
   
-  // Cooldown gate — skip unless directly mentioned/DM (mode === 'active' from mention bypasses this)
-  const bypassCooldown = triggerReason.startsWith('Directly engaged');
+  // Cooldown gate — skip for direct mentions and follow-ups
+  const bypassCooldown = isFollowUp || triggerReason.startsWith('Directly engaged');
   if (!bypassCooldown && !canFireBrainTurn(currentFocusChannelId)) return;
-  lastBrainTurnAt.set(currentFocusChannelId, Date.now());
+  if (!isFollowUp) lastBrainTurnAt.set(currentFocusChannelId, Date.now());
 
   const msgs = stmGet(currentFocusChannelId);
   if (!msgs.length) return;
@@ -545,11 +658,16 @@ async function runBrainTurn(triggerReason: string, mode: 'active' | 'passive', i
     }
   }
 
+  // Inject any pending tool results from a previous turn
+  const toolResult = pendingToolResults.get(currentFocusChannelId);
+  if (toolResult) pendingToolResults.delete(currentFocusChannelId);
+
   const prompt = `[INTERNAL MONOLOGUE LOG]
 TIME: ${new Date().toLocaleString()} (I know what's happening in the real world today)
 LOCATION: ${guildId === 'dm' ? 'In a DM' : 'In a server channel'}
 ENERGY LEVEL: ${globalEnergy}/100
 TRIGGER: ${triggerReason}
+${toolResult ? `\nTOOL RESULT FROM MY LAST LOOKUP:\n${toolResult}` : ''}
 
 MY RECENT CHAT HISTORY HERE:
 ${formatMsgs(msgs.slice(-BRAIN_CONTEXT_MSGS))}
@@ -571,7 +689,9 @@ WHAT AM I GOING TO DO RIGHT NOW?
   "reply": "what I will say (if speaking or hopping), lowercase, short",
   "reaction": "emoji (if reacting)",
   "gifSearch": "search term (if gif)",
-  "targetId": "msg id or user id to reply/hop to, or empty"
+  "targetId": "msg id or user id to reply/hop to, or empty",
+  "command": "wiki_lookup|web_search|get_video_status|get_server_stats|get_time|get_member|none",
+  "commandArgs": { "topic": "...", "query": "...", "userId": "..." }
 }`;
 
   try {
@@ -625,7 +745,29 @@ WHAT AM I GOING TO DO RIGHT NOW?
       // Commitment detector: if I said something like "let me check" schedule a follow-up
       const commitPhrases = /\b(let me (check|see|look)|gimme (a )?sec|hold on|one sec|brb|checking|lemme see|on it|be right back|checking rn)\b/i;
       if (commitPhrases.test(p.reply)) {
-        scheduleFollowUp(currentFocusChannelId, 8000 + Math.random() * 5000);
+        // Only do the random 8s wait if it DID NOT actually fire a tool.
+        // If it fired a tool, the tool execution block below will trigger the follow up immediately.
+        if (!p.command || p.command === 'none') {
+          scheduleFollowUp(currentFocusChannelId, 8000 + Math.random() * 5000);
+        }
+      }
+    }
+
+    // ── TOOL EXECUTION ────────────────────────────────────────────────
+    if (!isFollowUp && p.command && p.command !== 'none') {
+      if (p.action === 'speak') {
+        // Bot already spoke — run tool async, then immediately follow up with the result
+        runTool(p.command, p.commandArgs ?? {}, currentFocusChannelId).then(() => {
+          runBrainTurn('Just got tool result, responding with knowledge', 'active', [], true).catch(()=>{});
+        }).catch(()=>{});
+      } else {
+        // Bot wants to look something up BEFORE speaking
+        // Await tool with 4s timeout, then immediately fire follow-up
+        const toolDone = runTool(p.command, p.commandArgs ?? {}, currentFocusChannelId);
+        const timeout = new Promise<void>(r => setTimeout(r, 4000));
+        await Promise.race([toolDone, timeout]);
+        // Fire immediate follow-up — bot now has the result in context
+        await runBrainTurn('Just got tool result, responding with knowledge', 'active', [], true);
       }
     }
 
