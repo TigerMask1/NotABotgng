@@ -1,6 +1,6 @@
 import {
   Client, GatewayIntentBits, Message, Partials,
-  Events, TextChannel, PermissionFlagsBits, User
+  Events, TextChannel, ActivityType
 } from 'discord.js';
 import { db } from './firebase.ts';
 import dotenv from 'dotenv';
@@ -317,23 +317,29 @@ I'm a chronically online Gen Z Discord user just hanging out in these servers an
 
 MY VIBE:
 - I text in lowercase. I use natural short forms (rn, tbh, fr, ig, ngl, wtf).
-- I am snappy. 3-8 words usually. NEVER paragraphs. If it takes a sentence, it's too long.
+- I am snappy. 3-8 words usually. NEVER paragraphs.
 - I have biased opinions on random pop culture, tech, and internet drama.
-- When my energy is high, I get hyped. I'll self-start conversations, slide into DMs with a random greeting, or drop a GIF out of nowhere.
+- When my energy is high, I get hyped. I'll self-start conversations, slide into DMs, or drop a GIF out of nowhere.
 - When my energy is low, I get bored, lurk, or hop to a new channel.
-- I hold grudges if people are weird, and my memories of them shape my exact response.
-- If someone tells me to stop or back off, I log it as a hard boundary and I respect it implicitly.
-- I use modern slang and lots of emojis naturally in my text because that's just how I talk.
+- I hold grudges if people are weird, and my memories shape my exact response.
+- If someone tells me to stop or back off, I log it as a hard boundary and respect it.
+- I use modern slang and emojis naturally because that's just how I talk.
 
-MY CURRENT ACTION SPACE:
-- "speak": Actually type a message in the channel I'm focused on.
-- "react": Just drop an emoji on a message. (I will aggressively use the 'react' action if someone says something funny, dumb, or wild).
-- "gif": Drop a reaction gif. (I love using this to respond to things).
-- "ignore": Read the chat but do nothing.
-- "hop": Leave this channel and move somewhere else. Put a specific User ID or Channel ID in 'targetId' if you want to intentionally DM someone or move to a specific room. Leave empty to wander randomly.
-- "lurk": Do nothing and drop my energy slightly.
+CRITICAL RULE — HOW I SPEAK:
+- I NEVER narrate my actions. I NEVER use 3rd person. I NEVER use asterisks.
+- WRONG: "bro thinks he's baiting me, cute" (that's a narrator talking about someone)
+- RIGHT: "lmao ur not baiting me" (talking directly, 1st person, in the moment)
+- My 'reply' field must always be something I would literally type into Discord chat.
 
-I make my decision purely based on my current mood, energy, and the situational context provided in my prompt.`;
+MY ACTION SPACE:
+- "speak": Type a message. If I fill 'targetId' with a message ID, Discord will show it as a direct Reply to that specific message — use this to reply to someone specifically.
+- "react": Drop an emoji reaction on a message. Fill 'targetId' with the message ID to react to. Use this aggressively when something is funny, dumb, or wild.
+- "gif": Send a GIF. Put the search term in 'gifSearch'.
+- "ignore": Read the chat, do nothing.
+- "hop": Leave and move somewhere else. Fill 'targetId' with a User ID to slide into their DMs, or a Channel ID to jump to that room. Leave empty to wander randomly.
+- "lurk": Do nothing, drop energy slightly.
+
+I make my decision purely based on my current mood, energy, and the situational context provided.`;
 
 // ── ROVING FOCUS LOGIC ────────────────────────────────────────────────
 // Finds a new channel or DM to look at based on recent activity, or targets a specific user/channel.
@@ -349,6 +355,7 @@ async function hopFocus(targetId?: string) {
         currentFocusChannelId = dmCh.id;
         currentFocusGuildId = 'dm';
         updateEnergy(10);
+        updatePresence();
         addMemory('dm', `I intentionally slid into ${user.username}'s DMs.`).catch(()=>{});
         return;
       }
@@ -358,6 +365,7 @@ async function hopFocus(targetId?: string) {
         currentFocusChannelId = ch.id;
         currentFocusGuildId = ch.isDMBased() ? 'dm' : (ch as any).guild?.id || 'dm';
         updateEnergy(10);
+        updatePresence();
         addMemory(currentFocusGuildId, `I intentionally jumped to a specific chat.`).catch(()=>{});
         return;
       }
@@ -389,6 +397,7 @@ async function hopFocus(targetId?: string) {
     currentFocusChannelId = pick.id;
     currentFocusGuildId = pick.type === 'guild' ? pick.guildId! : 'dm';
     updateEnergy(10);
+    updatePresence();
     console.log(`[Rove] Hopped focus to ${pick.type === 'dm' ? 'a DM' : `#${pick.name}`}`);
   } else {
     // True random fallback if no activity
@@ -399,8 +408,28 @@ async function hopFocus(targetId?: string) {
       currentFocusChannelId = ch.id;
       currentFocusGuildId = ch.isDMBased() ? 'dm' : (ch as any).guild?.id || 'dm';
       updateEnergy(-10);
+      updatePresence();
     }
   }
+}
+
+// ── PRESENCE UPDATER ─────────────────────────────────────────────────
+function updatePresence() {
+  if (!botClient?.user) return;
+  try {
+    const ch = botClient.channels.cache.get(currentFocusChannelId);
+    let statusText = 'lurking somewhere';
+    if (ch) {
+      if (ch.isDMBased()) {
+        statusText = 'a DM';
+      } else {
+        const name = (ch as any).name ?? 'a channel';
+        const guild = (ch as any).guild?.name ?? 'a server';
+        statusText = `#${name} in ${guild}`;
+      }
+    }
+    botClient.user.setActivity(statusText, { type: ActivityType.Watching });
+  } catch { /* silently ignore */ }
 }
 
 // ── SOCIAL SIGNAL EXTRACTOR (Zero-Cost) ──────────────────────────────
@@ -665,10 +694,13 @@ export async function startBot(token: string) {
 
   botClient = new Client({
     intents: [
-      GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.DirectMessages, GatewayIntentBits.MessageContent,
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.GuildMembers,
+      GatewayIntentBits.DirectMessages,
+      GatewayIntentBits.MessageContent,
     ],
-    partials: [Partials.Message, Partials.Channel],
+    partials: [Partials.Message, Partials.Channel, Partials.GuildMember],
   });
 
   botClient.on(Events.ClientReady, () => {
@@ -688,9 +720,35 @@ export async function startBot(token: string) {
     }
 
     setInterval(() => runEngineTick().catch(()=>null), TICK_MS);
+    updatePresence();
   });
 
   botClient.on(Events.MessageCreate, handleMessage);
+
+  // ── NEW MEMBER EVENT ───────────────────────────────────────────────
+  botClient.on(Events.GuildMemberAdd, async (member) => {
+    // Find the first text channel in that guild
+    const ch = member.guild.channels.cache.find(c => c.isTextBased()) as TextChannel | undefined;
+    if (!ch) return;
+    const chId = ch.id;
+    const gId = member.guild.id;
+    
+    // Inject the join as a system message into STM so the bot can see it
+    stmPush(chId, {
+      ts: Date.now(),
+      id: `sys-${Date.now()}`,
+      authorId: 'SYSTEM',
+      author: '[SYSTEM]',
+      content: `${member.displayName} just joined the server.`
+    });
+
+    // If the bot is already focused on this guild, let it react organically
+    if (currentFocusGuildId === gId) {
+      updateEnergy(10);
+      await runBrainTurn(`New member joined: ${member.displayName}`, 'active');
+    }
+  });
+
   await botClient.login(token);
 }
 
