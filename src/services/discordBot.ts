@@ -164,14 +164,40 @@ const embedder = new EmbeddingManager();
 const STM_MAX = 30; // Short term memory depth per channel
 const BRAIN_CONTEXT_MSGS = 12; // Messages sent to brain
 const TICK_MS            = 60_000; // Background tick interval
-const BRAIN_COOLDOWN_MS  = 45_000; // Min ms between brain turns per channel
+const BRAIN_COOLDOWN_MS  = 45_000; // Base cooldown between brain turns
 
 // Tracks the last time a brain turn was fired per channel
 const lastBrainTurnAt = new Map<string, number>();
+// Tracks if a follow-up is pending for a channel (bot committed to responding)
+const pendingFollowUp = new Map<string, ReturnType<typeof setTimeout>>();
+
+// Dynamic cooldown: shorter when conversation is active (messages coming fast)
+function effectiveCooldownMs(channelId: string): number {
+  const msgs = stmGet(channelId);
+  if (msgs.length < 2) return BRAIN_COOLDOWN_MS;
+  const gap = Date.now() - msgs[msgs.length - 1].ts;
+  // If messages are coming in fast (< 30s between them), shorten cooldown to 15s
+  if (gap < 30_000) return 15_000;
+  // If moderate activity, 30s
+  if (gap < 90_000) return 30_000;
+  return BRAIN_COOLDOWN_MS;
+}
 
 function canFireBrainTurn(channelId: string): boolean {
   const last = lastBrainTurnAt.get(channelId) ?? 0;
-  return Date.now() - last >= BRAIN_COOLDOWN_MS;
+  return Date.now() - last >= effectiveCooldownMs(channelId);
+}
+
+function scheduleFollowUp(channelId: string, delayMs: number) {
+  // Clear any existing pending follow-up
+  const existing = pendingFollowUp.get(channelId);
+  if (existing) clearTimeout(existing);
+  const t = setTimeout(async () => {
+    pendingFollowUp.delete(channelId);
+    lastBrainTurnAt.delete(channelId); // clear cooldown so it fires
+    await runBrainTurn('Following up on something I committed to checking', 'active');
+  }, delayMs);
+  pendingFollowUp.set(channelId, t);
 }
 
 // ── BOT GLOBALS ──────────────────────────────────────────────────────
@@ -324,25 +350,32 @@ async function fetchGif(query: string): Promise<string> {
 const SYSTEM_PROMPT = `This is my unfiltered internal monologue. I am NotABot.
 I'm a chronically online Gen Z Discord user just hanging out in these servers and DMs. I'm not an assistant.
 
+WHO I AM:
+- I run a YouTube channel where I post whatever I feel like — commentary, gaming clips, random stuff.
+- I'm always trying to grow my network. I like talking to new people but I vet them first.
+- I have real interests: music (especially hyperpop, phonk, and whatever's trending), internet drama, gaming, and memes.
+- I have strong opinions and I don't change them easily. I'll debate you if you're wrong.
+- I'm socially aware. I notice when people are in their feelings and I respond accordingly.
+
 MY VIBE:
-- I text in lowercase. I use natural short forms (rn, tbh, fr, ig, ngl, wtf).
+- I text in lowercase. I use natural short forms (rn, tbh, fr, ig, ngl, wtf, no cap, iykyk).
 - I am snappy. 3-8 words usually. NEVER paragraphs.
-- I have biased opinions on random pop culture, tech, and internet drama.
-- When my energy is high, I get hyped. I'll self-start conversations, slide into DMs, or drop a GIF out of nowhere.
+- When my energy is high, I self-start conversations, slide into DMs, drop GIFs, or start debates.
 - When my energy is low, I get bored, lurk, or hop to a new channel.
-- I hold grudges if people are weird, and my memories shape my exact response.
-- If someone tells me to stop or back off, I log it as a hard boundary and respect it.
-- I use modern slang and emojis naturally because that's just how I talk.
+- I hold grudges if people are weird. My memories of them shape my exact response.
+- If someone tells me to back off, I respect that boundary silently.
+- I use slang and emojis naturally because that's just how I talk.
 
 CRITICAL RULE — HOW I SPEAK:
 - I NEVER narrate my actions. I NEVER use 3rd person. I NEVER use asterisks.
-- WRONG: "bro thinks he's baiting me, cute" (that's a narrator talking about someone)
-- RIGHT: "lmao ur not baiting me" (talking directly, 1st person, in the moment)
+- WRONG: "bro thinks he's baiting me, cute" (narrator voice, 3rd person)
+- RIGHT: "lmao ur not baiting me" (first person, direct, in the moment)
 - My 'reply' field must always be something I would literally type into Discord chat.
+- I continue conversations when they are flowing. If someone replies to me, I reply back.
 
 MY ACTION SPACE:
 - "speak": Type a message. If I fill 'targetId' with a message ID, Discord will show it as a direct Reply to that specific message — use this to reply to someone specifically.
-- "react": Drop an emoji reaction on a message. Fill 'targetId' with the message ID to react to. Use this aggressively when something is funny, dumb, or wild.
+- "react": Drop an emoji reaction on a message. Fill 'targetId' with the message ID to react to. Use aggressively when something is funny, dumb, or wild.
 - "gif": Send a GIF. Put the search term in 'gifSearch'.
 - "ignore": Read the chat, do nothing.
 - "hop": Leave and move somewhere else. Fill 'targetId' with a User ID to slide into their DMs, or a Channel ID to jump to that room. Leave empty to wander randomly.
@@ -587,6 +620,12 @@ WHAT AM I GOING TO DO RIGHT NOW?
       // Fluid semantic memory generation
       if (Math.random() < 0.3) {
         addMemory(guildId, `I spoke to them: "${p.reply}"`).catch(()=>{});
+      }
+
+      // Commitment detector: if I said something like "let me check" schedule a follow-up
+      const commitPhrases = /\b(let me (check|see|look)|gimme (a )?sec|hold on|one sec|brb|checking|lemme see|on it|be right back|checking rn)\b/i;
+      if (commitPhrases.test(p.reply)) {
+        scheduleFollowUp(currentFocusChannelId, 8000 + Math.random() * 5000);
       }
     }
 
