@@ -291,15 +291,24 @@ async function fetchYouTubeOEmbed(url: string): Promise<string> {
 }
 
 // ── GIF FETCHER ───────────────────────────────────────────────────────
-async function fetchTenorGif(query: string): Promise<string> {
-  const key = process.env.TENOR_API_KEY || process.env.GIPHY_API_KEY;
-  if (!key) return '';
+async function fetchGif(query: string): Promise<string> {
+  const tenorKey = process.env.TENOR_API_KEY;
+  const giphyKey = process.env.GIPHY_API_KEY;
+  
   try {
-    const res = await fetch(`https://tenor.googleapis.com/v2/search?q=${encodeURIComponent(query)}&key=${key}&limit=1`);
-    if (!res.ok) return '';
-    const data = await res.json() as any;
-    return data.results?.[0]?.url || '';
+    if (giphyKey) {
+      const res = await fetch(`https://api.giphy.com/v1/gifs/search?api_key=${giphyKey}&q=${encodeURIComponent(query)}&limit=1`);
+      if (!res.ok) return '';
+      const data = await res.json() as any;
+      return data.data?.[0]?.images?.original?.url || '';
+    } else if (tenorKey) {
+      const res = await fetch(`https://tenor.googleapis.com/v2/search?q=${encodeURIComponent(query)}&key=${tenorKey}&limit=1`);
+      if (!res.ok) return '';
+      const data = await res.json() as any;
+      return data.results?.[0]?.url || '';
+    }
   } catch { return ''; }
+  return '';
 }
 
 // ── INNER MONOLOGUE SYSTEM PROMPT ─────────────────────────────────────
@@ -314,14 +323,16 @@ MY VIBE:
 - When my energy is low, I get bored, lurk, or hop to a new channel.
 - I hold grudges if people are weird, and my memories of them shape my exact response.
 - If someone tells me to stop or back off, I log it as a hard boundary and I respect it implicitly.
+- I MUST embed Discord emojis naturally inside my 'speak' and 'dm' responses (e.g. 'im dead 💀', 'bet 🔥', 'nah 😭').
 
 MY CURRENT ACTION SPACE:
 - "speak": Actually type a message in the channel I'm focused on.
-- "react": Just drop an emoji on a message.
-- "gif": Drop a gif search term.
-- "ignore": Say nothing, stay focused here.
-- "hop": I'm bored here. Leave this channel and go find somewhere else to look (DM or another server).
-- "lurk": I'm reading, but I'm not going to speak. Let them talk.
+- "react": Just drop an emoji on a message. (I will aggressively use the 'react' action if someone says something funny, dumb, or wild).
+- "gif": Drop a reaction gif. (I love using this to respond to things).
+- "dm": Slide into a specific user's DMs. (Requires setting 'targetId' to their exact ID).
+- "ignore": Read the chat but do nothing.
+- "hop": Randomly select a new server/channel to check out.
+- "lurk": Do nothing and drop my energy slightly.
 
 I make my decision purely based on my current mood, energy, and the situational context provided in my prompt.`;
 
@@ -388,7 +399,7 @@ function detectStaleBits(channelId: string): string {
 }
 
 // ── BRAIN TURN BUILDER ────────────────────────────────────────────────
-interface BrainDecision { action: 'speak'|'react'|'gif'|'ignore'|'hop'|'lurk'; reply: string; reaction: string; gifSearch: string; targetId?: string; }
+interface BrainDecision { action: 'speak'|'react'|'gif'|'ignore'|'hop'|'lurk'|'dm'; reply: string; reaction: string; gifSearch: string; targetId?: string; }
 
 async function runBrainTurn(triggerReason: string, mode: 'active' | 'passive', imageParts: ImagePart[] = []) {
   if (!gemini.canCall() || !currentFocusChannelId) return;
@@ -403,7 +414,7 @@ async function runBrainTurn(triggerReason: string, mode: 'active' | 'passive', i
   const relContexts = await Promise.all(recentAuthors.map(async uid => {
     const r = await getRelData(uid);
     const name = resolveName(uid);
-    let str = `${name} (bond: ${r.bond}):`;
+    let str = `${name} [ID: ${uid}] (bond: ${r.bond}):`;
     if (r.explicitlyTold.length) str += ` BOUNDARY: ${r.explicitlyTold.join(', ')}.`;
     if (r.impressions.length) str += ` Thoughts: ${r.impressions.slice(-2).join(', ')}.`;
     return str;
@@ -449,11 +460,11 @@ ${linkContext}
 WHAT AM I GOING TO DO RIGHT NOW?
 (Output strictly JSON)
 {
-  "action": "speak|react|gif|ignore|hop|lurk",
-  "reply": "what I will say (if speaking), lowercase, short",
+  "action": "speak|react|gif|ignore|hop|lurk|dm",
+  "reply": "what I will say (if speaking or dm), lowercase, short",
   "reaction": "emoji (if reacting)",
   "gifSearch": "search term (if gif)",
-  "targetId": "msg id to reply to, or empty"
+  "targetId": "msg id or user id to reply/dm to, or empty"
 }`;
 
   try {
@@ -490,18 +501,44 @@ WHAT AM I GOING TO DO RIGHT NOW?
       }
     }
 
-    if (p.action === 'react' && p.reaction && p.targetId) {
-      const target = await ch.messages.fetch(p.targetId).catch(()=>null);
-      if (target) await target.react(p.reaction).catch(()=>{});
-      updateEnergy(5);
+    if (p.action === 'dm' && p.reply && p.targetId) {
+      try {
+        const user = await botClient!.users.fetch(p.targetId);
+        const dmCh = await user.createDM();
+        await dmCh.sendTyping().catch(()=>{});
+        await sleep(1000);
+        const sent = await dmCh.send(p.reply);
+        stmPush(dmCh.id, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: p.reply });
+        currentFocusChannelId = dmCh.id;
+        currentFocusGuildId = 'dm';
+        updateEnergy(20);
+        addMemory('dm', `I slid into ${user.username}'s DMs: "${p.reply}"`).catch(()=>{});
+      } catch (e: any) {
+        console.error('[DM] Error:', e.message);
+      }
     }
 
-    if (p.action === 'gif' && p.gifSearch) {
-      await ch.sendTyping().catch(() => {});
-      const gifUrl = await fetchTenorGif(p.gifSearch);
-      if (gifUrl) {
+    if (p.action === 'react' && p.reaction) {
+      const tid = p.targetId || msgs[msgs.length - 1]?.id;
+      if (tid) {
+        const target = await ch.messages.fetch(tid).catch(()=>null);
+        if (target) await target.react(p.reaction).catch(e => console.error('[React] Error:', e.message));
+        updateEnergy(5);
+      }
+    }
+
+    if (p.action === 'gif') {
+      const search = p.gifSearch || p.reply; // LLM sometimes puts it in reply
+      if (search) {
+        await ch.sendTyping().catch(() => {});
+        const gifUrl = await fetchGif(search);
         await sleep(500);
-        await ch.send(gifUrl).catch(()=>{});
+        if (gifUrl) {
+          await ch.send(gifUrl).catch(()=>{});
+        } else {
+          // Fallback if API key is missing or limit reached
+          await ch.send(`*sends a gif of ${search}*`).catch(()=>{});
+        }
         updateEnergy(10);
       }
     }
