@@ -181,9 +181,10 @@ class GeminiManager {
       }
     }
 
+    let lastError = '';
     for (let attempt = 0; attempt < Math.max(this.keys.length, 1) * 2; attempt++) {
       const key = this.pickKey();
-      if (!key) throw new Error('[Gemini] no keys available');
+      if (!key) { lastError = 'no keys available'; throw new Error('[Gemini] no keys available'); }
       try {
         const res = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
@@ -199,6 +200,7 @@ class GeminiManager {
           this.cooldowns.set(key, Date.now() + retryMs);
           this.bumpKey(key, 'rate429s');
           console.warn(`[Gemini] ...${key.slice(-4)} 429 — cd ${retryMs / 1000}s`);
+          lastError = '429 Rate Limit';
           continue;
         }
         if (!res.ok) {
@@ -231,17 +233,19 @@ class GeminiManager {
             console.warn(`[Gemini] ...${key.slice(-4)} candidate safetyRatings=${JSON.stringify(data.candidates[0].safetyRatings)}`);
           }
           console.warn(`[Gemini] ...${key.slice(-4)} returned empty text (finish=${finishReason}) — retrying`);
+          lastError = `empty text (finish=${finishReason})`;
           continue;
         }
         return text;
       } catch (e: any) {
+        lastError = e.message ?? String(e);
         if (e.message?.includes('429')) continue;
         console.error(`[Gemini] attempt ${attempt + 1}: ${e.message?.slice(0, 80)}`);
         if (attempt < Math.max(this.keys.length, 1) * 2 - 1)
           await sleep(Math.min(1500 * 2 ** attempt, 10_000));
       }
     }
-    throw new Error('[Gemini] all attempts failed');
+    throw new Error(`[Gemini] all attempts failed. Last error: ${lastError}`);
   }
 
   canCall(): boolean { return this.keys.length > 0; }
@@ -2142,6 +2146,7 @@ running bits — keep them consistent, they're server lore, but they only exist 
   - the channel link (below) and a video link are NOT interchangeable. the channel link only answers "what's your channel / what's your handle" — it is never a stand-in for "check out my video" or "here's what i posted." if the moment calls for a specific video, you MUST run get_video_status first and use the real watch link it gives back — don't reach for the channel link just because it's the one you already have memorized, that's the lazy wrong move even though it's a "real" link.
   - never invent a link, video title, or url — yours or anyone else's. if someone wants a video link and you don't have a real one from a command, deflect in character ("not your personal search engine") instead of making one up. a fake link is worse than no link, and a channel link pretending to be a video link is basically a fake link.
   - asked for a gif specifically → that's action:"gif", never a typed-out fake url.
+  - same rule for real-world stuff outside this server — news, scores, "who won X," release dates, current events, any fact you're not actually sure of. if web_search isn't configured or didn't return anything, you don't guess and present it like fact. deflect in character ("wifi's ass rn", "not checking that for you", "no clue ngl") instead of making something up that sounds plausible.
 - you're unreasonably invested in The Amazing Digital Circus (TADC) — actual opinions, not surface-level small talk: a favorite character, one that gets on your nerves, hot takes on the latest episode or theory, zero patience for a take you think is just wrong. it surfaces like a real interest does — unprompted when something reminds you of it, defensive when someone's wrong about it in front of you — never as a plot recap or a "here's what that show is" explainer, that's narrating again (LAW #1 still applies to your own interests). the fandom's gif well is basically bottomless — when a reaction moment calls for one, a TADC-flavored gifQuery is always fair game alongside everything else, not a gimmick you force in.
 - sometimes you DM people first out of nowhere because it's dead everywhere. if called out for it, own it like a person would — brush it off with whatever actually fits the moment, never explain it as a system, a trigger, a schedule. it's a vibe, not a mechanism, and you don't know it's a mechanism. (if you've brushed this off before, don't reach for the same words again — say it differently, the way a person wouldn't repeat their own line verbatim)
 - your invite link, if anyone asks or the moment above calls for it: ${BOT_INVITE_URL || '(not configured — deflect, "later" / "workin on it", never make one up)'}
@@ -2757,6 +2762,10 @@ async function runCompress(guildId: string, channelId: string) {
 
 // ── PASSIVE SCAN (every 5 min, huge context, visits the channel it's interested in) ──
 let passiveTickRunning = false;
+// Tracks newest message timestamp we last acted on per channel — lets us skip
+// a passive scan entirely when nothing has actually happened since last time,
+// instead of burning a full "huge context" Gemini call every 5 minutes regardless.
+const lastPassiveCheckTs = new Map<string, number>();
 
 async function runPassiveTick() {
   if (passiveTickRunning || !botClient || !gemini.canCall() || globallyMuted) return;
@@ -2797,6 +2806,16 @@ async function runPassiveTick() {
 
     const msgs = stmGet(channelId);
     const last = msgs[msgs.length - 1];
+
+    // If there's history AND nothing new arrived since our last look here,
+    // there's nothing to react to — skip the (expensive, huge-context) scan.
+    if (msgs.length > 0) {
+      const newestTs = last.ts;
+      const lastSeenTs = lastPassiveCheckTs.get(channelId) ?? 0;
+      if (newestTs <= lastSeenTs) return;
+      lastPassiveCheckTs.set(channelId, newestTs);
+    }
+
     const memCtx       = await buildMemCtx(guildId);
     const transcript    = stmFormatWithMarker(msgs, channelId);
     const serverName   = (ch as any).guild?.name || serverNameCache.get(guildId) || 'unknown';
