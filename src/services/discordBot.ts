@@ -343,7 +343,7 @@ const PROACTIVE_MAX_STRIKES = 3;             // ignored this many times in a row
 const COLD_OPEN_GLOBAL_QUIET_MS     = 20 * 60_000;  // every server must be this quiet (no human msg anywhere) before a DM-hop is even considered
 const COLD_OPEN_SWEEP_INTERVAL_MS   = 4  * 60_000;  // how often we check whether it's time to hop into someone's DMs
 const COLD_OPEN_WAIT_FOR_REPLY_MS   = 6  * 60_000;  // how long it lingers on one person before hopping to someone/something else
-const COLD_OPEN_USER_COOLDOWN_MS    = 6  * 60 * 60_000; // don't re-ping the same person for this long, replied or not
+const COLD_OPEN_USER_COOLDOWN_MS    = 24 * 60 * 60_000; // don't re-ping the same person more than once per day
 const COLD_OPEN_MAX_CANDIDATES_SCAN = 40;            // cap how many recent chatters we consider per sweep, just a sanity bound
 const COLD_OPEN_CANDIDATE_MAX_AGE_MS = 24 * 60 * 60_000; // "active recently" window — online OR offline, doesn't matter, as long as they talked within the last 24h
 
@@ -580,6 +580,35 @@ function stmPush(channelId: string, m: STMsg) {
 }
 
 function stmGet(channelId: string): STMsg[] { return stmStore.get(channelId) ?? []; }
+
+// Scans every other channel in stmStore for recent messages from this user.
+// Gives the brain cross-server context so it knows what someone said elsewhere.
+function getRecentCrossChannelCtx(userId: string, excludeChannelId: string): string {
+  const now = Date.now();
+  const WINDOW_MS = 3 * 60 * 60_000; // look back 3 hours max
+  const hits: { ago: number; where: string; content: string }[] = [];
+
+  for (const [chId, msgs] of stmStore.entries()) {
+    if (chId === excludeChannelId) continue;
+    for (const m of msgs) {
+      if (m.authorId !== userId) continue;
+      const ago = now - m.ts;
+      if (ago > WINDOW_MS) continue;
+      // resolve a readable location label from caches
+      const chName = channelNameCache.get(chId);
+      const location = chName ? `#${chName}` : 'another channel';
+      hits.push({ ago, where: location, content: m.content.slice(0, 120) });
+    }
+  }
+
+  if (!hits.length) return '';
+  // most recent first, cap at 5 lines so it doesn't bloat the prompt
+  hits.sort((a, b) => a.ago - b.ago);
+  return hits.slice(0, 5).map(h => {
+    const t = h.ago < 60_000 ? `${Math.round(h.ago/1000)}s ago` : `${Math.round(h.ago/60_000)}m ago`;
+    return `[${t} in ${h.where}]: "${h.content}"`;
+  }).join('\n');
+}
 
 // ── PROCESSED MARKER (tracks how far into the chat the bot has actually
 // "dealt with" — separate from the last message it merely saw) ────
@@ -2002,6 +2031,7 @@ interface BrainOpts {
   isSecondPass?:  boolean;
   videoCtx?:     { title: string; url: string };
   images?:       ImagePart[];   // live vision attachments for THIS call only, never persisted
+  crossChannelCtx?: string;  // what this user said in other channels recently
   consecutiveUnpromptedReplies?: number;
 }
 
@@ -2012,7 +2042,8 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
 
   if (opts.goal)          parts.push(`\nYOUR GOAL RIGHT NOW: ${opts.goal}`);
   if (opts.memCtx)        parts.push(`\nSERVER MEMORY:\n${opts.memCtx}`);
-  if (opts.personalCtx)   parts.push(`\nWHAT YOU KNOW ABOUT ${opts.sender.toUpperCase()} AS A PERSON (carries across every server/DM, not just this one):\n${opts.personalCtx}`);
+  if (opts.personalCtx)      parts.push(`\nWHAT YOU KNOW ABOUT ${opts.sender.toUpperCase()} AS A PERSON (carries across every server/DM, not just this one):\n${opts.personalCtx}`);
+  if (opts.crossChannelCtx)  parts.push(`\nWHAT ${opts.sender.toUpperCase()} RECENTLY SAID IN OTHER CHANNELS/SERVERS (so you have the full picture if they reference it):\n${opts.crossChannelCtx}`);
   if (opts.historyCtx)    parts.push(`\nHISTORY LOGS (archived summaries):\n${opts.historyCtx}`);
   if (opts.thread)        parts.push(`\nREPLY TO:\n${opts.thread}`);
   if (opts.videoCtx)      parts.push(`\nYOUR NEW VIDEO:\ntitle: "${opts.videoCtx.title}"\nlink: ${opts.videoCtx.url}\n(you just posted this — see "WHEN A NEW VIDEO OF YOURS DROPS" for how to bring it up, if at all)`);
@@ -3086,12 +3117,13 @@ async function respondToDM(msg: Message) {
   const endingConvo = /\b(bye|cya|gotta go|gtg|see ya|later|good night|gn|logging off|ttyl|im out)\b/i.test(content);
 
   const liveMsgs = stmGet(channelId);
-  const personalCtx = await getPersonalCtx(msg.author.id);
+  const personalCtx    = await getPersonalCtx(msg.author.id);
+  const crossChannelCtx = getRecentCrossChannelCtx(msg.author.id, channelId);
   const brainOpts: BrainOpts = {
     model: ACTIVE_MODEL,
     sender, bond: 50, message: content,
     transcript: stmFormatWithMarker(liveMsgs, channelId),
-    thread: threadCtx, memCtx: '', personalCtx,
+    thread: threadCtx, memCtx: '', personalCtx, crossChannelCtx: crossChannelCtx || undefined,
     mentioned: true, isDM: true,
     statusLine: `mode: dm | speak: active | server: DM | channel: #dm`,
     inExchange, channelName: 'DM', serverName: 'DM',
@@ -3171,6 +3203,7 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
   ]);
   const bond  = typeof memberData.bond === 'number' ? memberData.bond : 50;
   const state = getChState(channelId);
+  const crossChannelCtx = getRecentCrossChannelCtx(last.author.id, channelId);
 
   const recentMsgs  = stmGet(channelId).slice(-12);
   const botReplied  = recentMsgs.some(m => m.authorId === BOT_ID);
@@ -3196,7 +3229,7 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
     model: ACTIVE_MODEL,
     sender: tSender, bond, message: tContent,
     transcript: stmFormatWithMarker(liveMsgs, channelId),
-    thread: threadCtx, memCtx, personalCtx,
+    thread: threadCtx, memCtx, personalCtx, crossChannelCtx: crossChannelCtx || undefined,
     mentioned: anyMentioned, isDM: false, statusLine,
     inExchange, channelName: tChannelName, serverName: tServerName,
     everyonePing: tEveryonePing, endingConvo,
