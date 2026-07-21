@@ -109,7 +109,8 @@ class GeminiManager {
     }
 
     let lastError = '';
-    for (let attempt = 0; attempt < Math.max(this.keys.length, 1) * 2; attempt++) {
+    const maxAttempts = Math.min(4, Math.max(this.keys.length, 1) * 2);
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const key = this.pickKey();
       if (!key) { lastError = 'no keys available'; throw new Error('[Gemini] no keys available'); }
       try {
@@ -308,8 +309,10 @@ const STM_MAX               = 200;         // huge context, not truncated per-ca
 const SESSION_BUFFER_MAX    = 300;
 const GAP_MAJOR_MS          = 25 * 60_000; // just display formatting in the transcript
 const GAP_MINOR_MS          =  5 * 60_000;
-const PASSIVE_TICK_MS       = 5  * 60_000; // how often the passive scan runs
-const SELF_CHECK_QUIET_MS   = 4  * 60_000; // how long it waits before noticing it got ghosted
+const PASSIVE_TICK_MS       =  5 * 60_000;
+const SELF_CHECK_TICK_MS    =  6 * 60_000;
+const PROACTIVE_TICK_MS     =  7 * 60_000;
+const SELF_CHECK_QUIET_MS   =  4 * 60_000; // how long it waits before noticing it got ghosted
 const ACTIVE_IDLE_REVERT_MS = 25 * 60_000; // safety net: dead-silent active channel quietly drops to passive
 const PROFILER_INTERVAL     = 25 * 60_000;
 const COMPRESS_INTERVAL     = 60 * 60_000;
@@ -804,6 +807,19 @@ function trackInterest(channelId: string, mentioned: boolean) {
 }
 
 function pickInterestChannel(): string | null {
+  const now = Date.now();
+
+  // if the bot has been staring at a dead channel for >10 minutes,
+  // and there are other channels with unread messages, hop to them.
+  if (focus && (now - focus.since > 10 * 60_000) && unreadCounts.size > 0) {
+    const nextCh = [...unreadCounts.keys()][0];
+    focus = { channelId: nextCh, since: now };
+    unreadCounts.delete(nextCh);
+    updatePresence();
+    console.log(`[Focus] drifted to #${nextCh.slice(-5)} (clearing unreads)`);
+    return nextCh;
+  }
+
   return focus?.channelId ?? null;
 }
 
@@ -2044,7 +2060,14 @@ interface BrainOpts {
 async function brain(opts: BrainOpts): Promise<BrainDecision> {
   const bondLabel = opts.bond > 70 ? 'close' : opts.bond > 40 ? 'neutral' : 'distant';
 
-  const parts: string[] = [opts.statusLine];
+  // Append full guild list so the bot always knows which servers it's in,
+  // regardless of which call path (active, DM, proactive, cold-open) triggered this.
+  const guildList = botClient?.guilds.cache.map(g => g.name).join(', ') || '';
+  const statusLine = guildList
+    ? `${opts.statusLine} | all servers i'm in: ${guildList}`
+    : opts.statusLine;
+
+  const parts: string[] = [statusLine];
 
   if (opts.goal)          parts.push(`\nYOUR GOAL RIGHT NOW: ${opts.goal}`);
   if (opts.memCtx)        parts.push(`\nSERVER MEMORY:\n${opts.memCtx}`);
@@ -2333,6 +2356,7 @@ async function runProfiler(client: Client) {
             byAuthor.get(m.author.id)!.push(m.content.slice(0, 80));
           }
 
+          let profilerApiCalls = 0;
           for (const [uid, lines] of byAuthor) {
             const existing = await getMember(guild.id, uid);
             if (existing.personality) continue;
@@ -2343,11 +2367,15 @@ async function runProfiler(client: Client) {
                 `${name}: ${lines.slice(0, 8).join(' | ')}`,
                 0.4, BG_MODEL,
               );
+              profilerApiCalls++;
               const m2 = raw.match(/\{[\s\S]*\}/);
               if (!m2) continue;
               const p = JSON.parse(m2[0]);
               if (p.p) await upsertMember(guild.id, uid, { personality: p.p });
             } catch {}
+            
+            // max 2 new profiles per profiler tick per guild so it doesn't blast the rate limit
+            if (profilerApiCalls >= 2) break;
           }
         } catch {}
       }
@@ -2360,6 +2388,8 @@ async function runCompress(guildId: string, channelId: string) {
   if (Date.now() - lastCompress < COMPRESS_INTERVAL) return;
   const msgs = stmGet(channelId);
   if (msgs.length < 8) return;
+  const buf = sessionBuffers.get(channelId);
+  if (!buf || buf.length < 15) return; // skip if nothing really happened since last compress
   lastCompress = Date.now();
 
   await withBgBudget(async () => {
@@ -3655,8 +3685,8 @@ export async function startBot(token: string) {
 
     setInterval(() => { runPassiveTick().catch(() => {}); }, PASSIVE_TICK_MS);
     setInterval(() => { runPendingVideoSweep().catch(() => {}); }, VIDEO_SWEEP_INTERVAL_MS);
-    setInterval(() => { runSelfActivationCheck().catch(() => {}); }, PASSIVE_TICK_MS);
-    setInterval(() => { runProactiveEngagement().catch(() => {}); }, PASSIVE_TICK_MS);
+    setInterval(() => { runSelfActivationCheck().catch(() => {}); }, SELF_CHECK_TICK_MS);
+    setInterval(() => { runProactiveEngagement().catch(() => {}); }, PROACTIVE_TICK_MS);
     setInterval(() => { runColdOpen().catch(() => {}); }, COLD_OPEN_SWEEP_INTERVAL_MS);
     setInterval(() => { runWeeklyNPC().catch(() => {}); }, 60 * 60_000); // checks every hour, only fires Sundays
 
