@@ -594,9 +594,14 @@ function getRecentCrossChannelCtx(userId: string, excludeChannelId: string): str
       if (m.authorId !== userId) continue;
       const ago = now - m.ts;
       if (ago > WINDOW_MS) continue;
-      // resolve a readable location label from caches
-      const chName = channelNameCache.get(chId);
-      const location = chName ? `#${chName}` : 'another channel';
+      // resolve a readable location from Discord client cache (includes server name)
+      const discordCh = botClient?.channels.cache.get(chId);
+      const chName    = (discordCh as any)?.name ?? channelNameCache.get(chId);
+      const guildName = (discordCh as any)?.guild?.name ?? serverNameCache.get((discordCh as any)?.guildId ?? '');
+      const location  = guildName && chName ? `${guildName} #${chName}`
+                      : guildName           ? guildName
+                      : chName              ? `#${chName}`
+                      : 'another channel';
       hits.push({ ago, where: location, content: m.content.slice(0, 120) });
     }
   }
@@ -609,6 +614,7 @@ function getRecentCrossChannelCtx(userId: string, excludeChannelId: string): str
     return `[${t} in ${h.where}]: "${h.content}"`;
   }).join('\n');
 }
+
 
 // ── PROCESSED MARKER (tracks how far into the chat the bot has actually
 // "dealt with" — separate from the last message it merely saw) ────
