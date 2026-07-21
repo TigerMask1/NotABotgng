@@ -469,49 +469,164 @@ function msSinceAnyGuildActivity(): number {
   return Date.now() - mostRecent;
 }
 
-interface ColdOpenCandidate { userId: string; name: string; guildId: string; lastMsg: string; online: boolean; recencyMs: number; }
+interface ColdOpenCandidate {
+  userId: string;
+  name: string;
+  guildId: string;
+  lastMsg: string;       // empty string if they've never talked
+  online: boolean;
+  recencyMs: number;
+  bond: number;
+  isNew: boolean;        // true = never talked to the bot before (seenCount == 0 or no record)
+}
 
-// pulls candidates from every mutual guild: anyone who's spoken recently in
-// ANY tracked channel (cross-referenced against live presence so "online
-// right now" can outrank "talked a while ago"), skipping muted guilds, the
-// bot itself, and anyone still on cooldown from a previous ping.
-function getColdOpenCandidates(): ColdOpenCandidate[] {
+// Candidate pool is TWO layers:
+//  Layer 1 (NEW): people who have NEVER talked to the bot before (seenCount 0 or no record).
+//                 Sub-pass A: recent chatters in stmStore (catches invisible/offline people actively typing).
+//                 Sub-pass B: online members in guild cache (catches lurkers who haven't typed yet).
+//                 These get absolute priority — the bot should be making new friends, not re-pinging regulars.
+//  Layer 2 (KNOWN): recent chatters from stmStore who are NOT on cooldown (fallback if nobody new is around).
+// Final sort: Layer 1 first (shuffled), Layer 2 sorted online-then-recent.
+async function getColdOpenCandidates(): Promise<ColdOpenCandidate[]> {
   if (!botClient) return [];
   const now = Date.now();
-  const seen = new Map<string, ColdOpenCandidate>(); // userId -> best candidate seen so far
+
+  // ── LAYER 1A: New people who typed recently (even if invisible) ──
+  // Walk stmStore for anyone who spoke in the last 6 hours with no bot record.
+  const NEW_RECENT_WINDOW_MS = 6 * 60 * 60_000; // talked in last 6 hours
+  const newSeenIds = new Set<string>(); // dedup across sub-passes
+  const newCandidates: ColdOpenCandidate[] = [];
+
+  for (const [channelId, msgs] of stmStore.entries()) {
+    if (newCandidates.length >= 15) break;
+    const ch = botClient.channels.cache.get(channelId) as any;
+    const guildId = ch?.guildId;
+    if (!guildId) continue;
+    if (serverMuted.get(guildId)) continue;
+
+    for (const m of [...msgs].reverse()) {
+      if (m.authorId === BOT_ID || !m.authorId) continue;
+      if (newSeenIds.has(m.authorId)) continue;
+      if (coldOpenTargetUserId === m.authorId) continue;
+      const hopState = coldOpenStates.get(m.authorId);
+      if (hopState && now - hopState.lastPingAt < COLD_OPEN_USER_COOLDOWN_MS) continue;
+      const recencyMs = now - m.ts;
+      if (recencyMs > NEW_RECENT_WINDOW_MS) continue; // too stale, skip
+
+      const memberData = await getMember(guildId, m.authorId).catch(() => ({} as MemberData));
+      const isNew = !memberData.seenCount || memberData.seenCount === 0;
+      if (!isNew) continue; // known person — falls into Layer 2
+
+      const guild = botClient.guilds.cache.get(guildId);
+      const member = guild?.members.cache.get(m.authorId);
+      const status = member?.presence?.status;
+      const online = status === 'online' || status === 'idle' || status === 'dnd';
+
+      newSeenIds.add(m.authorId);
+      newCandidates.push({
+        userId: m.authorId,
+        name: m.author,
+        guildId,
+        lastMsg: m.content.slice(0, 100),
+        online,
+        recencyMs,
+        bond: memberData.bond ?? 50,
+        isNew: true,
+      });
+      break;
+    }
+  }
+
+  // ── LAYER 1B: New people who are online/idle but haven't typed yet (lurkers) ──
+  for (const guild of botClient.guilds.cache.values()) {
+    if (serverMuted.get(guild.id)) continue;
+    if (newCandidates.length >= 20) break;
+
+    for (const member of guild.members.cache.values()) {
+      if (member.user.bot || member.id === BOT_ID) continue;
+      if (newSeenIds.has(member.id)) continue;
+      if (coldOpenTargetUserId === member.id) continue;
+      const hopState = coldOpenStates.get(member.id);
+      if (hopState && now - hopState.lastPingAt < COLD_OPEN_USER_COOLDOWN_MS) continue;
+
+      const status = member.presence?.status;
+      const online = status === 'online' || status === 'idle' || status === 'dnd';
+      if (!online) continue; // can't reach lurkers who are offline AND haven't typed
+
+      const memberData = await getMember(guild.id, member.id).catch(() => ({} as MemberData));
+      const isNew = !memberData.seenCount || memberData.seenCount === 0;
+      if (!isNew) continue;
+
+      newSeenIds.add(member.id);
+      newCandidates.push({
+        userId: member.id,
+        name: member.displayName || member.user.username,
+        guildId: guild.id,
+        lastMsg: '',
+        online: true,
+        recencyMs: Number.MAX_SAFE_INTEGER, // no recent msg, sort below recent-typers
+        bond: memberData.bond ?? 50,
+        isNew: true,
+      });
+      if (newCandidates.length >= 20) break;
+    }
+  }
+
+  // ── LAYER 2: Fallback — known recent chatters not on cooldown ──
+  const knownCandidates: ColdOpenCandidate[] = [];
+  const seen = new Map<string, Omit<ColdOpenCandidate, 'bond' | 'isNew'>>();
 
   for (const [channelId, msgs] of stmStore.entries()) {
     if (seen.size >= COLD_OPEN_MAX_CANDIDATES_SCAN) break;
     const ch = botClient.channels.cache.get(channelId) as any;
     const guildId = ch?.guildId;
-    if (!guildId) continue; // skip DM channels and anything we can't place in a guild
+    if (!guildId) continue;
     if (serverMuted.get(guildId)) continue;
 
     for (const m of [...msgs].reverse()) {
       if (m.authorId === BOT_ID || !m.authorId) continue;
+      if (newSeenIds.has(m.authorId)) continue; // already in Layer 1, don't duplicate
       const existing = seen.get(m.authorId);
       const recencyMs = now - m.ts;
-      if (recencyMs > COLD_OPEN_CANDIDATE_MAX_AGE_MS) continue; // talked, but too long ago — not "recently active" anymore
-      if (existing && existing.recencyMs <= recencyMs) continue; // already have a more recent sighting of this person
+      if (recencyMs > COLD_OPEN_CANDIDATE_MAX_AGE_MS) continue;
+      if (existing && existing.recencyMs <= recencyMs) continue;
       const hopState = coldOpenStates.get(m.authorId);
-      if (hopState && now - hopState.lastPingAt < COLD_OPEN_USER_COOLDOWN_MS) continue; // still on cooldown
-      if (coldOpenTargetUserId === m.authorId) continue; // already mid-conversation with them right now
+      if (hopState && now - hopState.lastPingAt < COLD_OPEN_USER_COOLDOWN_MS) continue;
+      if (coldOpenTargetUserId === m.authorId) continue;
 
       const guild = botClient.guilds.cache.get(guildId);
       const member = guild?.members.cache.get(m.authorId);
-      const status = member?.presence?.status; // 'online' | 'idle' | 'dnd' | 'offline' | undefined
+      const status = member?.presence?.status;
       const online = status === 'online' || status === 'idle' || status === 'dnd';
 
       seen.set(m.authorId, { userId: m.authorId, name: m.author, guildId, lastMsg: m.content.slice(0, 100), online, recencyMs });
-      break; // only need the most recent message per channel per person
+      break;
     }
   }
 
-  // online + recently-active first, then just recently-active, then everyone else
-  return [...seen.values()].sort((a, b) => {
-    if (a.online !== b.online) return a.online ? -1 : 1;
-    return a.recencyMs - b.recencyMs;
-  });
+  if (seen.size > 0) {
+    const withBonds = await Promise.all(
+      [...seen.values()].map(async (c) => {
+        const m = await getMember(c.guildId, c.userId).catch(() => ({} as MemberData));
+        return { ...c, bond: m.bond ?? 50, isNew: false } as ColdOpenCandidate;
+      })
+    );
+    knownCandidates.push(...withBonds);
+  }
+
+  // shuffle Layer 1 so we don't always greet the same new person
+  const shuffle = <T>(arr: T[]): T[] => arr.sort(() => Math.random() - 0.5);
+
+  // Within Layer 1: sort recent typers before pure lurkers
+  const newSorted = newCandidates.sort((a, b) => a.recencyMs - b.recencyMs);
+
+  return [
+    ...shuffle(newSorted),
+    ...knownCandidates.sort((a, b) => {
+      if (a.online !== b.online) return a.online ? -1 : 1;
+      return a.recencyMs - b.recencyMs;
+    }),
+  ];
 }
 
 // ── ID / NAME CACHES ──────────────────────────────────────────────
@@ -2954,24 +3069,112 @@ let coldOpenRunning = false;
 async function runColdOpen() {
   if (coldOpenRunning || !botClient || !gemini.canCall() || globallyMuted) return;
   if (coldOpenTargetUserId) return; // already lingering on someone — wait for that to resolve first
-  if (msSinceAnyGuildActivity() < COLD_OPEN_GLOBAL_QUIET_MS) return; // somewhere is still alive — no need to go hunting in DMs
+  if (msSinceAnyGuildActivity() < COLD_OPEN_GLOBAL_QUIET_MS) return; // somewhere is still alive — no need to go hunting
 
   coldOpenRunning = true;
   try {
-    const candidates = getColdOpenCandidates();
-    if (!candidates.length) return; // nobody eligible right now — everyone's on cooldown or nothing to go on
+    const candidates = await getColdOpenCandidates();
+    if (!candidates.length) return;
 
     const pick = candidates[0];
+    const guildName = serverNameCache.get(pick.guildId) || 'a server';
     const user = await botClient.users.fetch(pick.userId).catch(() => null);
     if (!user) return;
 
+    // ── Randomly pick approach: DM (slide in quietly) vs server ping (loud, public) ──
+    // New people (isNew=true) get 50/50, known people lean more toward DM (70% DM)
+    const pingInServer = pick.isNew ? Math.random() < 0.5 : Math.random() < 0.3;
+
+    // ── APPROACH: PING IN SERVER ──
+    if (pingInServer) {
+      const guild = botClient.guilds.cache.get(pick.guildId);
+      if (!guild) return;
+
+      // Find the best channel to ping in: allowed channel list first, otherwise system/general/first available
+      const allowList = serverChannelAllowlist.get(pick.guildId);
+      let targetChannel: TextChannel | undefined;
+
+      if (allowList?.size) {
+        for (const chId of allowList) {
+          const ch = guild.channels.cache.get(chId) as TextChannel | undefined;
+          if (ch?.isTextBased() && !ch.isDMBased() && ch.permissionsFor(guild.members.me!)?.has(PermissionFlagsBits.SendMessages)) {
+            targetChannel = ch;
+            break;
+          }
+        }
+      }
+
+      if (!targetChannel) {
+        const systemCh = guild.systemChannel;
+        if (systemCh?.permissionsFor(guild.members.me!)?.has(PermissionFlagsBits.SendMessages)) {
+          targetChannel = systemCh;
+        }
+      }
+
+      if (!targetChannel) {
+        targetChannel = guild.channels.cache.find(
+          (c): c is TextChannel =>
+            c.isTextBased() && !c.isDMBased() &&
+            !!(c as TextChannel).permissionsFor(guild.members.me!)?.has(PermissionFlagsBits.SendMessages)
+        ) as TextChannel | undefined;
+      }
+
+      if (!targetChannel) return; // no suitable channel, give up on server ping
+
+      const chId = targetChannel.id;
+      if (!stmStore.has(chId)) {
+        try {
+          const fetched = await targetChannel.messages.fetch({ limit: STM_MAX });
+          seedSTM(chId, ([...fetched.values()] as Message[]).reverse());
+        } catch { stmStore.set(chId, []); }
+      }
+
+      const isNewPerson = pick.isNew;
+      const selfNote = isNewPerson
+        ? `you spotted ${pick.name} in ${guildName} — they are completely new and you've never talked before. greet them naturally like a normal person would when they notice someone new around. keep it super casual and short — a quick "hey" or "yo" or just tagging them with something friendly and low-pressure. @mention them so they actually see it. do NOT be formal or cringe, just human. if nothing feels natural to say, action:ignore.`
+        : `you're pinging ${pick.name} in ${guildName} — you know them a bit. say something quick and natural to get their attention, maybe a callback or a poke. @mention them. keep it one line. if nothing feels worth it, action:ignore.`;
+
+      const brainOpts: BrainOpts = {
+        model: ACTIVE_MODEL,
+        sender: '(proactive-ping)',
+        bond: pick.bond,
+        message: `ping ${pick.name} in the server to get their attention`,
+        transcript: stmFormatWithMarker(stmGet(chId), chId),
+        memCtx: '',
+        mentioned: false, isDM: false,
+        statusLine: `mode: proactive | speak: active | server: ${guildName} | channel: #${targetChannel.name}`,
+        inExchange: false,
+        channelName: targetChannel.name,
+        serverName: guildName,
+        everyonePing: false, endingConvo: false,
+        selfNote,
+      };
+
+      let decision = await brain(brainOpts);
+      decision = await executeBrainDecision({ decision, brainOpts, channel: targetChannel as any, channelId: chId, guildId: pick.guildId });
+
+      coldOpenStates.set(pick.userId, { lastPingAt: Date.now(), pending: false, hopTimer: null });
+
+      if (decision.action !== 'speak' || !decision.reply?.trim()) {
+        console.log(`[ColdOpen] considered pinging ${pick.name} in #${targetChannel.name} — chose not to`);
+        return;
+      }
+
+      // Force @mention into the reply if the bot didn't add it
+      const mentionTag = `<@${pick.userId}>`;
+      const replyText = decision.reply.includes(mentionTag) ? decision.reply : `${mentionTag} ${decision.reply}`;
+      decision = { ...decision, reply: replyText };
+
+      await sendDecision({ channel: targetChannel as any, decision, channelId: chId, guildId: pick.guildId });
+      console.log(`[ColdOpen] pinged ${pick.name} in #${targetChannel.name} (${guildName}) — isNew:${isNewPerson}`);
+      return;
+    }
+
+    // ── APPROACH: DM ──
     const dmChannel = await user.createDM().catch(() => null);
     if (!dmChannel) return;
     const dmChannelId = dmChannel.id;
 
-    // seed STM for this DM channel so the brain call (and any reply that
-    // comes back) has real context instead of starting from nothing —
-    // mirrors how handleDirectMessage seeds STM on first contact.
     if (!stmStore.has(dmChannelId)) {
       try {
         const fetched = await dmChannel.messages.fetch({ limit: STM_MAX });
@@ -2979,26 +3182,30 @@ async function runColdOpen() {
       } catch { stmStore.set(dmChannelId, []); }
     }
 
-    const guildName = serverNameCache.get(pick.guildId) || 'a server';
+    const isNewPerson = pick.isNew;
+    const selfNote = isNewPerson
+      ? `you're sliding into ${pick.name}'s DMs for the very first time — you've seen them around in ${guildName} but you've literally never spoken. act like a normal person randomly DMing someone they've noticed: keep it super short, low-pressure, natural. something like "hey" or "yo haven't talked before" or just a casual opener aimed at them. do NOT be formal or cringe. do NOT mention that you're a bot. if nothing feels natural, action:ignore.`
+      : `you're sliding into ${pick.name}'s DMs completely out of nowhere — no prompt, they didn't message you first, you just felt like it. keep it tiny: one line, natural, aimed at them specifically. you know them from ${guildName} — use something personal about their vibe, NOT what you saw them doing in the server just now (that's creepy). if you genuinely have nothing worth opening with, action:ignore.`;
+
     const brainOpts: BrainOpts = {
       model: ACTIVE_MODEL,
       sender: '(cold-open)',
-      bond: 50,
-      message: `you're sliding into ${pick.name}'s DMs completely out of nowhere — no prompt, they didn't message you first, you just felt like it`,
+      bond: pick.bond,
+      message: isNewPerson
+        ? `you're DMing ${pick.name} for the first time — they've never spoken to you before`
+        : `you're sliding into ${pick.name}'s DMs completely out of nowhere`,
       transcript: stmFormatWithMarker(stmGet(dmChannelId), dmChannelId),
       memCtx: '',
       mentioned: false, isDM: true,
       statusLine: `mode: dm-initiate | speak: active | server: DM | channel: #dm`,
       inExchange: false, channelName: 'DM', serverName: 'DM',
       everyonePing: false, endingConvo: false,
-      selfNote: `you are starting this DM completely unprompted — they did not message you first. keep it tiny: one line, natural, aimed at them specifically. you know them from a server — use something personal about them as a person (their vibe, a past joke between you, something you know about them), NOT what you saw them doing in the server just now — that's weird, don't reference their recent server activity like you were watching them. if you genuinely have nothing worth opening with for this specific person, action:ignore and nothing gets sent.`,
+      selfNote,
     };
 
     let decision = await brain(brainOpts);
     decision = await executeBrainDecision({ decision, brainOpts, channel: dmChannel as any, channelId: dmChannelId, guildId: 'dm' });
 
-    // cooldown applies regardless of outcome — whether it spoke or chose not
-    // to, this candidate doesn't get re-evaluated again immediately.
     coldOpenStates.set(pick.userId, { lastPingAt: Date.now(), pending: false, hopTimer: null });
 
     if (decision.action !== 'speak' || !decision.reply?.trim()) {
@@ -3011,9 +3218,6 @@ async function runColdOpen() {
     coldOpenTargetUserId = pick.userId;
     updatePresence();
     const hopTimer = setTimeout(() => {
-      // still pending after the wait window = no reply landed — hop away.
-      // (if they DID reply, handleDirectMessage already called clearColdOpenHop
-      // and coldOpenTargetUserId is back to null, so this is a no-op.)
       if (coldOpenTargetUserId === pick.userId) {
         console.log(`[ColdOpen] ${pick.name} didn't bite — hopping away`);
         coldOpenTargetUserId = null;
@@ -3024,7 +3228,7 @@ async function runColdOpen() {
     }, COLD_OPEN_WAIT_FOR_REPLY_MS);
 
     coldOpenStates.set(pick.userId, { lastPingAt: Date.now(), pending: true, hopTimer });
-    console.log(`[ColdOpen] opened DM with ${pick.name} (${pick.online ? 'online' : 'offline'}, from ${guildName})`);
+    console.log(`[ColdOpen] opened DM with ${pick.name} (${pick.online ? 'online' : 'offline'}, from ${guildName}, isNew:${isNewPerson})`);
   } catch (e) {
     console.error('[ColdOpen]', e);
   } finally { coldOpenRunning = false; }
@@ -3043,6 +3247,9 @@ async function handleDirectMessage(msg: Message) {
   // if this is a reply from whoever the bot's currently lingering on
   // (cold-open DM), cancel the hop-away timer — they bit, no need to leave.
   if (coldOpenTargetUserId === msg.author.id) clearColdOpenHop(msg.author.id);
+
+  // place a 24-hour cold open cooldown on anyone we have a natural DM conversation with
+  coldOpenStates.set(msg.author.id, { lastPingAt: Date.now(), pending: false, hopTimer: null });
 
   if (!stmStore.has(channelId)) {
     try {
@@ -3777,7 +3984,7 @@ export async function startBot(token: string) {
         await msg.reply('done — check logs for what it picked (or why it passed)');
       }
       if (c === '!coldopencandidates') {
-        const list = getColdOpenCandidates().slice(0, 10);
+        const list = (await getColdOpenCandidates()).slice(0, 10);
         await msg.reply(list.length
           ? list.map(c => `${c.name} — ${c.online ? '🟢 online' : '⚫ offline'} | ${humanDuration(c.recencyMs)} ago | "${c.lastMsg.slice(0, 50)}"`).join('\n')
           : 'no eligible candidates right now (everyone on cooldown, or nothing tracked yet)');
