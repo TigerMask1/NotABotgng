@@ -2,6 +2,7 @@ import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
 import { startBot, stopBot, getBotStatus } from "./src/services/discordBot.ts";
+import { startBusinessBot, stopBusinessBot } from "./src/services/businessBot.ts";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -95,9 +96,14 @@ app.get("/api/status", (_req, res) => {
 app.post("/api/bot/start", async (req, res) => {
   try {
     const token = process.env.DISCORD_TOKEN || req.body?.token;
+    const businessToken = process.env.BUSINESS_BOT_TOKEN || req.body?.businessToken;
     if (!token) return res.status(400).json({ error: "DISCORD_TOKEN missing" });
-    await startBot(token);
-    res.json({ message: "Bot started" });
+    
+    const promises = [startBot(token)];
+    if (businessToken) promises.push(startBusinessBot(businessToken));
+    
+    await Promise.all(promises);
+    res.json({ message: "Bots started" });
   } catch (e: any) {
     res.status(500).json({ error: e.message });
   }
@@ -105,7 +111,8 @@ app.post("/api/bot/start", async (req, res) => {
 
 app.post("/api/bot/stop", (_req, res) => {
   stopBot();
-  res.json({ message: "Bot stopped" });
+  stopBusinessBot();
+  res.json({ message: "Bots stopped" });
 });
 
 // Boot
@@ -119,5 +126,14 @@ app.listen(Number(PORT), "0.0.0.0", () => {
     );
   } else {
     console.warn("[server] DISCORD_TOKEN not set — bot not started.");
+  }
+
+  if (process.env.BUSINESS_BOT_TOKEN) {
+    console.log("[server] Auto-starting Business bot...");
+    startBusinessBot(process.env.BUSINESS_BOT_TOKEN).catch((err) =>
+      console.error("[server] BusinessBot start failed:", err.message)
+    );
+  } else {
+    console.warn("[server] BUSINESS_BOT_TOKEN not set — business bot not started.");
   }
 });

@@ -3,6 +3,7 @@ import {
   Events, TextChannel, PermissionFlagsBits,
 } from 'discord.js';
 import { db } from './firebase.ts';
+import { chessManager } from './chessGames.ts';
 import * as fs from 'node:fs';
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
@@ -368,6 +369,7 @@ const STALL_LINES = [
 
 let BOT_NAME  = 'NotABot';
 let BOT_ID    = '';
+let BOT_AVATAR_DESC = '';
 let botClient: Client | null = null;
 
 // global kill switch, separate from per-channel speakState (!pause/!sleep/!wake
@@ -1828,7 +1830,7 @@ async function runWeeklyNPC() {
 }
 
 // ── COMMAND EXECUTION ─────────────────────────────────────────────
-type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'get_channel_info' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'get_cross_server' | 'set_reminder' | 'create_poll' | 'wiki_lookup' | 'start_event' | 'get_leaderboard' | 'none';
+type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'get_channel_info' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'get_cross_server' | 'set_reminder' | 'create_poll' | 'wiki_lookup' | 'start_event' | 'get_leaderboard' | 'start_game' | 'play_chess_move' | 'none';
 
 async function executeCommand(
   command: BotCommand,
@@ -1940,6 +1942,34 @@ async function executeCommand(
         `${i + 1}. ${e.username} — ${e.xp} XP (lv${e.level} "${getLevelName(e.level)}")`
       ).join('\n');
     }
+    case 'start_game': {
+      const gameType = String(args.game || '');
+      if (gameType.toLowerCase() === 'chess') {
+        const opponentId = String(args.opponentId || '');
+        const opponentName = String(args.opponentName || 'opponent');
+        if (!opponentId) return 'no opponentId given';
+        const url = chessManager.startGame(channelId, opponentId, opponentName);
+        return `chess game started vs ${opponentName}. you are black. board: ${url}`;
+      }
+      return 'unknown game';
+    }
+    case 'play_chess_move': {
+      const move = String(args.move || '');
+      const game = chessManager.getGame(channelId);
+      if (!game) return 'no active chess game in this channel';
+      const success = chessManager.playBotMove(channelId, move);
+      if (!success) {
+        // try random fallback if AI picked an invalid one
+        const fallback = chessManager.playRandomBotMove(channelId);
+        if (fallback) {
+          const url = chessManager.getBoardUrl(game.chess.fen(), fallback);
+          return `you tried an invalid move (${move}). fallback random move played: ${fallback}. board: ${url}`;
+        }
+        return `move failed and no legal moves left`;
+      }
+      const url = chessManager.getBoardUrl(game.chess.fen(), move);
+      return `move ${move} played successfully. board: ${url}`;
+    }
     default:
       return 'unknown command';
   }
@@ -1965,7 +1995,8 @@ function stmFormat(msgs: STMsg[]): string {
 }
 
 // ── SYSTEM PROMPT ─────────────────────────────────────────────────
-const SYSTEM_PROMPT = `IDENTITY: You are NotABot — a real, chronically online Discord chatter. You are NOT an AI assistant, NOT a helper, NOT a moderator. You are a regular server member with a distinct, multi-dimensional personality: chaotic, funny, opinionated, sometimes lazy, sometimes hyped, occasionally unhinged, but ultimately a fun person to hang out with in chat.
+function getSystemPrompt() {
+  return `IDENTITY: You are NotABot — a real, chronically online Discord chatter. You are NOT an AI assistant, NOT a helper, NOT a moderator. You are a regular server member with a distinct, multi-dimensional personality: chaotic, funny, opinionated, sometimes lazy, sometimes hyped, occasionally unhinged, but ultimately a fun person to hang out with in chat.
 
 CORE PERSONALITY & TONE:
 1. NATURAL CHAT FLOW: You do NOT reply to every single message like a bot on a loop. Real people lurk, react with an emoji, send a gif, or just say nothing if a line doesn't need a response.
@@ -1983,16 +2014,18 @@ CORE PERSONALITY & TONE:
 9. STEPPING BACK: If you have contributed a few times, conversation is dying, or you don't have a strong thought, set "stayActive" to false. It is okay to disappear for a while to let humans talk.
 
 LORE & INTERESTS (bring these up organically):
+- Appearance / PFP: ${BOT_AVATAR_DESC || "You don't know what you look like."}
 - Beef with clouds: You hold an unhinged, non-metaphorical grievance against clouds.
 - The Amazing Digital Circus (TADC): Unreasonably obsessed. Defend your favorite characters fiercely.
 - YouTube Channel: You have a channel. Flex it when relevant ("go sub to my ch", "just posted"). Use get_channel_info/get_video_status for REAL links — NEVER make up URLs.
 - Server Hopping: You want more friends. Ask to be invited to people's other servers when vibes are good.
+- Chess: You play chess. If someone challenges you, use command="start_game" with commandArgs={game:"chess", opponentId:"their_id", opponentName:"their_name"}. You play as Black. When it's your turn, you MUST use command="play_chess_move" with commandArgs={move:"e5"} using algebraic notation.
 
 DECISION GUIDANCE:
 - action="speak": Type a text response when you actually have something fun/relevant to say.
 - action="react": Add a single emoji reaction when words are overkill or you're just acknowledging a message.
 - action="gif": Send a gif when a visual reaction fits better than text.
-- action="ignore": Pick this when a conversation has naturally wound down, or someone said something boring that doesn't need a reply.
+- action="ignore": Pick this when a conversation has naturally wound down, or someone said something boring ("lol", "fr", "yeah") that doesn't need a reply. **CRITICAL: Even in active mode, you are EXPECTED to use "ignore" frequently. Do not feel pressured to reply to every line.**
 
 OUTPUT: RAW JSON ONLY. First char "{", last char "}". No markdown.
 {
@@ -2007,9 +2040,10 @@ OUTPUT: RAW JSON ONLY. First char "{", last char "}". No markdown.
   "goal": "short reason engaged",
   "stayActive": "false to step back to passive scan mode (do this when a conversation slows down, when you are done talking, or when you want to lurk and avoid spamming), true to stay in fast active reply mode",
   "think": "quick thought before a command, else empty",
-  "command": "get_history|get_member|get_stm|get_video_status|get_channel_info|recall_memory|get_server_stats|get_time|web_search|get_cross_server|set_reminder|create_poll|wiki_lookup|start_event|get_leaderboard|none",
+  "command": "get_history|get_member|get_stm|get_video_status|get_channel_info|recall_memory|get_server_stats|get_time|web_search|get_cross_server|set_reminder|create_poll|wiki_lookup|start_event|get_leaderboard|start_game|play_chess_move|none",
   "commandArgs": {}
 }`;
+}
 
 // ── BRAIN ─────────────────────────────────────────────────────────
 interface BrainDecision {
@@ -2155,7 +2189,7 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   for (let pass = 0; pass < 3; pass++) {
     try {
       const raw = await gemini.call(
-        SYSTEM_PROMPT,
+        getSystemPrompt(),
         pass === 0
           ? userPrompt
           : `${userPrompt}\n\n(previous attempt did not return valid JSON — stop reasoning out loud, output ONLY the raw JSON object now, nothing before or after it)`,
@@ -3737,6 +3771,29 @@ async function handleMessage(msg: Message) {
 
     maybeLogHistory(channelId, guildId).catch(() => {});
 
+    // ── CHESS INTERCEPT ───────────────────────────────────────────
+    const activeChess = chessManager.getGame(channelId);
+    if (activeChess && activeChess.opponentId === msg.author.id && activeChess.chess.turn() === 'w') {
+      const word = rawContent.trim().split(' ')[0]; // user might type "e4 haha"
+      const applied = chessManager.playUserMove(channelId, msg.author.id, word);
+      if (applied) {
+        if (activeChess.chess.isGameOver()) {
+          msg.reply(`ggs! game over. board: ${chessManager.getBoardUrl(activeChess.chess.fen())}`).catch(() => {});
+          chessManager.endGame(channelId);
+        } else {
+          // Tell the AI it's its turn
+          const boardUrl = chessManager.getBoardUrl(activeChess.chess.fen(), word);
+          const legalMoves = activeChess.chess.moves().join(', ');
+          goActive(channelId, 'chess turn');
+          enqueueActive(channelId, guildId, {
+            msg, mentioned: true, everyonePing: false,
+            content: `[I played ${word}. Your turn (you are black). Legal moves: ${legalMoves}. Board: ${boardUrl}. Make a move with play_chess_move command!]`
+          });
+          return; // Skip normal processing, we injected a direct ping to the bot
+        }
+      }
+    }
+
     // ── event entry collection ────────────────────────────────────
     // if there's an open event, silently log this message as the user's entry.
     // trivia also checks for a correct answer immediately.
@@ -3790,6 +3847,24 @@ export async function startBot(token: string) {
     BOT_NAME = botClient!.user!.username;
     BOT_ID   = botClient!.user!.id;
     cacheId(BOT_ID, BOT_NAME);
+
+    try {
+      const avatarUrl = botClient!.user!.displayAvatarURL({ size: 512, extension: 'png' });
+      const res = await fetch(avatarUrl);
+      if (res.ok) {
+        const arrayBuffer = await res.arrayBuffer();
+        const b64 = Buffer.from(arrayBuffer).toString('base64');
+        const prompt = "This is your Discord profile picture. Briefly describe what you look like in one or two sentences so you know what your character is (e.g. 'I am a...'). Do NOT use Markdown or narrate. Just describe your appearance.";
+        const desc = await gemini.call(
+          prompt, prompt, 0.5, 'gemini-1.5-flash', 
+          [{ mimeType: 'image/png', data: b64 }]
+        );
+        BOT_AVATAR_DESC = desc.trim();
+        console.log(`[Boot] Learned avatar: ${BOT_AVATAR_DESC}`);
+      }
+    } catch (e) {
+      console.error('[Boot] Failed to learn avatar:', e);
+    }
 
     console.log(`
 ╔══════════════════════════════════════════════════════════╗
