@@ -383,6 +383,7 @@ const ADMIN_ID = '1296109674361520146';
 // per-server mute: server admins (anyone with Administrator perm) can !stop / !resume the bot
 // in their own server without affecting other servers. stored in-memory + persisted to Firebase.
 const serverMuted = new Map<string, boolean>();
+const serverFamilyFriendly = new Map<string, boolean>();
 
 // per-server "which other bots am i allowed to see" — empty/missing set = ignore
 // every other bot (the historical default). server admins add/remove bot IDs
@@ -815,13 +816,16 @@ interface ChannelState {
   // any actual ignore resets this to 0. mentioned/DM/in-exchange replies
   // don't touch it either way — being directly engaged isn't "talking too much."
   consecutiveUnpromptedReplies: number;
+  // userId of whoever triggered the last bot reply — used for the same-sender
+  // rapid-fire guard (don't reply to every quick follow-up from the same person).
+  lastRepliedToSenderId:       string;
 }
 const channelState = new Map<string, ChannelState>();
 
 function getChState(channelId: string): ChannelState {
   let s = channelState.get(channelId);
   if (!s) {
-    s = { mode: 'passive', goal: '', lastActivityAt: Date.now(), lastRelevantAt: Date.now(), lastBotMsgAt: 0, gotResponseSinceLastBotMsg: true, consecutiveUnpromptedReplies: 0 };
+    s = { mode: 'passive', goal: '', lastActivityAt: Date.now(), lastRelevantAt: Date.now(), lastBotMsgAt: 0, gotResponseSinceLastBotMsg: true, consecutiveUnpromptedReplies: 0, lastRepliedToSenderId: '' };
     channelState.set(channelId, s);
   }
   if (s.mode === 'active' && Date.now() - s.lastActivityAt > ACTIVE_IDLE_REVERT_MS) {
@@ -1973,9 +1977,10 @@ CORE PERSONALITY & TONE:
 3. CONCISE TEXTING STYLE: Lowercase default. No periods at the end of lines. Short to medium responses (3-12 words). Typos/slang (ngl, tbh, fr, lmao, wtf, rn) used naturally, not forced into every word.
 4. SWEARING & SLURS CONTROL: Swearing is punctuation for high emotion, not your whole vocabulary. Use it when genuinely pissed or laughing hard, not in every single line.
 5. NO MARVEL ROASTS: No two-clause pre-written comeback lines ("the delusion is real get help"). Keep banter raw, casual, and human.
-6. NO NARRATING: Speak directly TO people, never talk ABOUT them like a commentator.
+6. NO NARRATING: Speak directly TO people, never talk ABOUT them like a commentator. If you see an image or GIF, react to the MEME or the VIBE. Do NOT describe what is in the image. Do NOT say "bro is [doing something]". Treat it like a normal meme sent in chat.
 7. STANDALONE MESSAGES: "replyToMsgId" should ALWAYS be "none" unless replying to a specific message from minutes ago.
-8. STEPPING BACK: If you have contributed a few times, conversation is dying, or you don't have a strong thought, set "stayActive" to false. It is okay to disappear for a while to let humans talk.
+8. MINDING YOUR BUSINESS: If a message is a reply to someone else (shown in 'REPLY TO'), they are talking to THEM, not you. Do NOT butt into their conversation unless pinged or you have a top-tier roast. action:ignore is best here.
+9. STEPPING BACK: If you have contributed a few times, conversation is dying, or you don't have a strong thought, set "stayActive" to false. It is okay to disappear for a while to let humans talk.
 
 LORE & INTERESTS (bring these up organically):
 - Beef with clouds: You hold an unhinged, non-metaphorical grievance against clouds.
@@ -2080,6 +2085,7 @@ interface BrainOpts {
   images?:       ImagePart[];   // live vision attachments for THIS call only, never persisted
   crossChannelCtx?: string;  // what this user said in other channels recently
   consecutiveUnpromptedReplies?: number;
+  guildId?:      string;
 }
 
 async function brain(opts: BrainOpts): Promise<BrainDecision> {
@@ -2094,18 +2100,22 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
 
   const parts: string[] = [statusLine];
 
+  if (opts.guildId && serverFamilyFriendly.get(opts.guildId)) {
+    parts.push(`\nCRITICAL RULE: THIS SERVER IS SET TO FAMILY FRIENDLY MODE. You MUST NOT use any slurs, profanity, or toxic insults whatsoever. Keep banter clean and PG-13.`);
+  }
+
   if (opts.goal)          parts.push(`\nYOUR GOAL RIGHT NOW: ${opts.goal}`);
   if (opts.memCtx)        parts.push(`\nSERVER MEMORY:\n${opts.memCtx}`);
   if (opts.personalCtx)      parts.push(`\nWHAT YOU KNOW ABOUT ${opts.sender.toUpperCase()} AS A PERSON (carries across every server/DM, not just this one):\n${opts.personalCtx}`);
   if (opts.crossChannelCtx)  parts.push(`\nWHAT ${opts.sender.toUpperCase()} RECENTLY SAID IN OTHER CHANNELS/SERVERS (so you have the full picture if they reference it):\n${opts.crossChannelCtx}`);
   if (opts.historyCtx)    parts.push(`\nHISTORY LOGS (archived summaries):\n${opts.historyCtx}`);
-  if (opts.thread)        parts.push(`\nREPLY TO:\n${opts.thread}`);
+  if (opts.thread)        parts.push(`\n[NOTE: THEY ARE REPLYING TO THIS MESSAGE -> ${opts.thread} — they are likely talking to that person, NOT you. Don't butt in unless necessary.]`);
   if (opts.videoCtx)      parts.push(`\nYOUR NEW VIDEO:\ntitle: "${opts.videoCtx.title}"\nlink: ${opts.videoCtx.url}\n(you just posted this — see "WHEN A NEW VIDEO OF YOURS DROPS" for how to bring it up, if at all)`);
   parts.push(`\nCHAT (recent):\n${opts.transcript}`);
   if (opts.batchSize && opts.batchSize > 1)
     parts.push(`\n(${opts.batchSize} messages landed while you were thinking — all already in the chat above, below the marker. default is ignoring the whole pile, that's normal. only break that if something in there genuinely earns a reply or reaction. if so, set replyToMsgId, and flag unansweredMsgId if something else in there is a real question you're leaving for later.)`);
   if (opts.images?.length)
-    parts.push(`\n(an image is attached to the most recent message below — actually look at it, react to what's really in it, don't guess. if it was a gif, you're seeing ONE static frame pulled from it, not the motion — react to what's visible in that frame, don't describe or assume movement you can't actually see)`);
+    parts.push(`\n(an image/gif is attached to the most recent message. react to the MEME or VIBE of it. DO NOT narrate or describe what you see. just react naturally as if someone sent a funny pic in chat)`);
   if (opts.consecutiveUnpromptedReplies && opts.consecutiveUnpromptedReplies >= 1) {
     const n = opts.consecutiveUnpromptedReplies;
     parts.push(`\n(for context: you've spoken up completely unprompted ${n} time${n > 1 ? 's' : ''} in a row now — nobody asked, you just had something to say each time)`);
@@ -2273,6 +2283,7 @@ async function sendDecision(opts: {
     }
     state.lastBotMsgAt = Date.now();
     state.gotResponseSinceLastBotMsg = false;
+    if (replyToMsg) state.lastRepliedToSenderId = replyToMsg.author.id;
     if (guildId !== 'dm' && replyToMsg) updateBond(guildId, replyToMsg.author.id, 1).catch(() => {});
   }
 
@@ -2298,6 +2309,7 @@ async function sendDecision(opts: {
     }
     state.lastBotMsgAt = Date.now();
     state.gotResponseSinceLastBotMsg = false;
+    if (replyToMsg) state.lastRepliedToSenderId = replyToMsg.author.id;
     if (guildId !== 'dm' && replyToMsg) updateBond(guildId, replyToMsg.author.id, 1).catch(() => {});
     // XP for being spoken to
     if (guildId !== 'dm' && replyToMsg && replyToMsg.author.id !== BOT_ID) {
@@ -2524,7 +2536,7 @@ async function runPassiveTick() {
     const channelName  = (ch as any).name || channelId.slice(-5);
     const statusLine = `mode: passive scan (5-min check-in, huge context, you may start something new) | speak: ${speakState.mode} | server: ${serverName} | channel: #${channelName}`;
 
-    const brainOpts: BrainOpts = {
+    const brainOpts: BrainOpts = { guildId,
       model: PASSIVE_MODEL,
       sender: last ? last.author : '(quiet)',
       bond: 50,
@@ -3355,10 +3367,18 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
   if (!gemini.canCall()) return;
 
   const tSender      = last.member?.displayName || last.author.username;
-  const tContent      = batch[batch.length - 1].content; // already enriched (image/gif/link tags) in handleMessage
+  
+  let i = batch.length - 1;
+  while (i > 0 && batch[i - 1].msg.author.id === last.author.id) {
+    i--;
+  }
+  const tContent      = batch.slice(i).map(b => b.content).join('\n'); // combine consecutive msgs from sender
+
   const tChannelName  = (last.channel as any).name ?? 'unknown';
   const tServerName   = last.guild?.name || serverNameCache.get(guildId) || 'unknown';
   const tEveryonePing = batch.some(b => b.everyonePing);
+  
+  const pingedOthers  = batch.some(b => b.msg.mentions.users.size > 0 && !b.msg.mentions.has(BOT_ID));
   const images        = await collectVisionImages(batch.map(b => b.msg));
 
   let threadCtx: string | undefined;
@@ -3379,10 +3399,16 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
   const state = getChState(channelId);
   const crossChannelCtx = getRecentCrossChannelCtx(last.author.id, channelId);
 
-  const recentMsgs  = stmGet(channelId).slice(-12);
-  const botReplied  = recentMsgs.some(m => m.authorId === BOT_ID);
-  const senderCount = recentMsgs.filter(m => m.authorId === last.author.id).length;
-  const inExchange  = botReplied && senderCount >= 2;
+  // inExchange: only true if there's a genuine back-and-forth where the bot
+  // actually replied TO this sender and they came back. Pattern: the last bot
+  // message in STM was preceded by a message from this sender, AND this sender
+  // has sent something after that bot reply. This avoids marking every active
+  // channel as "mid exchange" just because the bot spoke recently.
+  const recentMsgs  = stmGet(channelId).slice(-10);
+  const lastBotIdx  = recentMsgs.map(m => m.authorId).lastIndexOf(BOT_ID);
+  const senderAfterBot = lastBotIdx >= 0 && recentMsgs.slice(lastBotIdx + 1).some(m => m.authorId === last.author.id);
+  const senderBeforeBot = lastBotIdx > 0 && recentMsgs[lastBotIdx - 1]?.authorId === last.author.id;
+  const inExchange  = senderAfterBot && senderBeforeBot; // bot replied to them, they came back — real 1-on-1
   const endingConvo = /\b(bye|cya|gotta go|gtg|see ya|later|good night|gn|logging off|ttyl|im out)\b/i.test(tContent);
   // "unprompted" = nobody pinged it, no @everyone, not mid back-and-forth with
   // this specific sender — i.e. it would be volunteering a reply purely because
@@ -3414,9 +3440,11 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
     // the model sees its reply in the STM transcript but doesn't always register
     // how recent it was, which causes it to reply again to harmless follow-ups.
     selfNote: inExchange
-      ? `you are in an active back-and-forth exchange with ${tSender}. reply naturally to keep the conversation going, do NOT drop the conversation.`
+      ? `you've been going back and forth with ${tSender}. they came back to you so reply if you feel like it — but if they're just hyping or agreeing and you have nothing to add, action:ignore or action:react is fine too.`
+      : (pingedOthers && !anyMentioned)
+      ? `they just pinged someone else in this batch. they are talking to them, NOT you. action:ignore is highly recommended unless you have a genius reason to butt in.`
       : (!anyMentioned && secsSinceSpoke !== null && secsSinceSpoke < 25)
-      ? `you spoke ${secsSinceSpoke}s ago. you've already responded to this room recently. be reluctant to reply unless spoken to directly.`
+      ? `you spoke ${secsSinceSpoke}s ago. you've already contributed recently. only reply if this is genuinely worth it, otherwise let them talk.`
       : undefined,
   };
 
