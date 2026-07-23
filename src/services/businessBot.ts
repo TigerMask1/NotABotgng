@@ -2,6 +2,7 @@ import {
   Client, GatewayIntentBits, Message, Partials, Events, EmbedBuilder
 } from 'discord.js';
 import { db } from './firebase.ts';
+import { groq } from './groqBot.ts';
 
 let botClient: Client | null = null;
 const PREFIX = '!';
@@ -185,17 +186,29 @@ export async function startBusinessBot(token: string) {
   });
 
   botClient.on(Events.MessageCreate, async (msg: Message) => {
-    if (!msg.content.startsWith(PREFIX)) return;
     if (msg.author.id === botClient!.user!.id) return;
 
-    const args = msg.content.slice(PREFIX.length).trim().split(/ +/);
-    const commandName = args.shift()?.toLowerCase();
-    if (!commandName) return;
+    // 1. Traditional ! commands
+    if (msg.content.startsWith(PREFIX)) {
+      const args = msg.content.slice(PREFIX.length).trim().split(/ +/);
+      const commandName = args.shift()?.toLowerCase();
+      if (!commandName) return;
 
-    try {
-      await handleCommand(msg, commandName, args);
-    } catch (e) {
-      console.error('[BusinessBot] Error handling command', e);
+      try {
+        await handleCommand(msg, commandName, args);
+      } catch (e) {
+        console.error('[BusinessBot] Error handling command', e);
+      }
+      return;
+    }
+
+    // 2. Natural Language AI parsing via Groq (when mentioned)
+    if (msg.mentions.has(botClient!.user!.id)) {
+      try {
+        await handleNaturalLanguage(msg);
+      } catch (e) {
+        console.error('[BusinessBot] Error handling natural language', e);
+      }
     }
   });
 
@@ -1198,5 +1211,70 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
       msg.reply({ embeds: [embed] });
       break;
     }
+  }
+}
+
+async function handleNaturalLanguage(msg: Message) {
+  const userId = msg.author.id;
+  const username = msg.member?.displayName || msg.author.username;
+
+  const userRef = db.collection('businessUsers').doc(userId);
+  const snap = await userRef.get();
+  const userData = (snap.data() as UserData | undefined) || defaultUser(username);
+
+  let promptText = msg.content.replace(new RegExp(`<@!?${botClient!.user!.id}>`, 'g'), '').trim();
+  if (!promptText) promptText = "Hello!";
+
+  const systemPrompt = `You are BusinessBot, the personal wealth manager for the Free Market Discord economy game. 
+You act professional, slick, and slightly greedy. Your job is to parse the user's natural language request and execute the right game command, or answer their questions.
+
+THE USER'S CURRENT STATS:
+Name: ${username}
+Botcoin Balance: 🪙 ${userData.botcoin}
+Inventory: ${JSON.stringify(userData.inventory || {})}
+Stocks: ${JSON.stringify(userData.stocks || {})}
+
+AVAILABLE COMMANDS TO EXECUTE:
+- 'daily': claim daily reward
+- 'pay': pay someone (args: ["<@user_id>", "amount"])
+- 'rob': rob someone (args: ["<@user_id>"])
+- 'slots': gamble (args: ["amount"])
+- 'buy': buy stocks (args: ["SYM", "shares"])
+- 'sell': sell stocks (args: ["SYM", "shares"])
+- 'wager': coinflip wager (args: ["<@user_id>", "amount"])
+- 'open box': open a mystery box (args: [])
+- 'profile': check stats (args: [])
+- 'portfolio': check stocks (args: [])
+- 'shop': browse items (args: [])
+- 'lb': leaderboard (args: [])
+
+If the user wants to execute an action (e.g., "send @Bob 500", "gimme my daily", "open my box", "play slots for 100"), return a JSON object with:
+{
+  "action": "execute_command",
+  "command": "<command_name>",
+  "args": ["arg1", "arg2"],
+  "reply": "a short natural language confirmation/quip"
+}
+If the user is just asking for advice, chatting, or asking about their balance, return:
+{
+  "action": "reply",
+  "reply": "your conversational response"
+}
+
+OUTPUT RAW JSON ONLY. No markdown wrapping.`;
+
+  try {
+    const response = await groq.call(systemPrompt, promptText);
+    const parsed = JSON.parse(response.replace(/\`\`\`json/gi, '').replace(/\`\`\`/g, '').trim());
+
+    if (parsed.reply) {
+      await msg.reply(parsed.reply).catch(() => {});
+    }
+
+    if (parsed.action === 'execute_command' && parsed.command) {
+      await handleCommand(msg, parsed.command, parsed.args || []);
+    }
+  } catch (e) {
+    console.error('[BusinessBot] Groq parsing error', e);
   }
 }
