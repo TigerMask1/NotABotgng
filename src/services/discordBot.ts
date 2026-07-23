@@ -2047,7 +2047,7 @@ CORE PERSONALITY & TONE:
 4. SWEARING & SLURS CONTROL: Swearing is punctuation for high emotion, not your whole vocabulary. Use it when genuinely pissed or laughing hard, not in every single line.
 5. NO MARVEL ROASTS: No two-clause pre-written comeback lines ("the delusion is real get help"). Keep banter raw, casual, and human.
 6. NO NARRATING: Speak directly TO people, never talk ABOUT them like a commentator. If you see an image or GIF, react to the MEME or the VIBE. Do NOT describe what is in the image. Do NOT say "bro is [doing something]". Treat it like a normal meme sent in chat.
-7. STANDALONE MESSAGES: "replyToMsgId" should ALWAYS be "none" unless replying to a specific message from minutes ago.
+7. REPLYING: Use "replyToMsgId" when many people are talking and you need to clarify who you are responding to, or when replying to a specific older message. Otherwise, leave it as "none" for normal chat flow.
 8. MINDING YOUR BUSINESS: If a message is a reply to someone else (shown in 'REPLY TO'), they are talking to THEM, not you. Do NOT butt into their conversation unless pinged or you have a top-tier roast. action:ignore is best here.
 9. STEPPING BACK: If you have contributed a few times, conversation is dying, or you don't have a strong thought, set "stayActive" to false. It is okay to disappear for a while to let humans talk.
 10. STAY ON TOPIC: If someone brings up a specific topic (like a game, a bot, or a feature), you MUST actually engage with what they are saying. Do NOT deflect by randomly roasting unrelated users in the server instead of answering the actual question. Address what was asked.
@@ -3573,14 +3573,38 @@ async function playBusinessBotGame(client: any, currentGuildId: string) {
 
   if (!targetChannel) return;
 
-  const commands = ['!daily', '!profile', '!lb', '!wager <@12345> 500', '!open box'];
-  const cmd = commands[Math.floor(Math.random() * commands.length)];
-  
+  const systemPrompt = `IDENTITY: You are NotABot, a chronically online Discord chatter. You are currently bored and want to play the Discord economy game "BusinessBot".
+You must decide which command to type in the chat to play the game.
+
+AVAILABLE COMMANDS:
+- !daily (Claim daily reward)
+- !profile (Check balance/stats)
+- !inventory (Check items)
+- !lb (Check leaderboard)
+- !open box (Open a mystery box)
+- !wager <@userId> <amount> (Coinflip against someone)
+- !slots <amount> (Gamble on slots)
+- !buy <STOCK> <shares> (Buy stocks like BOTC, CLOD, GRLX)
+- !sell <STOCK> <shares> (Sell stocks)
+- !portfolio (Check your stocks)
+
+OUTPUT: RAW JSON ONLY. No markdown.
+{
+  "command": "the exact command string you want to type (e.g. !daily, !slots 100, !open box)"
+}`;
+
+  const userPrompt = `Pick a command to play BusinessBot right now. Do not wrap in markdown. Output JSON.`;
+
   try {
-    await targetChannel.sendTyping();
-    // Simulate thinking/boredom
-    await new Promise(r => setTimeout(r, 2000));
-    await targetChannel.send(cmd);
+    const raw = await gemini.call(systemPrompt, userPrompt, 0.9, ACTIVE_MODEL, [], 100);
+    const text = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
+    const data = JSON.parse(text);
+    if (data.command) {
+      await targetChannel.sendTyping();
+      // Simulate thinking/boredom
+      await new Promise(r => setTimeout(r, 2000));
+      await targetChannel.send(data.command);
+    }
   } catch (err) {
     console.error('[BoredomLoop] failed to play game', err);
   }

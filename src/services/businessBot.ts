@@ -127,8 +127,20 @@ function calcNetWorth(u: UserData, customItems: Record<string, any>): number {
 
 function xpForLevel(lvl: number): number { return lvl * 500; }
 function levelLabel(lvl: number): string {
-  const labels = ['', 'Broke', 'Hustler', 'Trader', 'Investor', 'Shark', 'Mogul', 'Tycoon', 'Oligarch', 'Billionaire', 'NotABot'];
-  return labels[Math.min(lvl, labels.length - 1)] || `Lv.${lvl}`;
+  const labels = [
+    '',
+    'Street Vendor',      // 1
+    'Market Stall',       // 2
+    'Corner Shop',        // 3
+    'Entrepreneur',       // 4
+    'Stock Trader',       // 5
+    'Investment Banker',  // 6
+    'Hedge Fund Manager', // 7
+    'Corporation',        // 8
+    'Conglomerate',       // 9
+    'Market Overlord',    // 10 — final rank
+  ];
+  return labels[Math.min(lvl, labels.length - 1)] || `Market Overlord`;
 }
 
 function addXP(u: UserData, amount: number) {
