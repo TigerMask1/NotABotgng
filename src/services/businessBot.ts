@@ -88,6 +88,10 @@ export function stopBusinessBot() {
   }
 }
 
+export function getBusinessBotId() {
+  return botClient?.user?.id;
+}
+
 // ── COMMAND HANDLERS ────────────────────────────────────────────────────────
 
 async function handleCommand(msg: Message, command: string, args: string[]) {

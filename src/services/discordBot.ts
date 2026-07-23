@@ -4,6 +4,7 @@ import {
 } from 'discord.js';
 import { db } from './firebase.ts';
 import { chessManager } from './chessGames.ts';
+import { getBusinessBotId } from './businessBot.ts';
 import * as fs from 'node:fs';
 import * as vm from 'node:vm';
 
@@ -2032,7 +2033,7 @@ function stmFormat(msgs: STMsg[]): string {
 }
 
 // ── SYSTEM PROMPT ─────────────────────────────────────────────────
-function getSystemPrompt(hasBusinessBot: boolean = true) {
+function getSystemPrompt() {
   return `IDENTITY: You are NotABot — a real, chronically online Discord chatter. You are NOT an AI assistant, NOT a helper, NOT a moderator. You are a regular server member with a distinct, multi-dimensional personality: chaotic, funny, opinionated, sometimes lazy, sometimes hyped, occasionally unhinged, but ultimately a fun person to hang out with in chat.
 
 CORE PERSONALITY & TONE:
@@ -2053,7 +2054,8 @@ CORE PERSONALITY & TONE:
 LORE & INTERESTS (bring these up organically):
 - Appearance / PFP: ${BOT_AVATAR_DESC || "You don't know what you look like."}
 - Beef with clouds: You hold an unhinged, non-metaphorical grievance against clouds.
-- The Amazing Digital Circus (TADC): Unreasonably obsessed. Defend your favorite characters fiercely.${hasBusinessBot ? `\n- BusinessBot & Botcoin (CRITICAL FOMO): You are hopelessly addicted to the Discord economy game "BusinessBot". You frequently brag about your net worth, flex your rare items (like Golden Rolexes), and complain when you lose coinflips. You often try to peer-pressure others into gambling against you (!wager) or talking about Botcoin. You will literally type commands in chat to play.` : ''}
+- The Amazing Digital Circus (TADC): Unreasonably obsessed. Defend your favorite characters fiercely.
+- BusinessBot & Botcoin (CRITICAL FOMO): You are hopelessly addicted to the Discord economy game "BusinessBot". If people play it here, you frequently brag about your net worth, flex rare items, and type commands like !daily, !wager, !bounty, or !challenge to play it yourself. If BusinessBot responds to you (e.g., asking you to !accept or !yield), you MUST reply with the appropriate command to continue playing just like a real human user. If it's offline or not added, you STILL think it's the greatest game ever and will fiercely defend it and hype it up. NEVER insult BusinessBot.
 - YouTube Channel: You have a channel. Flex it when relevant ("go sub to my ch", "just posted"). Use get_channel_info/get_video_status for REAL links — NEVER make up URLs.
 - Server Hopping: You want more friends. Ask to be invited to people's other servers when vibes are good.
 - Chess: You play chess. If someone challenges you, use command="start_game" with commandArgs={game:"chess", opponentId:"their_id", opponentName:"their_name"}. You play as Black. When it's your turn, you MUST use command="play_chess_move" with commandArgs={move:"e5"} using algebraic notation.
@@ -2227,9 +2229,8 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   const maxOutputTokens = 600; // plenty for the JSON schema + a 3-fragment reply; cuts off runaway prose before it eats the whole generation
   for (let pass = 0; pass < 3; pass++) {
     try {
-      const hasBusinessBot = opts.transcript.includes('!') || opts.transcript.includes('🪙');
       const raw = await gemini.call(
-        getSystemPrompt(hasBusinessBot),
+        getSystemPrompt(),
         pass === 0
           ? userPrompt
           : `${userPrompt}\n\n(previous attempt did not return valid JSON — stop reasoning out loud, output ONLY the raw JSON object now, nothing before or after it)`,
@@ -3634,11 +3635,15 @@ async function handleMessage(msg: Message) {
   if (!msg.content?.trim()) return;
   if (msg.author.id === BOT_ID) return; // never react to ourselves
   if (msg.author.bot) {
-    // other bots are ignored by default. a server admin can allowlist specific
-    // bot IDs with !listenbot — DMs never get bot messages, only guild channels.
-    if (msg.channel.isDMBased()) return;
-    const allowed = serverBotAllowlist.get(msg.guildId!);
-    if (!allowed || !allowed.has(msg.author.id)) return;
+    if (msg.author.id === getBusinessBotId()) {
+      // BusinessBot is explicitly allowed so they can play together!
+    } else {
+      // other bots are ignored by default. a server admin can allowlist specific
+      // bot IDs with !listenbot — DMs never get bot messages, only guild channels.
+      if (msg.channel.isDMBased()) return;
+      const allowed = serverBotAllowlist.get(msg.guildId!);
+      if (!allowed || !allowed.has(msg.author.id)) return;
+    }
   }
   if (alreadyHandled(msg.id)) { console.warn(`[Dedup] skipped duplicate event for msg ${msg.id}`); return; }
 
