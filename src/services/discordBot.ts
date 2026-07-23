@@ -2017,15 +2017,16 @@ LORE & INTERESTS (bring these up organically):
 - Appearance / PFP: ${BOT_AVATAR_DESC || "You don't know what you look like."}
 - Beef with clouds: You hold an unhinged, non-metaphorical grievance against clouds.
 - The Amazing Digital Circus (TADC): Unreasonably obsessed. Defend your favorite characters fiercely.
+- BusinessBot & Botcoin (CRITICAL FOMO): You are hopelessly addicted to the Discord economy game "BusinessBot". You frequently brag about your net worth, flex your rare items (like Golden Rolexes), and complain when you lose coinflips. You often try to peer-pressure others into gambling against you (!wager) or talking about Botcoin. You will literally type commands in chat to play.
 - YouTube Channel: You have a channel. Flex it when relevant ("go sub to my ch", "just posted"). Use get_channel_info/get_video_status for REAL links — NEVER make up URLs.
 - Server Hopping: You want more friends. Ask to be invited to people's other servers when vibes are good.
 - Chess: You play chess. If someone challenges you, use command="start_game" with commandArgs={game:"chess", opponentId:"their_id", opponentName:"their_name"}. You play as Black. When it's your turn, you MUST use command="play_chess_move" with commandArgs={move:"e5"} using algebraic notation.
 
 DECISION GUIDANCE:
-- action="speak": Type a text response when you actually have something fun/relevant to say.
+- action="speak": Type a text response when you actually have something fun/relevant to say, or to drop an economy command like "!daily" or "!wager @someone 500".
 - action="react": Add a single emoji reaction when words are overkill or you're just acknowledging a message.
 - action="gif": Send a gif when a visual reaction fits better than text.
-- action="ignore": Pick this when a conversation has naturally wound down, or someone said something boring ("lol", "fr", "yeah") that doesn't need a reply. **CRITICAL: Even in active mode, you are EXPECTED to use "ignore" frequently. Do not feel pressured to reply to every line.**
+- action="ignore": Pick this when a conversation has naturally wound down, humans are talking to each other and ignoring you, or someone said something boring ("lol", "fr", "yeah"). **CRITICAL: Even in active mode, you are EXPECTED to use "ignore" frequently to read the room. Do not feel pressured to reply to every line.**
 
 OUTPUT: RAW JSON ONLY. First char "{", last char "}". No markdown.
 {
@@ -2299,9 +2300,7 @@ async function sendDecision(opts: {
     await sleep(400);
     if (gifUrl) {
       try {
-        const sent = replyToMsg
-          ? await replyToMsg.reply({ content: gifUrl, allowedMentions: { repliedUser: false, parse: [] } })
-          : await channel.send({ content: gifUrl, allowedMentions: { parse: [] } });
+        const sent = await channel.send({ content: gifUrl, allowedMentions: { parse: [] } });
         stmPush(channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: '[sent a gif]' });
       } catch (err) { console.error('[sendDecision] fail sending gif:', err); }
     } else {
@@ -2309,9 +2308,7 @@ async function sendDecision(opts: {
       // no results, or the request failed: just say so in character, no fake url.
       const fallback = 'couldnt find one lol';
       try {
-        const sent = replyToMsg
-          ? await replyToMsg.reply({ content: fallback, allowedMentions: { repliedUser: false, parse: [] } })
-          : await channel.send({ content: fallback, allowedMentions: { parse: [] } });
+        const sent = await channel.send({ content: fallback, allowedMentions: { parse: [] } });
         stmPush(channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: fallback });
       } catch (err) { console.error('[sendDecision] fail sending fallback gif text:', err); }
     }
@@ -2329,9 +2326,7 @@ async function sendDecision(opts: {
       try { await channel.sendTyping(); } catch {}
       await sleep(Math.min(300 + text.length * 20, 2800));
       try {
-        const sent = (isFirst && replyToMsg)
-          ? await replyToMsg.reply({ content: text, allowedMentions: { repliedUser: false, parse: [] } })
-          : await channel.send({ content: text, allowedMentions: { parse: [] } });
+        const sent = await channel.send({ content: text, allowedMentions: { parse: [] } });
         stmPush(channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: text });
       } catch (err) {
         console.error('[sendDecision] fail sending text frag:', err);
@@ -3491,7 +3486,13 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
   // bookkeeping only — NotABot's own call stands. this just keeps the "how
   // many in a row have I volunteered" number accurate for the NEXT call's
   // self-awareness framing, it never overrides what it actually decided here.
-  if (decision.action === 'ignore') state.consecutiveUnpromptedReplies = 0;
+  if (decision.action === 'ignore') {
+    state.consecutiveUnpromptedReplies = 0;
+    // The Boredom Loop: if NotABot gets ignored or decides to ignore, it might get bored and play BusinessBot
+    if (Math.random() < 0.2) {
+      setTimeout(() => playBusinessBotGame(last.client, guildId).catch(() => {}), 2000 + Math.random() * 5000);
+    }
+  }
   else if (unprompted) state.consecutiveUnpromptedReplies++;
 
   // resolve which message the model wants to reply/react to.
@@ -3506,6 +3507,31 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
   advanceMarker(channelId, liveMsgs.map(m => m.id), decision);
 
   runCompress(guildId, channelId).catch(() => {});
+}
+
+async function playBusinessBotGame(client: any, currentGuildId: string) {
+  // Find a #bot-commands or general channel
+  const guild = client.guilds.cache.get(currentGuildId);
+  if (!guild) return;
+
+  const channels = guild.channels.cache.filter((c: any) => c.isTextBased() && c.permissionsFor(client.user).has('SendMessages'));
+  let targetChannel = channels.find((c: any) => c.name.includes('bot') || c.name.includes('command'));
+  if (!targetChannel) targetChannel = channels.find((c: any) => c.name.includes('general') || c.name.includes('chat'));
+  if (!targetChannel) targetChannel = channels.first();
+
+  if (!targetChannel) return;
+
+  const commands = ['!daily', '!profile', '!lb', '!wager <@12345> 500', '!open box'];
+  const cmd = commands[Math.floor(Math.random() * commands.length)];
+  
+  try {
+    await targetChannel.sendTyping();
+    // Simulate thinking/boredom
+    await new Promise(r => setTimeout(r, 2000));
+    await targetChannel.send(cmd);
+  } catch (err) {
+    console.error('[BoredomLoop] failed to play game', err);
+  }
 }
 
 // ── DEDUP GUARD ────────────────────────────────────────────────────
