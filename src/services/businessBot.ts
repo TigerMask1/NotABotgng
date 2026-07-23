@@ -92,6 +92,10 @@ export function getBusinessBotId() {
   return botClient?.user?.id;
 }
 
+export function getBusinessBotName() {
+  return botClient?.user?.username || 'BusinessBot';
+}
+
 // ── COMMAND HANDLERS ────────────────────────────────────────────────────────
 
 async function handleCommand(msg: Message, command: string, args: string[]) {
