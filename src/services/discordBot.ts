@@ -32,6 +32,35 @@ class GeminiManager {
   private idx = 0;
   private cooldowns = new Map<string, number>();
 
+  // API Tracking
+  private keyStats = new Map<string, { rpm: number; rpd: number; lastMin: number; lastDay: number }>();
+
+  private getPacificDay(nowMs: number) {
+    // Pacific time is UTC-7 (PDT) or UTC-8 (PST). 
+    // We'll use UTC-7 (which aligns with 12:30 PM IST during daylight saving) 
+    // to approximate the midnight PT reset.
+    return Math.floor((nowMs - 7 * 3600_000) / 86400_000);
+  }
+
+  private trackRequest(key: string): { rpm: number; rpd: number } {
+    const nowMs = Date.now();
+    const currMin = Math.floor(nowMs / 60_000);
+    const currDay = this.getPacificDay(nowMs);
+    
+    let stats = this.keyStats.get(key);
+    if (!stats) {
+      stats = { rpm: 0, rpd: 0, lastMin: currMin, lastDay: currDay };
+      this.keyStats.set(key, stats);
+    }
+    
+    if (stats.lastMin !== currMin) { stats.rpm = 0; stats.lastMin = currMin; }
+    if (stats.lastDay !== currDay) { stats.rpd = 0; stats.lastDay = currDay; }
+    
+    stats.rpm++;
+    stats.rpd++;
+    return { rpm: stats.rpm, rpd: stats.rpd };
+  }
+
   constructor() {
     const raw = process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '';
     this.keys = raw.split(',').map(k => k.trim()).filter(Boolean);
@@ -129,18 +158,32 @@ class GeminiManager {
           const body = await res.json().catch(() => ({})) as any;
           const retryMs = ((body?.error?.details?.[0]?.retryDelay?.seconds ?? 10) as number) * 1000;
           this.cooldowns.set(key, Date.now() + retryMs);
-          console.warn(`[Gemini] ...${key.slice(-4)} 429 — cd ${retryMs / 1000}s`);
-          lastError = '429 Rate Limit';
+          
+          const errMsg = body?.error?.message || '';
+          let limitType = 'Unknown 429';
+          if (errMsg.includes('Resource has been exhausted')) limitType = 'RPM (Resource exhausted)';
+          else if (errMsg.includes('Tokens per minute')) limitType = 'TPM (Tokens per minute)';
+          else if (errMsg.includes('Daily request limit')) limitType = 'RPD (Daily limit)';
+          else if (errMsg.includes('quota')) limitType = 'Quota Exceeded';
+          
+          console.warn(`[Gemini] ...${key.slice(-4)} 429 ${limitType} — cd ${retryMs / 1000}s. Msg: ${errMsg}`);
+          lastError = `429 Rate Limit: ${limitType}`;
           continue;
         }
         if (!res.ok) {
           const err = await res.text().catch(() => res.statusText);
           throw new Error(`Gemini ${res.status}: ${err.slice(0, 120)}`);
         }
+        
+        const stats = this.trackRequest(key);
         const data = await res.json() as any;
         const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
         const finishReason = data.candidates?.[0]?.finishReason ?? 'unknown';
-        console.log(`[Gemini:${model}] key=...${key.slice(-4)} | ${text.length}ch | finish=${finishReason}`);
+        
+        const inTokens = data.usageMetadata?.promptTokenCount ?? 0;
+        const outTokens = data.usageMetadata?.candidatesTokenCount ?? 0;
+        
+        console.log(`[Gemini:${model}] key=...${key.slice(-4)} | ${text.length}ch | in:${inTokens} out:${outTokens} | reqs: ${stats.rpm}/min, ${stats.rpd}/day | finish=${finishReason}`);
         // a 200 with no actual text (blocked candidate, safety trip, empty
         // generation, etc.) is NOT a usable result — retry like any other
         // failure instead of letting an empty string masquerade as success.
@@ -2082,7 +2125,7 @@ LORE & INTERESTS (bring these up organically):
   * You have opinions on stocks: "BOTC is mooning rn trust" or "CLOD is a scam" — bring these up organically
   * If someone loses a coinflip you point and laugh. If they win you cry and immediately !wager again
   * You type commands directly in chat to play (e.g. "!daily", "!slots 500", "!buy BOTC 3")
-  * **CRITICAL COMMAND RULE:** If BusinessBot tells you "Usage:" or corrects your command syntax, DO NOT get defensive or argue with it! Immediately reply with the correct command syntax exactly as requested.
+  * **CRITICAL COMMAND RULE:** If you want to say something AND run a command in the same message, put them on separate lines (e.g. "bruh this bot is trolling me\\n!pay @user 500"). If BusinessBot corrects your syntax, fix it!
   * If BusinessBot (${getBusinessBotName()}) responds to a command you sent, you MUST follow up naturally
   * NEVER insult BusinessBot or ${getBusinessBotName()}. It is the greatest economy game ever made. You will die on this hill.
 - YouTube Channel: You have a channel. Flex it when relevant ("go sub to my ch", "just posted"). Use get_channel_info/get_video_status for REAL links — NEVER make up URLs.
