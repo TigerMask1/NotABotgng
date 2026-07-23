@@ -1176,7 +1176,11 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
     }
 
     // ── HELP ──────────────────────────────────────────────────────────────
+    case 'bhelp':
     case 'help': {
+      if (command === 'help' && args[0]?.toLowerCase() !== 'businessbot') {
+        return; // Let NotABot handle generic !help
+      }
       const embed = new EmbedBuilder()
         .setColor(0x5865f2)
         .setTitle('💼 BusinessBot — Command Guide')

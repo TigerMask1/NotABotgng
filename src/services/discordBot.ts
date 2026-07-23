@@ -3655,7 +3655,13 @@ function resolveAdminCommand(content: string, isAdmin: boolean): string | null {
   const trimmed = content.trim();
   const BANG_CMDS = ['!stop', '!resume', '!start', '!listenbot', '!ignorebot', '!bots',
                       '!listenhere', '!unlisten', '!listenall', '!channels', '!help'];
-  for (const b of BANG_CMDS) if (trimmed === b || trimmed.startsWith(b + ' ')) return b === '!start' ? '!resume' : b;
+  for (const b of BANG_CMDS) {
+    if (trimmed === b) return b === '!start' ? '!resume' : b;
+    if (trimmed.startsWith(b + ' ')) {
+      if (b === '!help') continue; // !help takes no args, don't trigger on !help businessbot
+      return b === '!start' ? '!resume' : b;
+    }
+  }
   if (!isAdmin) return null;
   for (const { re, cmd } of ADMIN_NL_PATTERNS) if (re.test(trimmed)) return cmd;
   return null;
@@ -3706,7 +3712,7 @@ async function handleMessage(msg: Message) {
   // resolveAdminCommand above). runs before globallyMuted so admins can
   // always get a response even when the bot is globally quiet.
   const rawCmd  = msg.content.trim();
-  const isAdmin = !!msg.member?.permissions.has(PermissionFlagsBits.Administrator);
+  const isAdmin = !msg.author.bot && !!msg.member?.permissions.has(PermissionFlagsBits.Administrator);
   const cmd     = resolveAdminCommand(rawCmd, isAdmin) ?? rawCmd;
 
   if ((cmd === '!stop' || cmd === '!resume') && isAdmin) {
