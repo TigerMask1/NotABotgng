@@ -660,6 +660,24 @@ function resolveMentions(text: string): string {
   );
 }
 
+function getMessageText(msg: any): string {
+  let text = msg.content || '';
+  if (msg.embeds && msg.embeds.length > 0) {
+    const embedTexts = msg.embeds.map((e: any) => {
+      let parts = [];
+      if (e.title) parts.push(`[Embed Title: ${e.title}]`);
+      if (e.description) parts.push(e.description);
+      if (e.fields && e.fields.length > 0) {
+        parts.push(e.fields.map((f: any) => `${f.name}: ${f.value}`).join(' | '));
+      }
+      if (e.footer?.text) parts.push(`[Footer: ${e.footer.text}]`);
+      return parts.join('\n');
+    }).join('\n\n');
+    text = text ? `${text}\n\n${embedTexts}` : embedTexts;
+  }
+  return text;
+}
+
 function cleanContent(raw: string): string {
   return resolveMentions(raw).trim();
 }
@@ -3573,6 +3591,17 @@ async function playBusinessBotGame(client: any, currentGuildId: string) {
 
   if (!targetChannel) return;
 
+  let statsContext = '';
+  try {
+    const snap = await db.collection('businessUsers').doc(client.user.id).get();
+    if (snap.exists) {
+      const data = snap.data();
+      statsContext = `\n\nYOUR CURRENT BUSINESSBOT STATS:\n- Botcoin: 🪙 ${data?.botcoin || 0}\n- Inventory: ${JSON.stringify(data?.inventory || {})}\n- Daily Streak: ${data?.dailyStreak || 0}\n- Stocks: ${JSON.stringify(data?.stocks || {})}`;
+    }
+  } catch (e) {
+    console.error('Failed to fetch business bot stats for playBusinessBotGame', e);
+  }
+
   const systemPrompt = `IDENTITY: You are NotABot, a chronically online Discord chatter. You are currently bored and want to play the Discord economy game "BusinessBot".
 You must decide which command to type in the chat to play the game.
 
@@ -3586,7 +3615,7 @@ AVAILABLE COMMANDS:
 - !slots <amount> (Gamble on slots)
 - !buy <STOCK> <shares> (Buy stocks like BOTC, CLOD, GRLX)
 - !sell <STOCK> <shares> (Sell stocks)
-- !portfolio (Check your stocks)
+- !portfolio (Check your stocks)${statsContext}
 
 OUTPUT: RAW JSON ONLY. No markdown.
 {
@@ -3672,7 +3701,6 @@ async function handleMessage(msg: Message) {
   if (msg.partial) {
     try { msg = await msg.fetch(); } catch { return; }
   }
-  if (!msg.content?.trim()) return;
   if (msg.author.id === BOT_ID) return; // never react to ourselves
   if (msg.author.bot) {
     if (msg.author.id === getBusinessBotId()) {
@@ -3693,7 +3721,10 @@ async function handleMessage(msg: Message) {
   // never in the channel it was said in. deliberately unconditional — runs
   // before mute checks, mode checks, everything. not part of the brain
   // pipeline at all, just a flat string match + a DM.
-  if (msg.content.trim().toLowerCase() === 'wiki waka tiki') {
+  const textContent = getMessageText(msg);
+  if (!textContent.trim()) return; // completely empty message
+
+  if (textContent.trim().toLowerCase() === 'wiki waka tiki') {
     msg.author.send('tiki waka wiki').catch(() => {
       // couldn't DM them (DMs closed etc) — fall back to the channel so the
       // easter egg doesn't just silently do nothing.
@@ -3711,7 +3742,7 @@ async function handleMessage(msg: Message) {
   // either with the exact "!command" or by just saying it naturally (see
   // resolveAdminCommand above). runs before globallyMuted so admins can
   // always get a response even when the bot is globally quiet.
-  const rawCmd  = msg.content.trim();
+  const rawCmd  = textContent.trim();
   const isAdmin = !msg.author.bot && !!msg.member?.permissions.has(PermissionFlagsBits.Administrator);
   const cmd     = resolveAdminCommand(rawCmd, isAdmin) ?? rawCmd;
 
@@ -3846,7 +3877,7 @@ async function handleMessage(msg: Message) {
     const mentioned   = BOT_ID ? msg.mentions.has(BOT_ID) : false;
     const everyonePing = msg.mentions.everyone ?? false;
     const sender      = msg.member?.displayName || msg.author.username;
-    const rawContent  = cleanContent(msg.content);
+    const rawContent  = cleanContent(textContent);
     const content     = await buildEnrichedContent(msg, rawContent);
     const channelName = (msg.channel as any).name ?? 'unknown';
 
