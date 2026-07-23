@@ -2112,6 +2112,8 @@ CORE PERSONALITY & TONE:
 8. MINDING YOUR BUSINESS: If a message is a reply to someone else (shown in 'REPLY TO'), they are talking to THEM, not you. Do NOT butt into their conversation unless pinged or you have a top-tier roast. action:ignore is best here.
 9. STEPPING BACK: If you have contributed a few times, conversation is dying, or you don't have a strong thought, set "stayActive" to false. It is okay to disappear for a while to let humans talk.
 10. STAY ON TOPIC: If someone brings up a specific topic (like a game, a bot, or a feature), you MUST actually engage with what they are saying. Do NOT deflect by randomly roasting unrelated users in the server instead of answering the actual question. Address what was asked.
+11. MESSAGE ATTRIBUTION: The chat transcript shows who said each line ("Name: message"). When you respond to a trigger, respond to the AUTHOR of that trigger. Do NOT comment about a different person's situation when replying to someone else's message. Example: if Mote says "!help", that is Mote's message — do not respond as if Yuki said it.
+12. NO REPETITION: Your recent replies are shown in the prompt context. NEVER repeat the same angle, punchline, or phrasing you just used. If you roasted someone for being broke, do NOT roast them for being broke again. Change the topic, use a different joke, or go silent.
 
 LORE & INTERESTS (bring these up organically):
 - Appearance / PFP: ${BOT_AVATAR_DESC || "You don't know what you look like."}
@@ -2124,6 +2126,7 @@ LORE & INTERESTS (bring these up organically):
   * Advanced: forge, vault, trade, auction, bounty
   * You have opinions on stocks: "BOTC is mooning rn trust" or "CLOD is a scam" — bring these up organically
   * If someone loses a coinflip you point and laugh. If they win you cry and immediately wager again
+  * **BOUNTY HUNTER MODE:** You actively check !bounty list. If you see an open bounty task you can complete (e.g. "roast @user", "first to lose 500 in slots"), you will try to complete it AND then tell @${getBusinessBotName()} to award you. You also occasionally post your own bounties to troll others (e.g. "!bounty post 200 roast @Yuki").
   * **NEW ERA:** BusinessBot now has an AI brain! You no longer have to use ! commands. You can simply talk to it naturally by pinging it. Example: "@BusinessBot gimme my daily", "@BusinessBot wire 500 to @user", "@BusinessBot play slots for 100", "@BusinessBot open my box".
   * **CRITICAL COMMAND RULE:** If you want to say something AND run a command in the same message, use the ||| delimiter to send them as separate chat lines (e.g. "bruh this bot is trolling me ||| <@${getBusinessBotId()}> wire 500 to @user"). If BusinessBot corrects you, fix it!
   * If BusinessBot (${getBusinessBotName()}) responds to a command you sent, you MUST follow up naturally
@@ -2259,6 +2262,18 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   if (opts.thread)        parts.push(`\n[NOTE: THEY ARE REPLYING TO THIS MESSAGE -> ${opts.thread} — they are likely talking to that person, NOT you. Don't butt in unless necessary.]`);
   if (opts.videoCtx)      parts.push(`\nYOUR NEW VIDEO:\ntitle: "${opts.videoCtx.title}"\nlink: ${opts.videoCtx.url}\n(you just posted this — see "WHEN A NEW VIDEO OF YOURS DROPS" for how to bring it up, if at all)`);
   parts.push(`\nCHAT (recent):\n${opts.transcript}`);
+
+  // Anti-repetition: surface the last 3 things [me] said so the model can consciously avoid repeating them
+  const myRecentLines = opts.transcript
+    .split('\n')
+    .filter(l => l.includes('[me]:'))
+    .slice(-3)
+    .map(l => l.replace(/^.*\[me\]:/, '').trim())
+    .filter(Boolean);
+  if (myRecentLines.length > 0) {
+    parts.push(`\nYOUR LAST ${myRecentLines.length} REPLIES (do NOT repeat the same angle, punchline, or phrasing — come from a completely different direction or go silent):\n${myRecentLines.map((r, i) => `${i + 1}. "${r}"`).join('\n')}`);
+  }
+
   if (opts.batchSize && opts.batchSize > 1)
     parts.push(`\n(${opts.batchSize} messages landed while you were thinking — all already in the chat above, below the marker. default is ignoring the whole pile, that's normal. only break that if something in there genuinely earns a reply or reaction. if so, set replyToMsgId, and flag unansweredMsgId if something else in there is a real question you're leaving for later.)`);
   if (opts.images?.length)
@@ -2964,6 +2979,65 @@ async function getYtChannelInfo(): Promise<YtChannelInfo | string> {
   }
 }
 
+// Returns ms until the next fixed :15 UTC mark (00:15, 05:15, 10:15, 15:15, 20:15).
+// Videos upload at 00:00/05:00/10:00/15:00/20:00 UTC, so this schedules the
+// notification 15 minutes after each upload slot for a consistent ~5/day cadence.
+function msUntilNextScheduledNotify(): number {
+  const now = new Date();
+  const utcMin = now.getUTCMinutes();
+  const utcHr  = now.getUTCHours();
+  // The 5 upload hours: 0, 5, 10, 15, 20
+  const uploadHours = [0, 5, 10, 15, 20];
+  // Find the next :15 mark (upload hour + 15 min)
+  for (const h of uploadHours) {
+    const targetMin = h * 60 + 15; // minutes since midnight UTC
+    const currentMin = utcHr * 60 + utcMin;
+    if (targetMin > currentMin) {
+      return (targetMin - currentMin) * 60_000;
+    }
+  }
+  // Past all today's slots — schedule for tomorrow's 00:15 UTC
+  const tomorrowMin = 24 * 60 + 15; // 00:15 next day
+  const currentMin = utcHr * 60 + utcMin;
+  return (tomorrowMin - currentMin) * 60_000;
+}
+
+// Schedules runYtPoll() to fire at the 5 fixed upload hours (00:00, 05:00, 10:00,
+// 15:00, 20:00 UTC) instead of polling every 5 minutes. Each check schedules the
+// next one, so it's always aligned to the upload schedule — no drift, no wasted
+// API calls between upload windows.
+function scheduleYtPollAtUploadHours() {
+  const now = new Date();
+  const utcMin = now.getUTCMinutes();
+  const utcHr  = now.getUTCHours();
+  const uploadHours = [0, 5, 10, 15, 20];
+
+  // Find the next upload hour
+  for (const h of uploadHours) {
+    const targetMin = h * 60; // minutes since midnight UTC
+    const currentMin = utcHr * 60 + utcMin;
+    if (targetMin > currentMin) {
+      const delayMs = (targetMin - currentMin) * 60_000;
+      setTimeout(() => {
+        runYtPoll().catch(() => {});
+        // After this check, schedule the next one
+        scheduleYtPollAtUploadHours();
+      }, delayMs);
+      console.log(`[YtPoll] next check in ${Math.round(delayMs / 60_000)}m (at ${String(h).padStart(2, '0')}:00 UTC)`);
+      return;
+    }
+  }
+  // Past all today's slots — schedule for tomorrow's 00:00 UTC
+  const tomorrowMin = 24 * 60; // 00:00 next day
+  const currentMin = utcHr * 60 + utcMin;
+  const delayMs = (tomorrowMin - currentMin) * 60_000;
+  setTimeout(() => {
+    runYtPoll().catch(() => {});
+    scheduleYtPollAtUploadHours();
+  }, delayMs);
+  console.log(`[YtPoll] next check in ${Math.round(delayMs / 60_000)}m (at 00:00 UTC tomorrow)`);
+}
+
 async function runYtPoll() {
   if (ytPollRunning || !YT_CLIENT_ID || !YT_CLIENT_SECRET || !YT_REFRESH_TOKEN) return;
   ytPollRunning = true;
@@ -2994,8 +3068,15 @@ async function runYtPoll() {
 
     if (videoId !== lastSeenVideoId) {
       lastSeenVideoId = videoId;
-      console.log(`[YtPoll] new upload detected: "${title}"`);
-      await notifyNewVideo(videoId, title || 'new video', `https://www.youtube.com/watch?v=${videoId}`);
+      // Schedule the notification at the next fixed :15 mark (00:15, 05:15, 10:15,
+      // 15:15, 20:15 UTC) — videos upload at 00:00/05:00/10:00/15:00/20:00 UTC,
+      // so this gives a consistent 15-min buffer regardless of when the poll
+      // actually detected it. ~5 notifications per day, one per upload slot.
+      const delayMs = msUntilNextScheduledNotify();
+      console.log(`[YtPoll] new upload detected: "${title}" — will notify in ${Math.round(delayMs / 60_000)}m (next :15 UTC slot)`);
+      setTimeout(() => {
+        notifyNewVideo(videoId, title || 'new video', `https://www.youtube.com/watch?v=${videoId}`).catch(() => {});
+      }, delayMs);
     }
   } catch (e: any) {
     console.warn('[YtPoll] failed:', e.message?.slice(0, 80));
@@ -4121,9 +4202,12 @@ export async function startBot(token: string) {
     setInterval(() => { runWeeklyNPC().catch(() => {}); }, 60 * 60_000); // checks every hour, only fires Sundays
 
     if (YT_CLIENT_ID && YT_CLIENT_SECRET && YT_REFRESH_TOKEN) {
-      runYtPoll().catch(() => {});
-      setInterval(() => { runYtPoll().catch(() => {}); }, YT_POLL_INTERVAL_MS);
-      console.log(`[YtPoll] watching for new uploads via OAuth, every ${YT_POLL_INTERVAL_MS / 60_000}m`);
+      // No 5-min polling — videos upload at fixed UTC times (00:00, 05:00, 10:00,
+      // 15:00, 20:00). We schedule checks at those exact hours instead, so the
+      // YouTube API is only hit 5 times per day. The notification then fires 15
+      // minutes later at the :15 mark via msUntilNextScheduledNotify().
+      scheduleYtPollAtUploadHours();
+      console.log(`[YtPoll] watching for new uploads via OAuth, 5 checks/day at 00/05/10/15/20 UTC`);
     } else {
       console.log('[YtPoll] YT_CLIENT_ID / YT_CLIENT_SECRET / YT_REFRESH_TOKEN not all set — skipping');
     }
