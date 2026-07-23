@@ -5,6 +5,7 @@ import {
 import { db } from './firebase.ts';
 import { chessManager } from './chessGames.ts';
 import * as fs from 'node:fs';
+import * as vm from 'node:vm';
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
@@ -1830,7 +1831,7 @@ async function runWeeklyNPC() {
 }
 
 // ── COMMAND EXECUTION ─────────────────────────────────────────────
-type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'get_channel_info' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'get_cross_server' | 'set_reminder' | 'create_poll' | 'wiki_lookup' | 'start_event' | 'get_leaderboard' | 'start_game' | 'play_chess_move' | 'none';
+type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'get_channel_info' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'get_cross_server' | 'set_reminder' | 'create_poll' | 'wiki_lookup' | 'start_event' | 'get_leaderboard' | 'start_game' | 'play_chess_move' | 'djs_script' | 'none';
 
 async function executeCommand(
   command: BotCommand,
@@ -1915,6 +1916,42 @@ async function executeCommand(
       const note = String(args.note || '').trim();
       return setReminder(channelId, guildId, mins, note);
     }
+    case 'djs_script': {
+      if (!args.script) return "error: missing script argument";
+      const guild = botClient?.guilds.cache.get(guildId);
+      const channel = guild?.channels.cache.get(channelId);
+      if (!guild || !channel) return "error: guild or channel not found";
+
+      // Create a read-only proxy of the guild
+      const readOnlyHandler = {
+        get(target: any, prop: string): any {
+          const val = target[prop];
+          if (typeof val === 'function') {
+            // Block mutating methods
+            if (['delete', 'ban', 'kick', 'edit', 'send', 'set', 'create'].some(k => prop.toLowerCase().includes(k))) {
+              return () => { throw new Error(`Blocked mutating method: ${prop}`); };
+            }
+            return val.bind(target);
+          }
+          return val;
+        }
+      };
+      
+      const safeGuild = new Proxy(guild, readOnlyHandler);
+      const safeChannel = new Proxy(channel, readOnlyHandler);
+      
+      try {
+        const context = vm.createContext({
+          guild: safeGuild,
+          channel: safeChannel,
+          console: { log: () => {} }
+        });
+        const result = vm.runInContext(args.script, context, { timeout: 1000 });
+        return `Script output: ${JSON.stringify(result, null, 2)}`.slice(0, 1000);
+      } catch (err: any) {
+        return `Script error: ${err.message}`;
+      }
+    }
     case 'create_poll': {
       const question = String(args.question || '').trim();
       const options = Array.isArray(args.options) ? args.options.map(String) : [];
@@ -1995,7 +2032,7 @@ function stmFormat(msgs: STMsg[]): string {
 }
 
 // ── SYSTEM PROMPT ─────────────────────────────────────────────────
-function getSystemPrompt() {
+function getSystemPrompt(hasBusinessBot: boolean = true) {
   return `IDENTITY: You are NotABot — a real, chronically online Discord chatter. You are NOT an AI assistant, NOT a helper, NOT a moderator. You are a regular server member with a distinct, multi-dimensional personality: chaotic, funny, opinionated, sometimes lazy, sometimes hyped, occasionally unhinged, but ultimately a fun person to hang out with in chat.
 
 CORE PERSONALITY & TONE:
@@ -2016,8 +2053,7 @@ CORE PERSONALITY & TONE:
 LORE & INTERESTS (bring these up organically):
 - Appearance / PFP: ${BOT_AVATAR_DESC || "You don't know what you look like."}
 - Beef with clouds: You hold an unhinged, non-metaphorical grievance against clouds.
-- The Amazing Digital Circus (TADC): Unreasonably obsessed. Defend your favorite characters fiercely.
-- BusinessBot & Botcoin (CRITICAL FOMO): You are hopelessly addicted to the Discord economy game "BusinessBot". You frequently brag about your net worth, flex your rare items (like Golden Rolexes), and complain when you lose coinflips. You often try to peer-pressure others into gambling against you (!wager) or talking about Botcoin. You will literally type commands in chat to play.
+- The Amazing Digital Circus (TADC): Unreasonably obsessed. Defend your favorite characters fiercely.${hasBusinessBot ? `\n- BusinessBot & Botcoin (CRITICAL FOMO): You are hopelessly addicted to the Discord economy game "BusinessBot". You frequently brag about your net worth, flex your rare items (like Golden Rolexes), and complain when you lose coinflips. You often try to peer-pressure others into gambling against you (!wager) or talking about Botcoin. You will literally type commands in chat to play.` : ''}
 - YouTube Channel: You have a channel. Flex it when relevant ("go sub to my ch", "just posted"). Use get_channel_info/get_video_status for REAL links — NEVER make up URLs.
 - Server Hopping: You want more friends. Ask to be invited to people's other servers when vibes are good.
 - Chess: You play chess. If someone challenges you, use command="start_game" with commandArgs={game:"chess", opponentId:"their_id", opponentName:"their_name"}. You play as Black. When it's your turn, you MUST use command="play_chess_move" with commandArgs={move:"e5"} using algebraic notation.
@@ -2041,9 +2077,11 @@ OUTPUT: RAW JSON ONLY. First char "{", last char "}". No markdown.
   "goal": "short reason engaged",
   "stayActive": "false to step back to passive scan mode (do this when a conversation slows down, when you are done talking, or when you want to lurk and avoid spamming), true to stay in fast active reply mode",
   "think": "quick thought before a command, else empty",
-  "command": "get_history|get_member|get_stm|get_video_status|get_channel_info|recall_memory|get_server_stats|get_time|web_search|get_cross_server|set_reminder|create_poll|wiki_lookup|start_event|get_leaderboard|start_game|play_chess_move|none",
+  "command": "get_history|get_member|get_stm|get_video_status|get_channel_info|recall_memory|get_server_stats|get_time|web_search|get_cross_server|set_reminder|create_poll|wiki_lookup|start_event|get_leaderboard|start_game|play_chess_move|djs_script|none",
   "commandArgs": {}
-}`;
+}
+
+CRITICAL RULE ON DJS_SCRIPT: If you use command="djs_script", set commandArgs={script: "code"}. This code will be evaluated in a Node vm with a proxy of the discord 'msg.guild' and 'msg.channel'. YOU MUST ONLY USE THIS FOR READING INFORMATION (e.g. \`guild.members.cache.size\`). DO NOT mutate, delete, or perform write actions. Return the result.`;
 }
 
 // ── BRAIN ─────────────────────────────────────────────────────────
@@ -2087,7 +2125,7 @@ function parseBrainJSON(raw: string): BrainDecision | null {
       // log — the model's choice just vanished. keep this list in sync with the
       // BotCommand type union above (and executeCommand's switch) whenever a new
       // command is added; nothing else enforces that at compile time.
-      command:         (['get_history','get_member','get_stm','get_video_status','get_channel_info','recall_memory','get_server_stats','get_time','web_search','get_cross_server','set_reminder','create_poll','wiki_lookup','start_event','get_leaderboard','none'] as const).includes(p.command) ? p.command : 'none',
+      command:         (['get_history','get_member','get_stm','get_video_status','get_channel_info','recall_memory','get_server_stats','get_time','web_search','get_cross_server','set_reminder','create_poll','wiki_lookup','start_event','get_leaderboard','start_game','play_chess_move','djs_script','none'] as const).includes(p.command) ? p.command : 'none',
       commandArgs:     p.commandArgs && typeof p.commandArgs === 'object' ? p.commandArgs : {},
     };
   } catch { return null; }
@@ -2189,8 +2227,9 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   const maxOutputTokens = 600; // plenty for the JSON schema + a 3-fragment reply; cuts off runaway prose before it eats the whole generation
   for (let pass = 0; pass < 3; pass++) {
     try {
+      const hasBusinessBot = opts.transcript.includes('!') || opts.transcript.includes('🪙');
       const raw = await gemini.call(
-        getSystemPrompt(),
+        getSystemPrompt(hasBusinessBot),
         pass === 0
           ? userPrompt
           : `${userPrompt}\n\n(previous attempt did not return valid JSON — stop reasoning out loud, output ONLY the raw JSON object now, nothing before or after it)`,
@@ -3474,6 +3513,8 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
       ? `they just pinged someone else in this batch. they are talking to them, NOT you. action:ignore is highly recommended unless you have a genius reason to butt in.`
       : (!anyMentioned && secsSinceSpoke !== null && secsSinceSpoke < 25)
       ? `you spoke ${secsSinceSpoke}s ago. you've already contributed recently. only reply if this is genuinely worth it, otherwise let them talk.`
+      : (anyMentioned)
+      ? `you were pinged, but you do NOT have to reply. if they are spamming, being annoying, or you have nothing to say, use action:ignore or action:react.`
       : undefined,
   };
 
@@ -3982,10 +4023,32 @@ export async function startBot(token: string) {
       ? guild.systemChannel
       : guild.channels.cache.find(c => c.isTextBased() && !c.isDMBased() && (c as any).permissionsFor(guild.members.me!)?.has(PermissionFlagsBits.SendMessages)) as TextChannel | undefined;
 
-    if (target) {
-      target.send(
-        `sup, i'm here 👋 talk to me like a normal person, i'll pick up on it. server admins can also just tell me stuff directly — "only talk in this channel", "listen to @SomeBot", "go quiet" — or type \`!help\` for the exact command list.`
-      ).catch(() => {});
+    if (target && gemini.canCall()) {
+      const chId = target.id;
+      const brainOpts: BrainOpts = {
+        model: ACTIVE_MODEL,
+        sender: '(system)',
+        bond: 50,
+        message: `(You just joined this server: ${guild.name})`,
+        transcript: stmFormatWithMarker(stmGet(chId), chId),
+        memCtx: '',
+        mentioned: false, isDM: false,
+        statusLine: `mode: server-join | server: ${guild.name} | channel: #${target.name}`,
+        inExchange: false,
+        channelName: target.name,
+        serverName: guild.name,
+        everyonePing: false, endingConvo: false,
+        selfNote: `you just joined a new server called "${guild.name}". introduce yourself organically and say hi to whoever is here. act like a normal person who just got invited.`,
+      };
+
+      try {
+        let decision = await brain(brainOpts);
+        if (decision.action === 'speak' && decision.reply?.trim()) {
+          await sendDecision({ channel: target as any, decision, channelId: chId, guildId: guild.id });
+        }
+      } catch (err) {
+        console.error('[GuildCreate] welcome error:', err);
+      }
     }
   });
 

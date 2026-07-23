@@ -18,6 +18,15 @@ interface Wager {
 }
 const pendingWagers = new Map<string, Wager>(); // key: `${toId}-${fromId}`
 
+interface Challenge {
+  id: string;
+  fromId: string;
+  toId: string;
+  amount: number;
+  terms: string;
+}
+const activeChallenges = new Map<string, Challenge>(); // key: challengeId
+
 interface Auction {
   itemId: string;
   sellerId: string;
@@ -428,6 +437,89 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
       break;
     }
 
+    case 'challenge': {
+      if (args.length < 3) {
+        msg.reply("Usage: `!challenge @user <amount> <terms>`"); return;
+      }
+      const targetMatch = args[0].match(/<@!?(\d+)>/);
+      if (!targetMatch) {
+        msg.reply("Please mention a user."); return;
+      }
+      const targetId = targetMatch[1];
+      const amount = parseInt(args[1], 10);
+      const terms = args.slice(2).join(' ');
+
+      if (isNaN(amount) || amount <= 0) {
+        msg.reply("Invalid amount."); return;
+      }
+      if (amount > userData.botcoin) {
+        msg.reply(`❌ You don't have enough 🪙 to bet that much! Balance: ${userData.botcoin}`); return;
+      }
+      if (targetId === userId) {
+        msg.reply("❌ You can't challenge yourself."); return;
+      }
+
+      // Check if target has enough to accept
+      const targetRef = db.collection('businessUsers').doc(targetId);
+      const targetSnap = await targetRef.get();
+      const targetData = targetSnap.data();
+      if (!targetData || targetData.botcoin < amount) {
+        msg.reply(`❌ <@${targetId}> does not have enough 🪙 to match this challenge!`); return;
+      }
+
+      // Deduct escrow from challenger now
+      userData.botcoin -= amount;
+      await saveUser(userId, userData);
+
+      const challengeId = Math.random().toString(36).substring(2, 8).toUpperCase();
+      activeChallenges.set(challengeId, {
+        id: challengeId, fromId: userId, toId: targetId, amount, terms
+      });
+      
+      msg.reply(`⚔️ **CHALLENGE ISSUED! [ID: ${challengeId}]** ⚔️\n<@${targetId}>! You have been challenged by ${username} for 🪙 **${amount}**.\n**Terms:** "${terms}"\n\n*(To accept, just start doing it. To surrender your 🪙 and let them win, type \`!yield ${challengeId}\`)*`);
+      break;
+    }
+
+    case 'yield': {
+      if (args.length < 1) {
+        msg.reply("Usage: `!yield <Challenge_ID>`"); return;
+      }
+      const challengeId = args[0].toUpperCase();
+      const challenge = activeChallenges.get(challengeId);
+
+      if (!challenge) {
+        msg.reply("❌ Invalid or finished challenge."); return;
+      }
+
+      if (userId !== challenge.toId && userId !== challenge.fromId) {
+        msg.reply("❌ You are not a part of this challenge."); return;
+      }
+
+      const winnerId = (userId === challenge.fromId) ? challenge.toId : challenge.fromId;
+      
+      // If the challenged person is yielding, deduct their money now
+      if (userId === challenge.toId) {
+        if (userData.botcoin < challenge.amount) {
+          msg.reply(`❌ You don't have enough 🪙 to pay the bet!`); return;
+        }
+        userData.botcoin -= challenge.amount;
+        await saveUser(userId, userData);
+      }
+
+      const winnerRef = db.collection('businessUsers').doc(winnerId);
+      const winnerSnap = await winnerRef.get();
+      let winnerData = winnerSnap.data()!;
+
+      // Winner gets their own bet back + the loser's bet
+      winnerData.botcoin += (challenge.amount * 2);
+      await saveUser(winnerId, winnerData);
+
+      activeChallenges.delete(challengeId);
+
+      msg.reply(`🏳️ **YIELD!** 🏳️\n<@${userId}> has surrendered!\n<@${winnerId}> wins the challenge and takes the 🪙 **${challenge.amount * 2}** pot!`);
+      break;
+    }
+
     case 'accept': {
       if (args.length < 1) {
         msg.reply("Usage: `!accept @user`"); return;
@@ -527,7 +619,9 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
               d.inventory[itemId] = (d.inventory[itemId] || 0) + 1;
               await ref.set(d);
             }
-            msg.channel.send(`🔨 Auction ended! No one bid on **${itemDef.name}**, it was returned to the seller.`);
+            if (msg.channel.isTextBased()) {
+              (msg.channel as any).send(`🔨 Auction ended! No one bid on **${itemDef.name}**, it was returned to the seller.`);
+            }
           } else {
             // Transfer item
             const ref = db.collection('businessUsers').doc(auction.highestBidder);
@@ -538,7 +632,9 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
               await ref.set(d);
             }
             // Give seller money (handled during bid)
-            msg.channel.send(`🔨 **SOLD!** 🔨\n**${itemDef.name}** goes to <@${auction.highestBidder}> for 🪙 **${auction.highestBid}**!`);
+            if (msg.channel.isTextBased()) {
+              (msg.channel as any).send(`🔨 **SOLD!** 🔨\n**${itemDef.name}** goes to <@${auction.highestBidder}> for 🪙 **${auction.highestBid}**!`);
+            }
           }
         }, 60000);
       }
@@ -610,6 +706,8 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
 \`!bounty post <amount> <task>\` - Post a bounty
 \`!bounty list\` - View bounties
 \`!bounty award @user <id>\` - Pay a bounty
+\`!challenge @user <amount> <terms>\` - Issue a 1v1 challenge
+\`!yield <id>\` - Surrender a challenge and pay out
 \`!auction start <item_id>\` - Sell an item
 \`!bid <item_id> <amount>\` - Bid on auction`);
       break;
