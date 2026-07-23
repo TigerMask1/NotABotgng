@@ -8,8 +8,9 @@ const PREFIX = '!';
 
 // Central bank limits
 const STARTER_GRANT = 1000;
+const FORGE_COST = 2000;
 
-// Temporary in-memory state for wagers
+// Temporary in-memory states
 interface Wager {
   fromId: string;
   toId: string;
@@ -17,8 +18,18 @@ interface Wager {
 }
 const pendingWagers = new Map<string, Wager>(); // key: `${toId}-${fromId}`
 
+interface Auction {
+  itemId: string;
+  sellerId: string;
+  highestBid: number;
+  highestBidder: string | null;
+  endTime: number;
+  channelId: string;
+}
+const activeAuctions = new Map<string, Auction>(); // key: itemId
+
 // Addictive Item Definitions
-const ITEMS = {
+let ITEMS: any = {
   'mystery_box': { name: 'Mystery Box 🎁', value: 0 },
   'golden_rolex': { name: 'Golden Rolex ⌚', value: 5000 },
   'trade_license': { name: 'Trade License 📜', value: 2000 },
@@ -88,17 +99,37 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
   if (!userData.inventory) userData.inventory = {};
   if (!userData.lastDaily) userData.lastDaily = 0;
 
+  // Fetch Global State (Custom Items, Bounties)
+  const globalRef = db.collection('businessGlobal').doc('state');
+  const globalSnap = await globalRef.get();
+  let globalState = globalSnap.data();
+  if (!globalState) {
+    globalState = { customItems: {}, bounties: {} };
+    await globalRef.set(globalState);
+  }
+  
+  // Merge custom items into local ITEMS dictionary for easy lookup
+  if (globalState.customItems) {
+    for (const [k, v] of Object.entries(globalState.customItems)) {
+      ITEMS[k] = v;
+    }
+  }
+
   // Helper to save user
   const saveUser = async (uid: string, data: any) => {
     // Recalculate net worth based on botcoin + items
     let itemValue = 0;
     for (const [itemKey, count] of Object.entries(data.inventory || {})) {
-      if ((ITEMS as any)[itemKey]) {
-        itemValue += ((ITEMS as any)[itemKey].value * (count as number));
+      if (ITEMS[itemKey]) {
+        itemValue += (ITEMS[itemKey].value * (count as number));
       }
     }
     data.netWorth = data.botcoin + itemValue;
     await db.collection('businessUsers').doc(uid).set(data, { merge: true });
+  };
+
+  const saveGlobal = async () => {
+    await globalRef.set(globalState);
   };
 
   switch (command) {
@@ -153,7 +184,7 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
         const legendaryItems = ['golden_rolex', 'ceo_title'];
         const wonItem = legendaryItems[Math.floor(Math.random() * legendaryItems.length)];
         userData.inventory[wonItem] = (userData.inventory[wonItem] || 0) + 1;
-        outcomeStr = `🔥 **LEGENDARY DROP!** 🔥 You unboxed a **${(ITEMS as any)[wonItem].name}**!`;
+        outcomeStr = `🔥 **LEGENDARY DROP!** 🔥 You unboxed a **${ITEMS[wonItem].name}**!`;
       } else if (roll < 0.251) { // 20% Rare Item / Botcoin
         if (Math.random() > 0.5) {
           userData.inventory['trade_license'] = (userData.inventory['trade_license'] || 0) + 1;
@@ -181,8 +212,8 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
       let invStr = '';
       for (const [key, count] of Object.entries(userData.inventory)) {
         if (count && (count as number) > 0) {
-          const itemDef = (ITEMS as any)[key];
-          if (itemDef) invStr += `- **${itemDef.name}** x${count}\n`;
+          const itemDef = ITEMS[key];
+          if (itemDef) invStr += `- **${itemDef.name}** (x${count}) \`[ID: ${key}]\`\n`;
         }
       }
       if (!invStr) invStr = "Your inventory is empty.";
@@ -208,6 +239,123 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
         rank++;
       });
       msg.reply(lbStr);
+      break;
+    }
+
+    case 'forge': {
+      if (args.length < 2) {
+        msg.reply(`Usage: \`!forge <emoji> <Name of item>\`\nCost: 🪙 **${FORGE_COST} Botcoin**`);
+        return;
+      }
+      if (userData.botcoin < FORGE_COST) {
+        msg.reply(`❌ You need 🪙 **${FORGE_COST} Botcoin** to forge a custom item.`);
+        return;
+      }
+
+      const emoji = args[0];
+      const name = args.slice(1).join(' ');
+      const itemId = `custom_${Date.now()}`;
+
+      // Deduct cost
+      userData.botcoin -= FORGE_COST;
+      
+      // Save global item definition
+      if (!globalState.customItems) globalState.customItems = {};
+      globalState.customItems[itemId] = {
+        name: `${name} ${emoji}`,
+        value: FORGE_COST, // Base value is what it cost to forge
+        creatorId: userId,
+        creatorName: username
+      };
+
+      // Give 1 copy to the creator
+      userData.inventory[itemId] = 1;
+
+      await Promise.all([saveGlobal(), saveUser(userId, userData)]);
+      
+      msg.reply(`⚒️ **ITEM FORGED!** ⚒️\nYou spent 🪙 ${FORGE_COST} to permanently inject **${name} ${emoji}** into the global economy! It has been added to your inventory.`);
+      break;
+    }
+
+    case 'bounty': {
+      const sub = args.shift()?.toLowerCase();
+      if (!sub) {
+        msg.reply("Usage: `!bounty post <amount> <task>`, `!bounty list`, `!bounty award @user <id>`"); return;
+      }
+
+      if (sub === 'list') {
+        const bounties = globalState.bounties || {};
+        let str = `📜 **WANTED: THE BOUNTY BOARD** 📜\n\n`;
+        let count = 0;
+        for (const [id, b] of Object.entries(bounties)) {
+          const bounty = b as any;
+          if (bounty.status === 'open') {
+            str += `**[ID: ${id}]** 🪙 **${bounty.amount}** - ${bounty.task} (by ${bounty.posterName})\n`;
+            count++;
+          }
+        }
+        if (count === 0) str += "No active bounties.";
+        msg.reply(str);
+      } 
+      else if (sub === 'post') {
+        const amount = parseInt(args[0], 10);
+        const task = args.slice(1).join(' ');
+        
+        if (isNaN(amount) || amount <= 0 || !task) {
+          msg.reply("Usage: `!bounty post <amount> <task>`"); return;
+        }
+        if (userData.botcoin < amount) {
+          msg.reply(`❌ You don't have enough 🪙 to post this bounty!`); return;
+        }
+
+        // Deduct escrow
+        userData.botcoin -= amount;
+        
+        const bountyId = Math.random().toString(36).substring(2, 6).toUpperCase();
+        if (!globalState.bounties) globalState.bounties = {};
+        globalState.bounties[bountyId] = {
+          amount, task, posterId: userId, posterName: username, status: 'open'
+        };
+
+        await Promise.all([saveGlobal(), saveUser(userId, userData)]);
+        msg.reply(`📜 **BOUNTY POSTED [ID: ${bountyId}]**\nYou locked up 🪙 **${amount}**. Anyone can claim it by doing the task and pinging you!`);
+      }
+      else if (sub === 'award') {
+        const targetMatch = args[0]?.match(/<@!?(\d+)>/);
+        const bountyId = args[1]?.toUpperCase();
+        
+        if (!targetMatch || !bountyId) {
+          msg.reply("Usage: `!bounty award @user <Bounty_ID>`"); return;
+        }
+        const targetId = targetMatch[1];
+        const bounty = (globalState.bounties || {})[bountyId];
+        
+        if (!bounty || bounty.status !== 'open') {
+          msg.reply("❌ Invalid or closed bounty ID."); return;
+        }
+        if (bounty.posterId !== userId) {
+          msg.reply("❌ Only the person who posted the bounty can award it."); return;
+        }
+
+        const targetRef = db.collection('businessUsers').doc(targetId);
+        const targetSnap = await targetRef.get();
+        let targetData = targetSnap.data();
+        if (!targetData) {
+          targetData = { botcoin: 0, username: 'Unknown', granted: false, netWorth: 0, inventory: {}, lastDaily: 0 };
+        }
+
+        // Payout
+        bounty.status = 'closed';
+        targetData.botcoin += bounty.amount;
+
+        await Promise.all([
+          saveGlobal(),
+          saveUser(targetId, targetData),
+          // no need to save userData, the escrow was already deducted
+        ]);
+
+        msg.reply(`💰 **BOUNTY CLAIMED!** 💰\n<@${targetId}> has been awarded 🪙 **${bounty.amount}** for completing the task: "${bounty.task}"!`);
+      }
       break;
     }
 
@@ -338,17 +486,132 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
       break;
     }
 
+    case 'auction': {
+      const sub = args.shift()?.toLowerCase();
+      if (sub === 'start') {
+        const itemId = args.join(' ');
+        if (!userData.inventory[itemId] || userData.inventory[itemId] <= 0) {
+          msg.reply(`❌ You don't have the item: ${itemId}`);
+          return;
+        }
+        
+        if (activeAuctions.has(itemId)) {
+          msg.reply(`❌ This item type is already up for auction! Wait for it to finish.`);
+          return;
+        }
+
+        // Temporarily deduct it
+        userData.inventory[itemId]--;
+        await saveUser(userId, userData);
+
+        const itemDef = ITEMS[itemId];
+        const startBid = Math.floor(itemDef.value / 2) || 10;
+        
+        activeAuctions.set(itemId, {
+          itemId, sellerId: userId, highestBid: startBid, highestBidder: null, endTime: Date.now() + 60000, channelId: msg.channelId
+        });
+
+        msg.reply(`🔨 **AUCTION STARTED!** 🔨\n${username} is auctioning a **${itemDef.name}**!\nStarting bid is 🪙 **${startBid}**.\nType \`!bid ${itemId} <amount>\` to bid! Auction ends in 60 seconds.`);
+        
+        setTimeout(async () => {
+          const auction = activeAuctions.get(itemId);
+          if (!auction) return;
+          activeAuctions.delete(itemId);
+
+          if (!auction.highestBidder) {
+            // Return item
+            const ref = db.collection('businessUsers').doc(auction.sellerId);
+            const dSnap = await ref.get();
+            let d = dSnap.data();
+            if (d) {
+              d.inventory[itemId] = (d.inventory[itemId] || 0) + 1;
+              await ref.set(d);
+            }
+            msg.channel.send(`🔨 Auction ended! No one bid on **${itemDef.name}**, it was returned to the seller.`);
+          } else {
+            // Transfer item
+            const ref = db.collection('businessUsers').doc(auction.highestBidder);
+            const dSnap = await ref.get();
+            let d = dSnap.data();
+            if (d) {
+              d.inventory[itemId] = (d.inventory[itemId] || 0) + 1;
+              await ref.set(d);
+            }
+            // Give seller money (handled during bid)
+            msg.channel.send(`🔨 **SOLD!** 🔨\n**${itemDef.name}** goes to <@${auction.highestBidder}> for 🪙 **${auction.highestBid}**!`);
+          }
+        }, 60000);
+      }
+      break;
+    }
+
+    case 'bid': {
+      const itemId = args[0];
+      const bidAmount = parseInt(args[1], 10);
+      
+      const auction = activeAuctions.get(itemId);
+      if (!auction) {
+        msg.reply(`❌ No active auction for ${itemId}`); return;
+      }
+      if (isNaN(bidAmount) || bidAmount <= auction.highestBid) {
+        msg.reply(`❌ You must bid higher than 🪙 ${auction.highestBid}`); return;
+      }
+      if (userData.botcoin < bidAmount) {
+        msg.reply(`❌ You don't have enough Botcoin for that bid!`); return;
+      }
+      if (auction.sellerId === userId) {
+        msg.reply(`❌ You cannot bid on your own auction.`); return;
+      }
+
+      // Return funds to previous bidder
+      if (auction.highestBidder) {
+        const prevRef = db.collection('businessUsers').doc(auction.highestBidder);
+        const prevSnap = await prevRef.get();
+        let prevData = prevSnap.data();
+        if (prevData) {
+          prevData.botcoin += auction.highestBid;
+          await prevRef.set(prevData);
+        }
+      }
+
+      // Deduct funds from new bidder and give to seller
+      userData.botcoin -= bidAmount;
+      
+      const sellerRef = db.collection('businessUsers').doc(auction.sellerId);
+      const sellerSnap = await sellerRef.get();
+      let sellerData = sellerSnap.data();
+      if (sellerData) {
+        sellerData.botcoin += bidAmount;
+        // if this was the first bid, we deduct the startBid which wasn't paid yet
+        if (auction.highestBidder) {
+          sellerData.botcoin -= auction.highestBid; 
+        }
+        await sellerRef.set(sellerData);
+      }
+
+      auction.highestBid = bidAmount;
+      auction.highestBidder = userId;
+      
+      await saveUser(userId, userData);
+      msg.reply(`💸 <@${userId}> takes the lead with a bid of 🪙 **${bidAmount}** for **${ITEMS[itemId].name}**!`);
+      break;
+    }
+
     case 'help': {
       msg.reply(`💼 **BusinessBot Free Market** 💼
-\`!grant\` - Claim your starter capital (Once)
-\`!daily\` - Claim your daily Mystery Box
-\`!open box\` - Open a Mystery Box
-\`!inv\` - View your items
-\`!profile\` - View stats & Net Worth
-\`!lb\` - View Global Leaderboard
+\`!grant\` - Claim starter capital
+\`!daily\` - Claim Mystery Box
+\`!open box\` - Open Mystery Box
+\`!inv\` - View items
+\`!lb\` - Global Leaderboard
+\`!wager @user <amount>\` - Coinflip
 \`!pay @user <amount>\` - Transfer funds
-\`!wager @user <amount>\` - Challenge someone to a coinflip
-\`!accept @user\` - Accept a wager`);
+\`!forge <emoji> <Name>\` - 2000🪙 Create a custom item
+\`!bounty post <amount> <task>\` - Post a bounty
+\`!bounty list\` - View bounties
+\`!bounty award @user <id>\` - Pay a bounty
+\`!auction start <item_id>\` - Sell an item
+\`!bid <item_id> <amount>\` - Bid on auction`);
       break;
     }
   }
