@@ -1274,9 +1274,9 @@ async function handleNaturalLanguage(msg: Message) {
 
   // Resolve all @mentioned users so the AI can use real Discord IDs in args
   const mentionedUsers: { id: string; name: string }[] = [];
-  for (const [id, member] of msg.mentions.members ?? []) {
+  for (const [id, user] of msg.mentions.users) {
     if (id === botClient!.user!.id) continue;
-    mentionedUsers.push({ id, name: member.displayName || member.user.username });
+    mentionedUsers.push({ id, name: user.username });
   }
   const mentionCtx = mentionedUsers.length
     ? mentionedUsers.map(u => u.name + '=<@' + u.id + '>').join(', ')
