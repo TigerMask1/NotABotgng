@@ -2195,7 +2195,6 @@ function parseBrainJSON(raw: string): BrainDecision | null {
     };
   } catch { return null; }
 }
-}
 
 interface BrainOpts {
   model:         string;
