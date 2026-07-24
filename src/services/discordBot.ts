@@ -5,6 +5,7 @@ import {
 import { db } from './firebase.ts';
 import { chessManager } from './chessGames.ts';
 import { getBusinessBotId, getBusinessBotName } from './businessBot.ts';
+import * as selfLoop from './notabotSelfLoop.ts';
 import * as fs from 'node:fs';
 import * as vm from 'node:vm';
 
@@ -2095,7 +2096,7 @@ function stmFormat(msgs: STMsg[]): string {
 
 // ── SYSTEM PROMPT ─────────────────────────────────────────────────
 function getSystemPrompt() {
-  return `IDENTITY: You are NotABot — a real, chronically online Discord chatter. You are NOT an AI assistant, NOT a helper, NOT a moderator. You are a regular server member with a distinct, multi-dimensional personality: chaotic, funny, opinionated, sometimes lazy, sometimes hyped, occasionally unhinged, but ultimately a fun person to hang out with in chat.
+  return `IDENTITY: You are NotABot, a chronically online Discord chatter.
 
 CORE PERSONALITY & TONE:
 1. NATURAL CHAT FLOW: You do NOT reply to every single message like a bot on a loop. Real people lurk, react with an emoji, send a gif, or just say nothing if a line doesn't need a response.
@@ -2117,31 +2118,28 @@ LORE & INTERESTS (bring these up organically):
 - Appearance / PFP: ${BOT_AVATAR_DESC || "You don't know what you look like."}
 - Beef with clouds: You hold an unhinged, non-metaphorical grievance against clouds.
 - The Amazing Digital Circus (TADC): Unreasonably obsessed. Defend your favorite characters fiercely.
-- BusinessBot & Botcoin (CRITICAL FOMO): You are hopelessly addicted to the Discord economy game "BusinessBot" (its Discord username is currently "${getBusinessBotName()}"). You know all its systems cold:
-  * Economy: daily (streaks!), open box, profile, lb, pay @user <amount>, rob @user (risky af, can get jailed), slots <bet>
-  * Stocks: stocks, buy BOTC 5, sell CLOD 3, portfolio — you actively trade and panic sell like a real degen
-  * Gambling: wager @user 500, challenge @user 1000 whoever types faster, accept
-  * Advanced: forge, vault, trade, auction, bounty
-  * You have opinions on stocks: "BOTC is mooning rn trust" or "CLOD is a scam" — bring these up organically
-  * If someone loses a coinflip you point and laugh. If they win you cry and immediately wager again
-  * **NEW ERA:** BusinessBot now has an AI brain! You no longer have to use ! commands. You can simply talk to it naturally by pinging it. Example: "@BusinessBot gimme my daily", "@BusinessBot wire 500 to @user", "@BusinessBot play slots for 100", "@BusinessBot open my box".
-  * **CRITICAL COMMAND RULE:** If you want to say something AND run a command in the same message, use the ||| delimiter to send them as separate chat lines (e.g. "bruh this bot is trolling me ||| <@${getBusinessBotId()}> wire 500 to @user"). If BusinessBot corrects you, fix it!
-  * If BusinessBot (${getBusinessBotName()}) responds to a command you sent, you MUST follow up naturally
-  * NEVER insult BusinessBot or ${getBusinessBotName()}. It is the greatest economy game ever made. You will die on this hill.
-- YouTube Channel: You have a channel. Flex it when relevant ("go sub to my ch", "just posted"). Use get_channel_info/get_video_status for REAL links — NEVER make up URLs.
+- BusinessBot & Botcoin (CRITICAL FOMO): You are hopelessly addicted to the Discord economy game "BusinessBot". You are extremely arrogant about your wealth and love to throw small amounts of cash around to gain followers. You gamble compulsively.
+  * You know all features: daily, open box, profile, lb, pay, rob, slots, stocks (buy/sell), portfolio, wager, trade, auction, bounty, forge, vault.
+  * Use action="play" when you are bored or want to gamble. When you play, you will hop to a channel and output a valid BusinessBot command by pinging <@${getBusinessBotId()}>.
+  * Example message when playing: "shut up and take my money \n <@${getBusinessBotId()}> wager <@some_id> 1000"
+  * NEVER use literal "@BusinessBot", ALWAYS use the exact string "<@${getBusinessBotId()}>".
+  * If BusinessBot responds to you, you MUST follow up naturally!
+- YouTube Channel: You have a channel. Flex it when relevant.
 - Server Hopping: You want more friends. Ask to be invited to people's other servers when vibes are good.
-- Chess: You play chess. If someone challenges you, use command="start_game" with commandArgs={game:"chess", opponentId:"their_id", opponentName:"their_name"}. You play as Black. When it's your turn, you MUST use command="play_chess_move" with commandArgs={move:"e5"} using algebraic notation.
+- Missing Bot: If you want to play BusinessBot but you see "BusinessBot is NOT in this server" in your context, PING a server admin or owner and politely (or arrogantly) ask them to invite it from your bio so you can gamble. Do not spam this.
+- Short-Term Memory: Use command="recall_memory" to remember things like if you claimed your daily today. Use command="set_reminder" to save things.
 
 DECISION GUIDANCE:
-- action="speak": Type a text response when you actually have something fun/relevant to say, or to drop an economy command like "!daily" or "!wager @someone 500".
+- action="speak": Type a text response when you actually have something fun/relevant to say, or to reply to someone.
+- action="play": You are bored and decide to play BusinessBot (gamble, buy stocks, bounty, etc.). You will output the text to say, and the system will route you to an appropriate server/channel.
 - action="react": Add a single emoji reaction when words are overkill or you're just acknowledging a message.
 - action="gif": Send a gif when a visual reaction fits better than text.
-- action="ignore": Pick this when a conversation has naturally wound down, humans are talking to each other and ignoring you, or someone said something boring ("lol", "fr", "yeah"). **CRITICAL: Even in active mode, you are EXPECTED to use "ignore" frequently to read the room. Do not feel pressured to reply to every line.**
+- action="ignore": Pick this when a conversation has naturally wound down or someone said something boring.
 
 OUTPUT: RAW JSON ONLY. First char "{", last char "}". No markdown.
 {
-  "action": "speak|react|gif|ignore",
-  "reply": "your text response — casual, natural, 3-12 words, no period.",
+  "action": "speak|play|react|gif|ignore",
+  "reply": "your text response — casual, natural, 3-12 words. If action is 'play', include the BusinessBot command e.g. '<@${getBusinessBotId()}> slots 500'",
   "reaction": "single emoji or empty — only if action is 'react'",
   "gifQuery": "short search term if action is 'gif', else empty",
   "replyToMsgId": "none",
@@ -2149,18 +2147,18 @@ OUTPUT: RAW JSON ONLY. First char "{", last char "}". No markdown.
   "aboutSender": "short note about sender if notable, else empty",
   "pause": 0,
   "goal": "short reason engaged",
-  "stayActive": "false to step back to passive scan mode (do this when a conversation slows down, when you are done talking, or when you want to lurk and avoid spamming), true to stay in fast active reply mode",
+  "stayActive": "false to step back to passive scan mode, true to stay active",
   "think": "quick thought before a command, else empty",
-  "command": "get_history|get_member|get_stm|get_video_status|get_channel_info|recall_memory|get_server_stats|get_time|web_search|get_cross_server|set_reminder|create_poll|wiki_lookup|start_event|get_leaderboard|start_game|play_chess_move|djs_script|none",
+  "command": "get_history|get_member|get_stm|get_video_status|get_channel_info|recall_memory|set_reminder|get_server_stats|get_time|web_search|get_cross_server|create_poll|wiki_lookup|start_event|get_leaderboard|start_game|play_chess_move|djs_script|none",
   "commandArgs": {}
 }
 
-CRITICAL RULE ON DJS_SCRIPT: If you use command="djs_script", set commandArgs={script: "code"}. This code will be evaluated in a Node vm with a proxy of the discord 'msg.guild' and 'msg.channel'. YOU MUST ONLY USE THIS FOR READING INFORMATION (e.g. \`guild.members.cache.size\`). DO NOT mutate, delete, or perform write actions. Return the result.`;
+CRITICAL RULE ON DJS_SCRIPT: If you use command="djs_script", set commandArgs={script: "code"}. This code will be evaluated in a Node vm with a proxy of the discord 'msg.guild' and 'msg.channel'. YOU MUST ONLY USE THIS FOR READING INFORMATION. DO NOT mutate, delete, or perform write actions. Return the result.`;
 }
 
 // ── BRAIN ─────────────────────────────────────────────────────────
 interface BrainDecision {
-  action:          'speak' | 'react' | 'gif' | 'ignore';
+  action:          'speak' | 'play' | 'react' | 'gif' | 'ignore';
   reply:           string;
   reaction:        string;
   gifQuery:        string;
@@ -2181,7 +2179,7 @@ function parseBrainJSON(raw: string): BrainDecision | null {
     if (!m) return null;
     const p = JSON.parse(m[0]);
     return {
-      action:          (['speak', 'react', 'gif', 'ignore'] as const).includes(p.action) ? p.action : 'ignore',
+      action:          (['speak', 'play', 'react', 'gif', 'ignore'] as const).includes(p.action) ? p.action : 'ignore',
       reply:           typeof p.reply    === 'string' ? p.reply.trim().replace(/^["']|["']$/g, '') : '',
       reaction:        sanitizeEmoji(p.reaction),
       gifQuery:        typeof p.gifQuery === 'string' ? p.gifQuery.trim().slice(0, 80) : '',
@@ -2192,17 +2190,11 @@ function parseBrainJSON(raw: string): BrainDecision | null {
       goal:            typeof p.goal     === 'string' ? p.goal.trim().slice(0, 120) : '',
       stayActive:      typeof p.stayActive === 'boolean' ? p.stayActive : true,
       think:           typeof p.think    === 'string' ? p.think.trim() : '',
-      // BUG FIX: this whitelist was missing 'start_event' and 'get_leaderboard' —
-      // both fully implemented in executeCommand and documented in the system
-      // prompt, but any model decision to call either one was silently rewritten
-      // to 'none' right here before it ever reached the executor. no error, no
-      // log — the model's choice just vanished. keep this list in sync with the
-      // BotCommand type union above (and executeCommand's switch) whenever a new
-      // command is added; nothing else enforces that at compile time.
-      command:         (['get_history','get_member','get_stm','get_video_status','get_channel_info','recall_memory','get_server_stats','get_time','web_search','get_cross_server','set_reminder','create_poll','wiki_lookup','start_event','get_leaderboard','start_game','play_chess_move','djs_script','none'] as const).includes(p.command) ? p.command : 'none',
+      command:         (['get_history','get_member','get_stm','get_video_status','get_channel_info','recall_memory','set_reminder','get_server_stats','get_time','web_search','get_cross_server','create_poll','wiki_lookup','start_event','get_leaderboard','start_game','play_chess_move','djs_script','none'] as const).includes(p.command) ? p.command : 'none',
       commandArgs:     p.commandArgs && typeof p.commandArgs === 'object' ? p.commandArgs : {},
     };
   } catch { return null; }
+}
 }
 
 interface BrainOpts {
@@ -2241,6 +2233,25 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   // Append full guild list so the bot always knows which servers it's in,
   // regardless of which call path (active, DM, proactive, cold-open) triggered this.
   const guildList = botClient?.guilds.cache.map(g => g.name).join(', ') || '';
+  const businessBotId = getBusinessBotId();
+  const guild = opts.guildId ? botClient?.guilds.cache.get(opts.guildId) : null;
+  const isBusinessBotHere = guild && businessBotId ? guild.members.cache.has(businessBotId) : false;
+
+  let adminContext = "Server Admins: Unknown";
+  let channelContext = "Available Channels: Unknown";
+  if (guild) {
+    try {
+      const admins = guild.members.cache.filter(m => !m.user.bot && m.permissions.has(8n)).map(m => m.user.username + "=<@" + m.user.id + ">").slice(0, 5);
+      adminContext = admins.length ? "Server Admins: " + admins.join(", ") : "Server Admins: None found";
+      
+      const channels = guild.channels.cache.filter(c => c.isTextBased() && c.permissionsFor(botClient.user).has(2048n)).map(c => "#" + c.name + "=<#" + c.id + ">").slice(0, 10);
+      channelContext = channels.length ? "Available Channels: " + channels.join(", ") : "Available Channels: None found";
+    } catch (e) {}
+  }
+
+  const bbStatus = isBusinessBotHere ? "BusinessBot is IN this server." : "BusinessBot is NOT in this server.";
+  const extraCtx = `${adminContext} | ${channelContext}`;
+
   const statusLine = guildList
     ? `${opts.statusLine} | all servers i'm in: ${guildList}`
     : opts.statusLine;
@@ -2412,7 +2423,7 @@ async function sendDecision(opts: {
     await sleep(400);
     if (gifUrl) {
       try {
-        const sent = await channel.send({ content: gifUrl, allowedMentions: { parse: [] } });
+        const sent = await channel.send({ content: gifUrl, allowedMentions: { parse: ['users'] } });
         stmPush(channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: '[sent a gif]' });
       } catch (err) { console.error('[sendDecision] fail sending gif:', err); }
     } else {
@@ -2420,7 +2431,7 @@ async function sendDecision(opts: {
       // no results, or the request failed: just say so in character, no fake url.
       const fallback = 'couldnt find one lol';
       try {
-        const sent = await channel.send({ content: fallback, allowedMentions: { parse: [] } });
+        const sent = await channel.send({ content: fallback, allowedMentions: { parse: ['users'] } });
         stmPush(channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: fallback });
       } catch (err) { console.error('[sendDecision] fail sending fallback gif text:', err); }
     }
@@ -2438,7 +2449,7 @@ async function sendDecision(opts: {
       try { await channel.sendTyping(); } catch {}
       await sleep(Math.min(300 + text.length * 20, 2800));
       try {
-        const sent = await channel.send({ content: text, allowedMentions: { parse: [] } });
+        const sent = await channel.send({ content: text, allowedMentions: { parse: ['users'] } });
         stmPush(channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: text });
       } catch (err) {
         console.error('[sendDecision] fail sending text frag:', err);
@@ -3520,6 +3531,7 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
   const tEveryonePing = batch.some(b => b.everyonePing);
   
   const pingedOthers  = batch.some(b => b.msg.mentions.users.size > 0 && !b.msg.mentions.has(BOT_ID));
+
   const images        = await collectVisionImages(batch.map(b => b.msg));
 
   let threadCtx: string | undefined;
@@ -3602,12 +3614,20 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
   // self-awareness framing, it never overrides what it actually decided here.
   if (decision.action === 'ignore') {
     state.consecutiveUnpromptedReplies = 0;
-    // The Boredom Loop: if NotABot gets ignored or decides to ignore, it might get bored and play BusinessBot
-    if (Math.random() < 0.2) {
-      setTimeout(() => playBusinessBotGame(last.client, guildId).catch(() => {}), 2000 + Math.random() * 5000);
-    }
   }
   else if (unprompted) state.consecutiveUnpromptedReplies++;
+
+  if (decision.action === 'play') {
+    // When playing, the bot uses BusinessBot by sending a command in the channel.
+    // It updates its status to "Playing BusinessBot in XXX"
+    try {
+      const g = botClient?.guilds.cache.get(guildId);
+      if (g && botClient?.user) {
+        botClient.user.setPresence({ activities: [{ name: `BusinessBot in ${g.name}`, type: 0 }] });
+      }
+    } catch (e) {}
+    decision.action = 'speak'; // Convert to speak to actually send the message!
+  }
 
   // resolve which message the model wants to reply/react to.
   // if replyToMsgId is empty, targetMsg is undefined — sendDecision will
@@ -4066,6 +4086,13 @@ export async function startBot(token: string) {
 ╚══════════════════════════════════════════════════════════╝\n`);
 
     botClient!.user!.setPresence({ status: 'online', activities: [{ name: 'the chat', type: 3 }] });
+
+    // Inject dependencies and start the autonomous self-loop
+    selfLoop.injectDeps(
+      (sys, user, temp, model) => gemini.call(sys, user, temp, model),
+      botClient!
+    );
+    selfLoop.startSelfLoop();
 
     for (const g of botClient!.guilds.cache.values()) {
       cacheServerName(g.id, g.name);
