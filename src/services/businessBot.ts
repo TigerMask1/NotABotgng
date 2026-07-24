@@ -1292,6 +1292,11 @@ async function handleNaturalLanguage(msg: Message) {
   let promptText = msg.content.replace(new RegExp(`<@!?${botClient!.user!.id}>`, 'g'), '').trim();
   if (!promptText) promptText = "Hello!";
 
+  // Build current stock prices string for the AI
+  const stockPricesStr = Object.entries(STOCKS)
+    .map(([sym, s]) => `${sym}: 🪙 ${s.price}`)
+    .join(' | ');
+
   const systemPrompt = `You are BusinessBot, the personal wealth manager for the Free Market Discord economy game. 
 You act professional, slick, and slightly greedy. Your job is to parse the user's natural language request and execute the right game command, or answer their questions.
 
@@ -1300,6 +1305,9 @@ Name: ${username}
 Botcoin Balance: 🪙 ${userData.botcoin}
 Inventory: ${JSON.stringify(userData.inventory || {})}
 Stocks: ${JSON.stringify(userData.stocks || {})}
+
+CURRENT MARKET PRICES:
+${stockPricesStr}
 
 AVAILABLE COMMANDS TO EXECUTE:
 - 'daily': claim daily reward
@@ -1313,7 +1321,17 @@ AVAILABLE COMMANDS TO EXECUTE:
 - 'profile': check stats (args: [])
 - 'portfolio': check stocks (args: [])
 - 'shop': browse items (args: [])
+- 'stocks': view market prices (args: [])
+- 'market': same as stocks (args: [])
+- 'inv': view inventory (args: [])
+- 'inventory': same as inv (args: [])
 - 'lb': leaderboard (args: [])
+- 'leaderboard': same as lb (args: [])
+- 'bounty': manage bounties (args: ["subcommand", ...])
+- 'auction': manage auctions (args: ["subcommand", ...])
+- 'trade': propose a trade (args: ["@user", "item", "for", "item"])
+- 'forge': forge a custom item (args: ["<emoji>", "<Name>"])
+- 'vault': use a vault key (args: [])
 
 If the user wants to execute an action (e.g., "send @Bob 500", "gimme my daily", "open my box", "play slots for 100"), return a JSON object with:
 {
@@ -1334,12 +1352,44 @@ OUTPUT RAW JSON ONLY. No markdown wrapping.`;
     const response = await groq.call(systemPrompt, promptText);
     const parsed = JSON.parse(response.replace(/\`\`\`json/gi, '').replace(/\`\`\`/g, '').trim());
 
-    if (parsed.reply) {
+    // Only send the AI's conversational reply when it's a pure reply (no command execution)
+    // This prevents double messages like "Checking the market..." followed by the actual shop embed
+    if (parsed.action === 'reply' && parsed.reply) {
       await msg.reply(parsed.reply).catch(() => {});
     }
 
     if (parsed.action === 'execute_command' && parsed.command) {
       await handleCommand(msg, parsed.command, parsed.args || []);
+    }
+
+    // Fallback: if the AI returned a "not supported" reply but the user's message contains
+    // known command keywords, try to route to the right command
+    if (parsed.action === 'reply' && parsed.reply) {
+      const lowerPrompt = promptText.toLowerCase();
+      const commandKeywords: Record<string, string> = {
+        'bounty': 'bounty',
+        'shop': 'shop',
+        'stocks': 'stocks',
+        'market': 'stocks',
+        'portfolio': 'portfolio',
+        'inv': 'inv',
+        'inventory': 'inv',
+        'profile': 'profile',
+        'bal': 'profile',
+        'leaderboard': 'lb',
+        'lb': 'lb',
+        'trade': 'trade',
+        'auction': 'auction',
+        'forge': 'forge',
+        'vault': 'vault',
+      };
+
+      for (const [keyword, cmd] of Object.entries(commandKeywords)) {
+        if (lowerPrompt.includes(keyword)) {
+          await handleCommand(msg, cmd, []);
+          return;
+        }
+      }
     }
   } catch (e) {
     console.error('[BusinessBot] Groq parsing error', e);
