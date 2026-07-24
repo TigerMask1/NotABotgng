@@ -1047,29 +1047,55 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
 
       if (sub === 'list') {
         const bounties = globalState.bounties || {};
-        const embed = new EmbedBuilder().setColor(0xff0000).setTitle('ðŸ“œ WANTED: Bounty Board');
-        let any = false;
-        for (const [id, b] of Object.entries(bounties)) {
+        const openBounties = Object.entries(bounties).filter(([, b]) => (b as any).status === 'open');
+        const embed = new EmbedBuilder()
+          .setColor(0xff4444)
+          .setTitle('🎯 BOUNTY BOARD — WANTED')
+          .setDescription(openBounties.length === 0
+            ? '🦗 Board is empty. Post a bounty with `!bounty post <amount> <task>`.\n💡 Stuck on ideas? Try `!bounty suggest`!'
+            : `**${openBounties.length} active bounty${openBounties.length > 1 ? 'ies' : ''}** up for grabs. Complete a task and ask the poster to \`!bounty award <ID> @you\`.`);
+        for (const [id, b] of openBounties) {
           const bty = b as any;
-          if (bty.status !== 'open') continue;
-          embed.addFields({ name: `[${id}] ðŸª™ ${bty.amount.toLocaleString()}`, value: `${bty.task}\nâ€” posted by ${bty.posterName}` });
-          any = true;
+          embed.addFields({ name: `[${id}] 🪙 ${bty.amount.toLocaleString()} — posted by ${bty.posterName}`, value: `> ${bty.task}` });
         }
-        if (!any) embed.setDescription('No active bounties. Post one with `!bounty post <amount> <task>`.');
+        embed.setFooter({ text: 'Post: !bounty post <amt> <task>  |  Award: !bounty award <ID> @user  |  Suggest: !bounty suggest' });
         msg.reply({ embeds: [embed] });
+        return;
+      }
+
+      if (sub === 'suggest') {
+        try {
+          const sysPrompt = 'You are a creative game master for a Discord economy game. Generate ONE funny, specific, competitive bounty task that players can complete in chat. Keep it under 15 words. Make it creative, fun, and slightly chaotic. Output ONLY the task text, no quotes, no explanation.';
+          const task = await groq.call(sysPrompt, 'Generate a fun bounty task now.', 0.9);
+          const cleanTask = task.replace(/```/g, '').trim();
+          msg.reply(`💡 **Bounty Idea:** *${cleanTask}*\n\nLike it? Use \`!bounty post 500 ${cleanTask}\``);
+        } catch {
+          msg.reply('💡 **Bounty Idea:** *First person to lose 1,000 coins in slots and screenshot it*\n\nUse `!bounty post <amount> <task>` to post it!');
+        }
         return;
       }
 
       if (sub === 'post') {
         const amount = parseInt(args[0], 10);
         const task   = args.slice(1).join(' ');
-        if (isNaN(amount) || amount <= 0 || !task) { msg.reply('Usage: `!bounty post <amount> <task>`'); return; }
-        if (userData.botcoin < amount) { msg.reply("âŒ Not enough ðŸª™."); return; }
+        if (isNaN(amount) || amount <= 0 || !task) { msg.reply('Usage: `!bounty post <amount> <task>`\n💡 Try `!bounty suggest` for ideas!'); return; }
+        if (amount < 50)   { msg.reply('❌ Minimum bounty is 🪙 50.'); return; }
+        if (userData.botcoin < amount) { msg.reply(`❌ You only have 🪙 ${userData.botcoin.toLocaleString()}.`); return; }
         userData.botcoin -= amount;
         const bountyId = Math.random().toString(36).substring(2, 6).toUpperCase();
         globalState.bounties[bountyId] = { amount, task, posterId: userId, posterName: username, status: 'open' };
         await Promise.all([saveGlobal(), saveUser(userId, userData)]);
-        msg.reply(`ðŸ“œ **Bounty [${bountyId}] Posted!** ðŸª™ **${amount.toLocaleString()}** locked up.\nTask: *${task}*`);
+        const embed = new EmbedBuilder()
+          .setColor(0xff4444)
+          .setTitle('🎯 NEW BOUNTY POSTED!')
+          .setDescription(`**Task:** ${task}`)
+          .addFields(
+            { name: '💰 Reward', value: `🪙 ${amount.toLocaleString()}`, inline: true },
+            { name: '🪪 ID', value: bountyId, inline: true },
+            { name: '📋 Posted by', value: username, inline: true },
+          )
+          .setFooter({ text: 'Complete it and ask the poster: !bounty award ' + bountyId + ' @you' });
+        msg.reply({ embeds: [embed] });
         return;
       }
 
@@ -1078,22 +1104,44 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
         const targetMatch = args[1]?.match(/<@!?(\d+)>/);
         if (!bountyId || !targetMatch) { msg.reply('Usage: `!bounty award <ID> @user`'); return; }
         const bty = (globalState.bounties || {})[bountyId];
-        if (!bty || bty.status !== 'open') { msg.reply("âŒ Invalid or closed bounty."); return; }
-        if (bty.posterId !== userId)       { msg.reply("âŒ Only the poster can award."); return; }
+        if (!bty || (bty as any).status !== 'open') { msg.reply('❌ Invalid or already closed bounty.'); return; }
+        if ((bty as any).posterId !== userId)       { msg.reply('❌ Only the person who posted this bounty can award it.'); return; }
 
         const targetId   = targetMatch[1];
+        if (targetId === userId) { msg.reply('❌ You cannot award yourself a bounty.'); return; }
         const targetRef  = db.collection('businessUsers').doc(targetId);
         const targetSnap = await targetRef.get();
         let targetData   = (targetSnap.data() as UserData) || defaultUser('Unknown');
-        bty.status        = 'closed';
-        targetData.botcoin += bty.amount;
-        targetData.totalEarned = (targetData.totalEarned || 0) + bty.amount;
+        (bty as any).status  = 'closed';
+        targetData.botcoin += (bty as any).amount;
+        targetData.totalEarned = (targetData.totalEarned || 0) + (bty as any).amount;
         addXP(targetData, 80);
         await Promise.all([saveGlobal(), saveUser(targetId, targetData)]);
-        msg.reply(`ðŸ’° **BOUNTY CLAIMED!** <@${targetId}> awarded ðŸª™ **${bty.amount.toLocaleString()}** for: *${bty.task}*`);
+        const embed = new EmbedBuilder()
+          .setColor(0xf1c40f)
+          .setTitle('💰 BOUNTY CLAIMED!')
+          .setDescription(`<@${targetId}> completed the task and walks away with 🪙 **${(bty as any).amount.toLocaleString()}**!`)
+          .addFields({ name: '📋 Completed Task', value: (bty as any).task })
+          .setFooter({ text: 'Bounty ' + bountyId + ' is now closed.' });
+        msg.reply({ embeds: [embed] });
         return;
       }
-      msg.reply('Subcommands: `!bounty list`, `!bounty post <amt> <task>`, `!bounty award <id> @user`');
+
+      if (sub === 'cancel') {
+        const bountyId = args[0]?.toUpperCase();
+        if (!bountyId) { msg.reply('Usage: `!bounty cancel <ID>`'); return; }
+        const bty = (globalState.bounties || {})[bountyId];
+        if (!bty || (bty as any).status !== 'open') { msg.reply('❌ Invalid or already closed bounty.'); return; }
+        if ((bty as any).posterId !== userId) { msg.reply('❌ Only the poster can cancel their bounty.'); return; }
+        const refund = Math.floor((bty as any).amount * 0.8);
+        userData.botcoin += refund;
+        (bty as any).status = 'cancelled';
+        await Promise.all([saveGlobal(), saveUser(userId, userData)]);
+        msg.reply(`🔴 **Bounty [${bountyId}] Cancelled.** Refunded 🪙 **${refund.toLocaleString()}** (80% back).`);
+        return;
+      }
+
+      msg.reply('📋 Subcommands: `!bounty list` | `!bounty post <amt> <task>` | `!bounty award <id> @user` | `!bounty cancel <id>` | `!bounty suggest`');
       break;
     }
 
