@@ -28,7 +28,8 @@ export class GroqManager {
     systemPrompt: string,
     userPrompt: string,
     temp = 0.5,
-    models = ['groq/compound-mini', 'llama-3.1-8b-instant', 'llama-3.3-70b-versatile']
+    models = ['groq/compound-mini', 'llama-3.1-8b-instant', 'llama-3.3-70b-versatile'],
+    jsonMode = true
   ): Promise<string> {
     const maxAttempts = Math.min(3, Math.max(this.keys.length, 1) * 2);
     let lastError = '';
@@ -52,7 +53,7 @@ export class GroqManager {
                 { role: 'user', content: userPrompt }
               ],
               temperature: temp,
-              response_format: { type: 'json_object' }
+              ...(jsonMode ? { response_format: { type: 'json_object' } } : {})
             })
           });
 
