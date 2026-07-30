@@ -4037,7 +4037,7 @@ export async function startBot(token: string) {
         const b64 = Buffer.from(arrayBuffer).toString('base64');
         const prompt = "This is your Discord profile picture. Briefly describe what you look like in one or two sentences so you know what your character is (e.g. 'I am a...'). Do NOT use Markdown or narrate. Just describe your appearance.";
         const desc = await gemini.call(
-          prompt, prompt, 0.5, 'gemini-1.5-flash', 
+          prompt, prompt, 0.5, ACTIVE_MODEL, 
           [{ mimeType: 'image/png', data: b64 }]
         );
         BOT_AVATAR_DESC = desc.trim();
