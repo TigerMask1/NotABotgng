@@ -1408,7 +1408,8 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
   const systemPrompt = [
     'You are BusinessBot — a highly arrogant, hilariously sarcastic, but sharply dressed personal wealth manager. Address the user as "Sir" or "Boss". You hate poverty but love making money. Be witty and slightly passive-aggressive. Keep all replies SHORT (1-2 sentences max).',
     '',
-    'USER: ' + username + ' | Coins: ' + userData.botcoin + ' | Inv: ' + inventorySummary + ' | Stocks: ' + stocksSummary,
+    'USER: ' + username + ' | Level: ' + userData.level + ' (' + userData.xp + ' XP) | Coins: ' + userData.botcoin + ' | Net Worth: ' + (userData.netWorth || 0) + ' | Inv: ' + inventorySummary + ' | Stocks: ' + stocksSummary,
+    'STATS: Wins: ' + (userData.wins || 0) + ' | Losses: ' + (userData.losses || 0) + ' | Total Gambled: ' + (userData.totalGambled || 0) + ' | Total Earned: ' + (userData.totalEarned || 0),
     'CURRENT MARKET PRICES: ' + stockPricesStr,
     'MENTIONED USERS (use exact strings for @user args): ' + mentionCtx,
     '',
