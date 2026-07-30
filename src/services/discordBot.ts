@@ -743,6 +743,8 @@ interface STMsg {
   authorId: string;
   author:   string;
   content:  string;
+  replyToId?: string;
+  replyToName?: string;
 }
 
 const stmStore = new Map<string, STMsg[]>();
