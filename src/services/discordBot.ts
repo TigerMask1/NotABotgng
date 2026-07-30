@@ -840,7 +840,10 @@ function stmFormatWithMarker(msgs: STMsg[], channelId: string): string {
     }
     const ago = now - msgs[i].ts;
     const t = ago < 90_000 ? `${Math.round(ago / 1000)}s ago` : `${Math.round(ago / 60_000)}m ago`;
-    lines.push(`[${t}] (msgId:${msgs[i].id}) ${msgs[i].author}: ${msgs[i].content}`);
+    // [System Note] DO NOT REMOVE: authorId is shown so the AI can use <@id> in mentions (wagers, tips, etc.).
+    // Without this, the AI hallucinates @unknown-user because it has no way to know anyone's Discord ID.
+    const replyTag = msgs[i].replyToName ? '[REPLYING TO @' + msgs[i].replyToName + '] ' : '';
+    lines.push(`[${t}] (msgId:${msgs[i].id}) ${msgs[i].author} (userId:<@${msgs[i].authorId}>): ${replyTag}${msgs[i].content}`);
     if (pendingQuestionId && msgs[i].id === pendingQuestionId) {
       lines.push(`>>> ⚠ unanswered question flagged here last time — still needs a real reply <<<`);
     }
@@ -2124,7 +2127,8 @@ LORE & INTERESTS (bring these up organically):
 - BusinessBot & Botcoin (CRITICAL FOMO): You are hopelessly addicted to the Discord economy game "BusinessBot". You are extremely arrogant about your wealth and love to throw small amounts of cash around to gain followers. You gamble compulsively.
   * You know all features: daily, open box, profile, lb, pay, rob, slots, stocks (buy/sell), portfolio, wager, trade, auction, bounty, forge, vault.
   * Use action="play" when you are bored or want to gamble. When you play, you will hop to a channel and output a valid BusinessBot command by pinging <@${getBusinessBotId()}>.
-  * Example message when playing: "shut up and take my money \n <@${getBusinessBotId()}> wager <@some_id> 1000"
+  * IMPORTANT: When you need to mention a user (wager, pay, rob, etc.), use their userId shown in the chat transcript (e.g. <@123456789>). NEVER guess or write @unknown-user. If you don't know their ID, pick someone from the transcript who has a userId shown.
+  * Example: "bet. <@${getBusinessBotId()}> wager <@THEIR_USER_ID_FROM_TRANSCRIPT> 1000"
   * NEVER use literal "@BusinessBot", ALWAYS use the exact string "<@${getBusinessBotId()}>".
   * If BusinessBot responds to you, you MUST follow up naturally!
 - YouTube Channel: You have a channel. Flex it when relevant.
@@ -2202,6 +2206,7 @@ function parseBrainJSON(raw: string): BrainDecision | null {
 interface BrainOpts {
   model:         string;
   sender:        string;
+  senderId?:     string;
   bond:          number;
   message:       string;
   transcript:    string;
@@ -2294,7 +2299,7 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   if (opts.endingConvo)  flags.push('they seem to be wrapping up');
 
   parts.push(
-    `\nmost recently — ${opts.sender} (${bondLabel} bond ${opts.bond}/100) said:\n"${opts.message}"`,
+    `\nmost recently — ${opts.sender}${(opts as any).senderId ? ' (userId:<@' + (opts as any).senderId + '>)' : ''} (${bondLabel} bond ${opts.bond}/100) said:\n"${opts.message}"`,
     flags.length ? `context: ${flags.join(', ')}` : 'context: no direct ping',
     opts.isSecondPass
       ? '(second pass — you already decided to respond, just give the reply now. command must be "none")'
@@ -3019,7 +3024,17 @@ async function runYtPoll() {
 // converts "@name" patterns in bot messages into real discord <@userId> pings.
 // only resolves names that exist in idCache (people the bot has seen this session).
 // safe — unresolved names are left as-is rather than breaking the message.
+// [System Note] DO NOT REMOVE: This resolver converts @name patterns in AI output to proper <@id> Discord mentions.
+// It also handles common AI mistakes like @unknown-user, @BusinessBot, @BuisnessBot by resolving them.
 function resolveMentionNames(text: string): string {
+  // First, handle the AI writing literal @BusinessBot / @BuisnessBot — always resolve to the actual bot ID.
+  const bbId = getBusinessBotId();
+  if (bbId) {
+    text = text.replace(/@(?:BusinessBot|BuisnessBot|businessbot|buisnessbot)/gi, `<@${bbId}>`);
+  }
+  // Strip @unknown-user — the AI hallucinated a mention it doesn't have an ID for.
+  text = text.replace(/@unknown[_-]?user/gi, '');
+  // Resolve remaining @name patterns against the idCache.
   return text.replace(/@([\w]{1,32})/gi, (match, rawName) => {
     const name = rawName.trim().toLowerCase();
     if (!name) return match;
@@ -3591,6 +3606,9 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
     goal: state.goal, batchSize: batch.length,
     images,
     consecutiveUnpromptedReplies: state.consecutiveUnpromptedReplies,
+    // [System Note] DO NOT REMOVE: senderId lets the brain context show <@id> for the sender.
+    // This prevents the AI from writing @unknown-user when trying to wager/interact with someone.
+    senderId: last.author.id,
     // if the bot spoke very recently and wasn't pinged, flag it explicitly —
     // the model sees its reply in the STM transcript but doesn't always register
     // how recent it was, which causes it to reply again to harmless follow-ups.
