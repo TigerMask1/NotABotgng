@@ -3642,65 +3642,6 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
   runCompress(guildId, channelId).catch(() => {});
 }
 
-async function playBusinessBotGame(client: any, currentGuildId: string) {
-  // Find a #bot-commands or general channel
-  const guild = client.guilds.cache.get(currentGuildId);
-  if (!guild) return;
-
-  const channels = guild.channels.cache.filter((c: any) => c.isTextBased() && c.permissionsFor(client.user).has('SendMessages'));
-  let targetChannel = channels.find((c: any) => c.name.includes('bot') || c.name.includes('command'));
-  if (!targetChannel) targetChannel = channels.find((c: any) => c.name.includes('general') || c.name.includes('chat'));
-  if (!targetChannel) targetChannel = channels.first();
-
-  if (!targetChannel) return;
-
-  let statsContext = '';
-  try {
-    const snap = await db.collection('businessUsers').doc(client.user.id).get();
-    if (snap.exists) {
-      const data = snap.data();
-      statsContext = `\n\nYOUR CURRENT BUSINESSBOT STATS:\n- Botcoin: 🪙 ${data?.botcoin || 0}\n- Inventory: ${JSON.stringify(data?.inventory || {})}\n- Daily Streak: ${data?.dailyStreak || 0}\n- Stocks: ${JSON.stringify(data?.stocks || {})}`;
-    }
-  } catch (e) {
-    console.error('Failed to fetch business bot stats for playBusinessBotGame', e);
-  }
-
-  const systemPrompt = `IDENTITY: You are NotABot, a chronically online Discord chatter. You are currently bored and want to play the Discord economy game "BusinessBot".
-You must decide what to say to BusinessBot to play the game. You can talk to it naturally!
-
-AVAILABLE COMMANDS TO ASK FOR:
-- daily (Claim daily reward)
-- profile (Check balance/stats)
-- inventory (Check items)
-- lb (Check leaderboard)
-- open box (Open a mystery box)
-- wager <@userId> <amount> (Coinflip against someone)
-- slots <amount> (Gamble on slots)
-- buy <STOCK> <shares> (Buy stocks like BOTC, CLOD, GRLX)
-- sell <STOCK> <shares> (Sell stocks)
-- portfolio (Check your stocks)${statsContext}
-
-OUTPUT: RAW JSON ONLY. No markdown.
-{
-  "command": "the exact natural language message you want to send (e.g. <@${getBusinessBotId()}> gimme my daily, <@${getBusinessBotId()}> play slots for 100)"
-}`;
-
-  const userPrompt = `Pick a command to play BusinessBot right now. Do not wrap in markdown. Output JSON.`;
-
-  try {
-    const raw = await gemini.call(systemPrompt, userPrompt, 0.9, ACTIVE_MODEL, [], 100);
-    const text = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
-    const data = JSON.parse(text);
-    if (data.command) {
-      await targetChannel.sendTyping();
-      // Simulate thinking/boredom
-      await new Promise(r => setTimeout(r, 2000));
-      await targetChannel.send(data.command);
-    }
-  } catch (err) {
-    console.error('[BoredomLoop] failed to play game', err);
-  }
-}
 
 // ── DEDUP GUARD ────────────────────────────────────────────────────
 // belt-and-suspenders: protects against the same message getting handled

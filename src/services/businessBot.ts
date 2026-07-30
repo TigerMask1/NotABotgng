@@ -1361,7 +1361,10 @@ async function handleNaturalLanguage(msg: Message) {
         const amtStr = (parsed.command === 'pay' || parsed.command === 'wager')
           ? parsed.args?.[1] : parsed.args?.[0];
         const amt = parseInt(amtStr, 10);
-        if (!isNaN(amt) && amt > userData.botcoin && parsed.command !== 'buy' && parsed.command !== 'bounty') return; // Basic check
+        if (!isNaN(amt) && amt > userData.botcoin && parsed.command !== 'buy' && parsed.command !== 'bounty') {
+          await msg.reply('Sir, your account balance suggests you should reconsider this action.').catch(() => {});
+          return;
+        }
       }
       await handleCommand(msg, parsed.command, (parsed.args || []).map(String));
     } else if (parsed.action === 'reply' && parsed.reply) {

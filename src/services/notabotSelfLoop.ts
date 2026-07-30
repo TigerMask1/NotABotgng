@@ -160,10 +160,13 @@ async function fetchProfile(): Promise<void> {
 }
 
 // ── LISTEN FOR BUSINESSBOT'S REPLY ──────────────────────────────────────────
-function waitForBusinessBotReply(timeoutMs: number): Promise<string | null> {
+function waitForBusinessBotReply(timeoutMs: number, playChannelId: string): Promise<string | null> {
   if (!botClientRef) return Promise.resolve(null);
   return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(null), timeoutMs);
+    const timer = setTimeout(() => {
+      botClientRef!.off('messageCreate', handler);
+      resolve(null);
+    }, timeoutMs);
 
     const handler = (msg: Message) => {
       if (msg.author.id === getBusinessBotId()) {
@@ -226,11 +229,11 @@ export async function runSelfLoopTick(): Promise<void> {
 
     await new Promise(r => setTimeout(r, 1000 + Math.random() * 1500));
 
-    await playChannel.channel.send(decision.message);
+    await playChannel.channel.send({ content: decision.message, allowedMentions: { parse: ['users'] } });
     console.log(`[SelfLoop] sent: "${decision.message.slice(0, 60)}..."`);
 
     // Step 5: Wait for BusinessBot's reply
-    const reply = await waitForBusinessBotReply(LOOP_WAIT_FOR_REPLY_MS);
+    const reply = await waitForBusinessBotReply(LOOP_WAIT_FOR_REPLY_MS, playChannel.channel.id);
     if (reply) {
       console.log(`[SelfLoop] BusinessBot replied: "${reply.slice(0, 60)}..."`);
       if (decision.action === 'check_stats' || decision.message.toLowerCase().includes('daily')) {
