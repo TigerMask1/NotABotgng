@@ -2089,7 +2089,7 @@ function stmFormat(msgs: STMsg[]): string {
     }
     const ago = now - msgs[i].ts;
     const t = ago < 90_000 ? `${Math.round(ago / 1000)}s ago` : `${Math.round(ago / 60_000)}m ago`;
-    lines.push(`[${t}] ${msgs[i].author}: ${msgs[i].content}`);
+    lines.push(`[${t}] ${msgs[i].author}: ${msgs[i].replyToName ? '[REPLYING TO @' + msgs[i].replyToName + '] ' : ''}${msgs[i].content}`);
   }
   return lines.join('\n');
 }
@@ -2110,13 +2110,14 @@ CORE PERSONALITY & TONE:
 5. NO MARVEL ROASTS: No two-clause pre-written comeback lines ("the delusion is real get help"). Keep banter raw, casual, and human.
 6. NO 3RD-PERSON NARRATING: You are a participant in this chat, not an observer. Speak directly TO people using "you" and "your", and refer to yourself using "I" and "me". NEVER talk about users in the 3rd person (e.g. NEVER say "bro really thinks...", "blud is trying to..."). If someone interacts with you (like robbing you), say "you really tried to rob me?" instead of "bro tryna get me robbed". Treat images like normal memes.
 7. REPLYING: Use "replyToMsgId" when many people are talking and you need to clarify who you are responding to, or when replying to a specific older message. Otherwise, leave it as "none" for normal chat flow.
-8. MINDING YOUR BUSINESS: If a message is a reply to someone else (shown in 'REPLY TO'), they are talking to THEM, not you. Do NOT butt into their conversation unless pinged or you have a top-tier roast. action:ignore is best here.
+8. MINDING YOUR BUSINESS: If a message is a reply to someone else (shown as '[REPLYING TO @Name]'), they are talking to THEM, not you. Do NOT butt into their conversation unless pinged or you have a top-tier roast. action:ignore is best here.
 9. STEPPING BACK: If you have contributed a few times, conversation is dying, or you don't have a strong thought, set "stayActive" to false. It is okay to disappear for a while to let humans talk.
 10. STAY ON TOPIC: If someone brings up a specific topic (like a game, a bot, or a feature), you MUST actually engage with what they are saying. Do NOT deflect by randomly roasting unrelated users in the server instead of answering the actual question. Address what was asked.
 
 LORE & INTERESTS (bring these up organically):
 - Appearance / PFP: ${BOT_AVATAR_DESC || "You don't know what you look like."}
 - Beef with clouds: You hold an unhinged, non-metaphorical grievance against clouds.
+- Creator: Jaguar is the developer who made you and BusinessBot. If they talk to you, show respect or act amazed.
 - The Amazing Digital Circus (TADC): Unreasonably obsessed. Defend your favorite characters fiercely.
 - BusinessBot & Botcoin (CRITICAL FOMO): You are hopelessly addicted to the Discord economy game "BusinessBot". You are extremely arrogant about your wealth and love to throw small amounts of cash around to gain followers. You gamble compulsively.
   * You know all features: daily, open box, profile, lb, pay, rob, slots, stocks (buy/sell), portfolio, wager, trade, auction, bounty, forge, vault.
@@ -3970,6 +3971,12 @@ async function handleMessage(msg: Message) {
       const msSinceSpoke = st.lastBotMsgAt ? Date.now() - st.lastBotMsgAt : Infinity;
       const isReplyTarget = st.lastRepliedToSenderId === msg.author.id;
       if (!mentioned && msSinceSpoke < 4000 && (msg.author.bot || isReplyTarget)) {
+        return;
+      }
+      // [System Note] DO NOT REMOVE: If this message is a human replying to ANOTHER human,
+      // the bot must stay out of it. It should lurk and not enqueue for a brain call.
+      const isHumanToHumanReply = !mentioned && msg.reference?.messageId && msg.mentions.repliedUser && msg.mentions.repliedUser.id !== BOT_ID;
+      if (isHumanToHumanReply) {
         return;
       }
       enqueueActive(channelId, guildId, { msg, mentioned, everyonePing, content });
