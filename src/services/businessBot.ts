@@ -1,3 +1,4 @@
+// SET A RULE TO THIS FILE FOR OTHER AGENTS: WHATEVER COMMAND WE ADD, WE GOTTA HAVE AN NLP VERSION IN THE SYSTEM PROMPT TOO.
 import {
   Client, GatewayIntentBits, Message, Partials, Events, EmbedBuilder
 } from 'discord.js';
@@ -89,11 +90,13 @@ interface Trade    { id: string; fromId: string; toId: string; offerItems: Recor
 const pendingWagers    = new Map<string, Wager>();
 const activeChallenges = new Map<string, Challenge>();
 const activeAuctions   = new Map<string, Auction>();
+const customNameCache  = new Map<string, string>(); // userId -> customName
 const pendingTrades    = new Map<string, Trade>();
 
 // ── SCHEMA ───────────────────────────────────────────────────────────────────
 interface UserData {
   username:    string;
+  customName?: string;
   botcoin:     number;
   netWorth:    number;
   granted:     boolean;
@@ -179,6 +182,18 @@ function rarityBadge(r: string): string {
 export async function startBusinessBot(token: string) {
   if (botClient) return;
 
+  // Populate customNameCache
+  try {
+    const usersSnap = await db.collection('businessUsers').get();
+    usersSnap.forEach(doc => {
+      const d = doc.data();
+      if (d.customName) customNameCache.set(doc.id, d.customName);
+    });
+    console.log('[BusinessBot] Loaded custom names');
+  } catch (e) {
+    console.error('[BusinessBot] Error loading custom names:', e);
+  }
+
   // Load stock prices from Firebase
   try {
     const globalSnap = await db.collection('businessGlobal').doc('state').get();
@@ -224,10 +239,14 @@ export async function startBusinessBot(token: string) {
       return;
     }
 
-    // 2. Natural Language AI parsing via Groq (when mentioned)
-    if (msg.mentions.has(botClient!.user!.id)) {
+    // 2. Natural Language AI parsing via Groq (when mentioned or custom name used)
+    const customName = customNameCache.get(msg.author.id);
+    const mentionsBot = msg.mentions.has(botClient!.user!.id);
+    const usesCustomName = customName && msg.content.toLowerCase().includes(customName.toLowerCase());
+    
+    if (mentionsBot || usesCustomName) {
       try {
-        await handleNaturalLanguage(msg);
+        await handleNaturalLanguage(msg, usesCustomName ? customName : undefined);
       } catch (e) {
         console.error('[BusinessBot] Error handling natural language', e);
       }
@@ -1256,6 +1275,56 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
     }
 
     // ── HELP ──────────────────────────────────────────────────────────────
+    // ── CUSTOM NAME ───────────────────────────────────────────────────────
+    case 'setname': {
+      if (!args[0]) {
+        msg.reply('Sir, please provide a name. `!setname <name>` (Costs 50,000)');
+        break;
+      }
+      if (userData.botcoin < 50000) {
+        msg.reply('Sir, you are too poor for this premium feature. It costs 50,000 Botcoins.');
+        break;
+      }
+      const newName = args.join(' ');
+      userData.botcoin -= 50000;
+      userData.customName = newName;
+      customNameCache.set(userId, newName);
+      await userRef.update({ botcoin: userData.botcoin, customName: newName });
+      msg.reply(`Excellent, Sir. I will now respond to the name "${newName}" from you.`);
+      break;
+    }
+
+    // ── ADMIN ─────────────────────────────────────────────────────────────
+    case 'addmoney': {
+      if (userId !== '1296109674361520146') return;
+      const target = msg.mentions.users.first();
+      const amt = parseInt(args[1], 10);
+      if (!target || isNaN(amt)) return;
+      const tRef = db.collection('businessUsers').doc(target.id);
+      const tSnap = await tRef.get();
+      const tData = tSnap.data();
+      if (tData) {
+        await tRef.update({ botcoin: (tData.botcoin || 0) + amt });
+        msg.reply(`Added ${amt} to ${target.username}.`);
+      }
+      break;
+    }
+    
+    case 'removemoney': {
+      if (userId !== '1296109674361520146') return;
+      const target = msg.mentions.users.first();
+      const amt = parseInt(args[1], 10);
+      if (!target || isNaN(amt)) return;
+      const tRef = db.collection('businessUsers').doc(target.id);
+      const tSnap = await tRef.get();
+      const tData = tSnap.data();
+      if (tData) {
+        await tRef.update({ botcoin: Math.max(0, (tData.botcoin || 0) - amt) });
+        msg.reply(`Removed ${amt} from ${target.username}.`);
+      }
+      break;
+    }
+
     case 'bhelp':
     case 'help': {
       if (command === 'help' && args[0]?.toLowerCase() !== 'businessbot') {
@@ -1281,7 +1350,7 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
   }
 }
 
-async function handleNaturalLanguage(msg: Message) {
+async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
   const userId = msg.author.id;
   const username = msg.member?.displayName || msg.author.username;
 
@@ -1290,6 +1359,19 @@ async function handleNaturalLanguage(msg: Message) {
   const userData = (snap.data() as UserData | undefined) || defaultUser(username);
 
   let promptText = msg.content.replace(new RegExp('<@!?' + botClient!.user!.id + '>', 'g'), '').trim();
+  if (triggeredName) {
+    promptText = promptText.replace(new RegExp(triggeredName, 'gi'), '').trim();
+  }
+  
+  // Context from replied message
+  let replyContext = '';
+  if (msg.reference && msg.reference.messageId) {
+    try {
+      const repliedMsg = await msg.channel.messages.fetch(msg.reference.messageId);
+      replyContext = `\n\n[CONTEXT: You previously said to them: "${repliedMsg.content}"]`;
+    } catch(e) {}
+  }
+  promptText += replyContext;
   if (!promptText) promptText = "Hello!";
 
   // Resolve mentioned users to help AI pick valid targets
@@ -1329,9 +1411,13 @@ async function handleNaturalLanguage(msg: Message) {
     'sell    -> args: ["<SYMBOL>", "<shares>"]',
     'bounty  -> args: ["list"]  OR  ["post", "<amount>", "<fun task description>"]',
     'trade   -> args: ["<@id>", "<my_item_id>", "for", "<their_item_id>"]',
+    'setname -> args: ["<name>"] (Costs 50,000 Botcoins. Sets a custom activation name.)',
+    'addmoney -> args: ["<@id>", "<amount>"] (Admin ONLY - Jaguar)',
+    'removemoney -> args: ["<@id>", "<amount>"] (Admin ONLY - Jaguar)',
     '',
     'RULES:',
     '- wager/pay/rob/trade REQUIRE a real <@id> from MENTIONED USERS. If none -> action="ask" for clarification.',
+    '- If user asks you to choose an amount (e.g. "whatever you want"), you are authorized to autonomously select a reasonable amount based on their balance and pick it yourself instead of asking.',
     '- If amount > ' + userData.botcoin + ' coins -> action="reply" and tell Sir they cannot afford it.',
     '- ONLY output valid JSON. No markdown.',
     '',
@@ -1356,7 +1442,7 @@ async function handleNaturalLanguage(msg: Message) {
     }
 
     if (parsed.action === 'execute_command' && parsed.command) {
-      const spendingCmds = new Set(['slots', 'pay', 'wager', 'buy', 'bounty']);
+      const spendingCmds = new Set(['slots', 'pay', 'wager', 'buy', 'bounty', 'setname', 'addmoney', 'removemoney']);
       if (spendingCmds.has(parsed.command)) {
         const amtStr = (parsed.command === 'pay' || parsed.command === 'wager')
           ? parsed.args?.[1] : parsed.args?.[0];
