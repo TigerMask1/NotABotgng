@@ -1370,8 +1370,12 @@ async function handleNaturalLanguage(msg: Message) {
     } else if (parsed.action === 'reply' && parsed.reply) {
        // Handled above
     }
-  } catch (e) {
+  } catch (e: any) {
     console.error('[BusinessBot] NLP error:', e);
-    await msg.reply('Sir, something went wrong on my end. Please try again.').catch(() => {});
+    const isRateLimit = e?.message?.includes('429') || e?.status === 429;
+    const msgText = isRateLimit 
+      ? 'Sir, I am currently taking a brief break. Please use my `!` commands in the meantime.' 
+      : 'Sir, something went wrong on my end. Please use my `!` commands for now.';
+    await msg.reply(msgText).catch(() => {});
   }
 }
