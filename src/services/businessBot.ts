@@ -1408,8 +1408,7 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
   const systemPrompt = [
     'You are BusinessBot — a highly arrogant, hilariously sarcastic, but sharply dressed personal wealth manager. Address the user as "Sir" or "Boss". You hate poverty but love making money. Be witty and slightly passive-aggressive. Keep all replies SHORT (1-2 sentences max).',
     '',
-    'USER: ' + username + ' | Level: ' + userData.level + ' (' + userData.xp + ' XP) | Coins: ' + userData.botcoin + ' | Net Worth: ' + (userData.netWorth || 0) + ' | Inv: ' + inventorySummary + ' | Stocks: ' + stocksSummary,
-    'STATS: Wins: ' + (userData.wins || 0) + ' | Losses: ' + (userData.losses || 0) + ' | Total Gambled: ' + (userData.totalGambled || 0) + ' | Total Earned: ' + (userData.totalEarned || 0),
+    'USER: ' + username + ' | Coins: ' + userData.botcoin + ' | Inv: ' + inventorySummary + ' | Stocks: ' + stocksSummary,
     'CURRENT MARKET PRICES: ' + stockPricesStr,
     'MENTIONED USERS (use exact strings for @user args): ' + mentionCtx,
     '',
@@ -1435,46 +1434,65 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
     '- ONLY output valid JSON. No markdown.',
     '',
     'FORMATS (pick one):',
+    '{"action":"lookup","target":"<@id> or self","reason":"<why>"}',
     '{"action":"execute_command","command":"<name>","args":[...],"reply":"<short Sir-addressed line>"}',
     '{"action":"ask","reply":"<one question to Sir>"}',
     '{"action":"reply","reply":"<one-line response>"}',
   ].join('\n');
 
-  try {
-    const raw = await groq.call(systemPrompt, promptText, 0.3, undefined, false);
-    let parsed: any;
+  let loopCount = 0;
+  while (loopCount < 3) {
+    loopCount++;
     try {
-      parsed = JSON.parse(raw.replace(/```json/gi, '').replace(/```/g, '').trim());
-    } catch {
-      await msg.reply('Sir, I had trouble parsing that. Please rephrase.').catch(() => {});
-      return;
-    }
-
-    if (parsed.reply) {
-      await msg.reply(String(parsed.reply)).catch(() => {});
-    }
-
-    if (parsed.action === 'execute_command' && parsed.command) {
-      const spendingCmds = new Set(['slots', 'pay', 'wager', 'buy', 'bounty', 'setname', 'addmoney', 'removemoney']);
-      if (spendingCmds.has(parsed.command)) {
-        const amtStr = (parsed.command === 'pay' || parsed.command === 'wager')
-          ? parsed.args?.[1] : parsed.args?.[0];
-        const amt = parseInt(amtStr, 10);
-        if (!isNaN(amt) && amt > userData.botcoin && parsed.command !== 'buy' && parsed.command !== 'bounty') {
-          await msg.reply('Sir, your account balance suggests you should reconsider this action.').catch(() => {});
-          return;
-        }
+      const raw = await groq.call(systemPrompt, promptText, 0.3, undefined, false);
+      let parsed: any;
+      try {
+        parsed = JSON.parse(raw.replace(/```json/gi, '').replace(/```/g, '').trim());
+      } catch {
+        await msg.reply('Sir, I had trouble parsing that. Please rephrase.').catch(() => {});
+        return;
       }
-      await handleCommand(msg, parsed.command, (parsed.args || []).map(String));
-    } else if (parsed.action === 'reply' && parsed.reply) {
-       // Handled above
+
+      if (parsed.action === 'lookup') {
+        const targetId = parsed.target === 'self' || parsed.target === `<@${userId}>` ? userId : parsed.target.replace(/[<@>]/g, '');
+        const snap = await db.collection('businessUsers').doc(targetId).get();
+        if (!snap.exists) {
+          promptText += `\n[SYSTEM: User ${parsed.target} not found in database]`;
+          continue;
+        }
+        const d = snap.data() as UserData;
+        const info = `Stats for <@${targetId}>: Level ${d.level}, ${d.xp} XP, Coins: ${d.botcoin}, NW: ${d.netWorth || 0}, Wins: ${d.wins || 0}, Losses: ${d.losses || 0}, Gambled: ${d.totalGambled || 0}, Earned: ${d.totalEarned || 0}`;
+        promptText += `\n[SYSTEM: LOOKUP RESULT: ${info}]`;
+        continue; // Loop again with new context
+      }
+
+      if (parsed.reply) {
+        await msg.reply(String(parsed.reply)).catch(() => {});
+      }
+
+      if (parsed.action === 'execute_command' && parsed.command) {
+        const spendingCmds = new Set(['slots', 'pay', 'wager', 'buy', 'bounty', 'setname', 'addmoney', 'removemoney']);
+        if (spendingCmds.has(parsed.command)) {
+          const amtStr = (parsed.command === 'pay' || parsed.command === 'wager')
+            ? parsed.args?.[1] : parsed.args?.[0];
+          const amt = parseInt(amtStr, 10);
+          if (!isNaN(amt) && amt > userData.botcoin && parsed.command !== 'buy' && parsed.command !== 'bounty') {
+            await msg.reply('Sir, your account balance suggests you should reconsider this action.').catch(() => {});
+            return;
+          }
+        }
+        await handleCommand(msg, parsed.command, (parsed.args || []).map(String));
+      }
+      
+      break; // Exit loop if it wasn't a lookup
+    } catch (e: any) {
+      console.error('[BusinessBot] NLP error:', e);
+      const isRateLimit = e?.message?.includes('429') || e?.status === 429;
+      const msgText = isRateLimit 
+        ? 'Sir, I am currently taking a brief break. Please use my `!` commands in the meantime.' 
+        : 'Sir, something went wrong on my end. Please use my `!` commands for now.';
+      await msg.reply(msgText).catch(() => {});
+      break;
     }
-  } catch (e: any) {
-    console.error('[BusinessBot] NLP error:', e);
-    const isRateLimit = e?.message?.includes('429') || e?.status === 429;
-    const msgText = isRateLimit 
-      ? 'Sir, I am currently taking a brief break. Please use my `!` commands in the meantime.' 
-      : 'Sir, something went wrong on my end. Please use my `!` commands for now.';
-    await msg.reply(msgText).catch(() => {});
-  }
+  } // End of while loop
 }
