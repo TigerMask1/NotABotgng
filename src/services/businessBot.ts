@@ -1433,6 +1433,7 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
     '- If amount > ' + userData.botcoin + ' coins -> action="reply" and tell Sir they cannot afford it.',
     '- If user asks about their own stats/coins/level/wins/profile -> use action="lookup" with target="self" FIRST, then reply with the data.',
     '- If user asks to COMPARE themselves with someone, or asks about another user -> use action="lookup" for each user. You can lookup multiple times.',
+    '- ALWAYS prefer action="execute_command" over action="reply" when the user is asking for something a command can handle (e.g. "show my profile" -> execute profile, "show leaderboard" -> execute lb, "open a box" -> execute open). Do NOT just reply with text when a command exists for it.',
     '- ONLY output valid JSON. No markdown.',
     '',
     'FORMATS (pick one):',
@@ -1482,7 +1483,8 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
         continue; // Loop again with new context
       }
 
-      if (parsed.reply) {
+      // Only send text reply if the action is NOT execute_command (the command embed IS the response)
+      if (parsed.action !== 'execute_command' && parsed.reply) {
         await msg.reply(String(parsed.reply)).catch(() => {});
       }
 
