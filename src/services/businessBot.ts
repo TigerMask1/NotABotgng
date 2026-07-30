@@ -1431,10 +1431,12 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
     '- wager/pay/rob/trade REQUIRE a real <@id> from MENTIONED USERS. If none -> action="ask" for clarification.',
     '- If user asks you to choose an amount (e.g. "whatever you want"), you are authorized to autonomously select a reasonable amount based on their balance and pick it yourself instead of asking.',
     '- If amount > ' + userData.botcoin + ' coins -> action="reply" and tell Sir they cannot afford it.',
+    '- If user asks about their own stats/coins/level/wins/profile -> use action="lookup" with target="self" FIRST, then reply with the data.',
+    '- If user asks to COMPARE themselves with someone, or asks about another user -> use action="lookup" for each user. You can lookup multiple times.',
     '- ONLY output valid JSON. No markdown.',
     '',
     'FORMATS (pick one):',
-    '{"action":"lookup","target":"<@id> or self","reason":"<why>"}',
+    '{"action":"lookup","target":"<@id> OR username OR self","reason":"<why>"}  — Use this to fetch any user\'s full stats before answering questions about them. You can use their Discord <@id> if known, OR their plain username (e.g. "NotABot"). Use "self" to look up the person talking to you.',
     '{"action":"execute_command","command":"<name>","args":[...],"reply":"<short Sir-addressed line>"}',
     '{"action":"ask","reply":"<one question to Sir>"}',
     '{"action":"reply","reply":"<one-line response>"}',
@@ -1454,13 +1456,27 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
       }
 
       if (parsed.action === 'lookup') {
-        const targetId = parsed.target === 'self' || parsed.target === `<@${userId}>` ? userId : parsed.target.replace(/[<@>]/g, '');
-        const snap = await db.collection('businessUsers').doc(targetId).get();
-        if (!snap.exists) {
+        let targetId = parsed.target === 'self' || parsed.target === `<@${userId}>` ? userId : parsed.target.replace(/[<@>]/g, '');
+        let snap = await db.collection('businessUsers').doc(targetId).get();
+        let d: UserData | null = snap.exists ? snap.data() as UserData : null;
+        
+        if (!d && !/^\d+$/.test(targetId)) {
+          const usersSnap = await db.collection('businessUsers').get();
+          for (const doc of usersSnap.docs) {
+            const data = doc.data() as UserData;
+            if ((data.username && data.username.toLowerCase() === targetId.toLowerCase()) ||
+                (data.customName && data.customName.toLowerCase() === targetId.toLowerCase())) {
+              targetId = doc.id;
+              d = data;
+              break;
+            }
+          }
+        }
+
+        if (!d) {
           promptText += `\n[SYSTEM: User ${parsed.target} not found in database]`;
           continue;
         }
-        const d = snap.data() as UserData;
         const info = `Stats for <@${targetId}>: Level ${d.level}, ${d.xp} XP, Coins: ${d.botcoin}, NW: ${d.netWorth || 0}, Wins: ${d.wins || 0}, Losses: ${d.losses || 0}, Gambled: ${d.totalGambled || 0}, Earned: ${d.totalEarned || 0}`;
         promptText += `\n[SYSTEM: LOOKUP RESULT: ${info}]`;
         continue; // Loop again with new context
