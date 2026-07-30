@@ -1365,10 +1365,18 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
   
   // Context from replied message
   let replyContext = '';
+  let originalMsgMentions = new Map();
+  
   if (msg.reference && msg.reference.messageId) {
     try {
       const repliedMsg = await msg.channel.messages.fetch(msg.reference.messageId);
       replyContext = `\n\n[CONTEXT: You previously said to them: "${repliedMsg.content}"]`;
+      
+      if (repliedMsg.reference && repliedMsg.reference.messageId) {
+        const originalMsg = await msg.channel.messages.fetch(repliedMsg.reference.messageId);
+        replyContext += `\n[CONTEXT: Which was in response to their original request: "${originalMsg.content}"]`;
+        originalMsgMentions = originalMsg.mentions.users;
+      }
     } catch(e) {}
   }
   promptText += replyContext;
@@ -1378,7 +1386,11 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
   const mentionedUsers: { id: string; name: string }[] = [];
   for (const [id, user] of msg.mentions.users) {
     if (id === botClient!.user!.id) continue;
-    mentionedUsers.push({ id, name: user.username });
+    if (!mentionedUsers.find(u => u.id === id)) mentionedUsers.push({ id, name: user.username });
+  }
+  for (const [id, user] of originalMsgMentions) {
+    if (id === botClient!.user!.id) continue;
+    if (!mentionedUsers.find(u => u.id === id)) mentionedUsers.push({ id, name: user.username });
   }
   const mentionCtx = mentionedUsers.length
     ? mentionedUsers.map(u => u.name + '=<@' + u.id + '>').join(', ')
