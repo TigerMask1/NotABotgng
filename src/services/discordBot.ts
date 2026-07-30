@@ -3966,6 +3966,12 @@ async function handleMessage(msg: Message) {
     // drainActiveQueue loop iteration, not given their own brain() call — see the
     // comment above processActiveBatch for how that interacts with the marker.
     if (mentioned || getChState(channelId).mode === 'active') {
+      const st = getChState(channelId);
+      const msSinceSpoke = st.lastBotMsgAt ? Date.now() - st.lastBotMsgAt : Infinity;
+      const isReplyTarget = st.lastRepliedToSenderId === msg.author.id;
+      if (!mentioned && msSinceSpoke < 4000 && (msg.author.bot || isReplyTarget)) {
+        return;
+      }
       enqueueActive(channelId, guildId, { msg, mentioned, everyonePing, content });
     }
   } catch (e) { console.error('[Handler outer]', e); }
