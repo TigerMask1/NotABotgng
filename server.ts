@@ -3,7 +3,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { startBot, stopBot, getBotStatus } from "./src/services/discordBot.ts";
 import { startBusinessBot, stopBusinessBot } from "./src/services/businessBot.ts";
-import { startDashboardServer } from "./src/services/dashboardServer.ts";
+import { mountDashboardServer } from "./src/services/dashboardServer.ts";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -79,7 +79,7 @@ app.get("/", (_req, res) => {
       Service ${status === "running" ? "Online" : "Offline"}
     </div>
     <div style="margin-top: 24px;">
-      <a href="http://localhost:4400" style="display: inline-block; padding: 10px 24px; background: #5865F2; color: #fff; text-decoration: none; border-radius: 8px; font-weight: 600; font-size: 0.9rem; transition: background 0.2s;">
+      <a href="/dashboard/" style="display: inline-block; padding: 10px 24px; background: #5865F2; color: #fff; text-decoration: none; border-radius: 8px; font-weight: 600; font-size: 0.9rem; transition: background 0.2s;">
         Open Advanced Dashboard
       </a>
     </div>
@@ -143,5 +143,5 @@ app.listen(Number(PORT), "0.0.0.0", () => {
     console.warn("[server] BUSINESS_BOT_TOKEN not set — business bot not started.");
   }
   
-  startDashboardServer(4400);
+  mountDashboardServer(app);
 });

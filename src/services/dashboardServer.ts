@@ -7,10 +7,7 @@ import { db } from './firebase.ts';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-let server: any = null;
-
-export function startDashboardServer(port = 4400) {
-  const app = express();
+export function mountDashboardServer(app: express.Application) {
   
   app.use((_, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
@@ -302,14 +299,8 @@ export function startDashboardServer(port = 4400) {
 
   // ── Serve static dashboard files ──
   const dashboardPath = path.resolve(__dirname, '../../dashboard/dist');
-  app.use(express.static(dashboardPath));
-  app.get('*', (_, res) => {
+  app.use('/dashboard', express.static(dashboardPath));
+  app.get('/dashboard/*', (_, res) => {
     res.sendFile(path.join(dashboardPath, 'index.html'));
   });
-
-  server = app.listen(port, () => {
-    console.log(`[Dashboard] Analytics dashboard running at http://localhost:${port}`);
-  });
-
-  return server;
 }
