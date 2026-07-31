@@ -29,7 +29,7 @@ ChartJS.register(
   Filler
 );
 
-const API_BASE = 'http://localhost:4400/api';
+const API_BASE = '/api';
 
 export default function App() {
   const [stats, setStats] = useState<any>(null);
