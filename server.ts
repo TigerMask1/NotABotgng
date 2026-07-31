@@ -121,6 +121,9 @@ app.post("/api/bot/stop", (_req, res) => {
   res.json({ message: "Bots stopped" });
 });
 
+// Mount Dashboard
+mountDashboardServer(app);
+
 // Boot
 app.listen(Number(PORT), "0.0.0.0", () => {
   console.log(`[server] Running on http://localhost:${PORT}`);
@@ -142,6 +145,4 @@ app.listen(Number(PORT), "0.0.0.0", () => {
   } else {
     console.warn("[server] BUSINESS_BOT_TOKEN not set — business bot not started.");
   }
-  
-  mountDashboardServer(app);
 });
