@@ -335,8 +335,8 @@ class TelemetryEngine {
 
       // -- Phase 3: Advanced Intelligence --
       case 'SESSION_TURN_DEPTH':
-        if (userId) {
-          s.userSessionTurns[userId] = Math.max(s.userSessionTurns[userId] || 0, e.data.turns || 0);
+        if (e.userId) {
+          s.userSessionTurns[e.userId] = Math.max(s.userSessionTurns[e.userId] || 0, e.data.turns || 0);
         }
         break;
       case 'RESPONSE_TIME':
@@ -344,12 +344,12 @@ class TelemetryEngine {
         s.responseCount++;
         break;
       case 'USER_SEEN':
-        if (userId) {
+        if (e.userId) {
           const nowMs = Date.now();
-          if (!s.firstSeenDates[userId]) {
-            s.firstSeenDates[userId] = nowMs;
+          if (!s.firstSeenDates[e.userId]) {
+            s.firstSeenDates[e.userId] = nowMs;
           } else {
-            const daysSinceFirst = (nowMs - s.firstSeenDates[userId]) / (1000 * 60 * 60 * 24);
+            const daysSinceFirst = (nowMs - s.firstSeenDates[e.userId]) / (1000 * 60 * 60 * 24);
             if (daysSinceFirst >= 1 && daysSinceFirst < 2) s.retentionD1++;
             else if (daysSinceFirst >= 7 && daysSinceFirst < 8) s.retentionD7++;
             else if (daysSinceFirst >= 30 && daysSinceFirst < 31) s.retentionD30++;

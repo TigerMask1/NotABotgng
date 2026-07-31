@@ -2517,9 +2517,9 @@ async function executeBrainDecision(opts: {
 
   // ── Action: react (add an emoji reaction to the target message) ─────
   if (decision.action === 'react') {
-    if (opts.replyToMsg && decision.emoji) {
-      Telemetry.track('EMOJI_USED', { emoji: decision.emoji }, undefined, opts.guildId);
-      await opts.replyToMsg.react(decision.emoji).catch(() => {});
+    if (opts.replyToMsg && decision.reaction) {
+      Telemetry.track('EMOJI_USED', { emoji: decision.reaction }, undefined, opts.guildId);
+      await opts.replyToMsg.react(decision.reaction).catch(() => {});
     }
     return decision;
   }
@@ -2582,7 +2582,7 @@ async function sendDecision(opts: {
   const { channel, decision, channelId, guildId, replyToMsg } = opts;
   const state = getChState(channelId);
   
-  if (replyToMsg && decision.action !== 'ignore' && decision.action !== 'silent') {
+  if (replyToMsg && decision.action !== 'ignore') {
     Telemetry.track('RESPONSE_TIME', { latencyMs: Date.now() - replyToMsg.createdTimestamp }, undefined, guildId);
   }
 
