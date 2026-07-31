@@ -1433,18 +1433,20 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
     '- If amount > ' + userData.botcoin + ' coins -> action="reply" and tell Sir they cannot afford it.',
     '- If user asks about their own stats/coins/level/wins/profile -> use action="lookup" with target="self" FIRST, then reply with the data.',
     '- If user asks to COMPARE themselves with someone, or asks about another user -> use action="lookup" for each user. You can lookup multiple times.',
-    '- ALWAYS prefer action="execute_command" over action="reply" when the user is asking for something a command can handle (e.g. "show my profile" -> execute profile, "show leaderboard" -> execute lb, "open a box" -> execute open). Do NOT just reply with text when a command exists for it.',
+    '- ALWAYS prefer action="execute_command" or action="execute_commands" over action="reply" when the user is asking for something a command can handle (e.g. "show my profile" -> execute profile, "show leaderboard" -> execute lb, "open a box" -> execute open). Do NOT just reply with text when a command exists for it.',
+    '- If you need to run MULTIPLE commands in one go (e.g. buying 5 different stocks to diversify), use action="execute_commands" with a "commands" array. This is the ONLY way to actually execute multiple things — do NOT just describe what you would do in a reply.',
     '- ONLY output valid JSON. No markdown.',
     '',
     'FORMATS (pick one):',
-    '{"action":"lookup","target":"<@id> OR username OR self","reason":"<why>"}  — Use this to fetch any user\'s full stats before answering questions about them. You can use their Discord <@id> if known, OR their plain username (e.g. "NotABot"). Use "self" to look up the person talking to you.',
-    '{"action":"execute_command","command":"<name>","args":[...],"reply":"<short Sir-addressed line>"}',
+    '{"action":"lookup","target":"<@id> OR username OR self","reason":"<why>"}  — Use this to fetch any user\'s full stats before answering questions about them.',
+    '{"action":"execute_command","command":"<name>","args":[...],"reply":"<short Sir-addressed line>"}  — Single command.',
+    '{"action":"execute_commands","commands":[{"command":"<name>","args":[...]}, ...],"reply":"<summary of what you did>"}  — Multiple commands at once (e.g. buying multiple stocks).',
     '{"action":"ask","reply":"<one question to Sir>"}',
     '{"action":"reply","reply":"<one-line response>"}',
   ].join('\n');
 
   let loopCount = 0;
-  while (loopCount < 3) {
+  while (loopCount < 5) {
     loopCount++;
     try {
       const raw = await groq.call(systemPrompt, promptText, 0.3, undefined, false);
@@ -1483,11 +1485,12 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
         continue; // Loop again with new context
       }
 
-      // Only send text reply if the action is NOT execute_command (the command embed IS the response)
-      if (parsed.action !== 'execute_command' && parsed.reply) {
+      // Only send text reply if not executing commands (the command output IS the response)
+      if (parsed.action !== 'execute_command' && parsed.action !== 'execute_commands' && parsed.reply) {
         await msg.reply(String(parsed.reply)).catch(() => {});
       }
 
+      // Single command execution
       if (parsed.action === 'execute_command' && parsed.command) {
         const spendingCmds = new Set(['slots', 'pay', 'wager', 'buy', 'bounty', 'setname', 'addmoney', 'removemoney']);
         if (spendingCmds.has(parsed.command)) {
@@ -1500,6 +1503,18 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
           }
         }
         await handleCommand(msg, parsed.command, (parsed.args || []).map(String));
+      }
+
+      // Batch command execution (e.g. diversifying into multiple stocks)
+      if (parsed.action === 'execute_commands' && Array.isArray(parsed.commands)) {
+        if (parsed.reply) {
+          await msg.reply(String(parsed.reply)).catch(() => {});
+        }
+        for (const cmd of parsed.commands) {
+          if (cmd.command) {
+            await handleCommand(msg, cmd.command, (cmd.args || []).map(String));
+          }
+        }
       }
       
       break; // Exit loop if it wasn't a lookup
