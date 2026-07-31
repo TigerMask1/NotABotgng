@@ -3,6 +3,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { startBot, stopBot, getBotStatus } from "./src/services/discordBot.ts";
 import { startBusinessBot, stopBusinessBot } from "./src/services/businessBot.ts";
+import { startDashboardServer } from "./src/services/dashboardServer.ts";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -136,4 +137,6 @@ app.listen(Number(PORT), "0.0.0.0", () => {
   } else {
     console.warn("[server] BUSINESS_BOT_TOKEN not set — business bot not started.");
   }
+  
+  startDashboardServer(4400);
 });

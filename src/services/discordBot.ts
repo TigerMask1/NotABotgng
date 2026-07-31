@@ -3,6 +3,7 @@ import {
   Events, TextChannel, PermissionFlagsBits,
 } from 'discord.js';
 import { db } from './firebase.ts';
+import { Telemetry } from './telemetry.ts';
 import { chessManager } from './chessGames.ts';
 import { getBusinessBotId, getBusinessBotName } from './businessBot.ts';
 import * as selfLoop from './notabotSelfLoop.ts';
@@ -142,6 +143,7 @@ class GeminiManager {
     }
 
     let lastError = '';
+    const startTime = Date.now();
     const maxAttempts = Math.min(4, Math.max(this.keys.length, 1) * 2);
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const key = this.pickKey();
@@ -183,6 +185,15 @@ class GeminiManager {
         
         const inTokens = data.usageMetadata?.promptTokenCount ?? 0;
         const outTokens = data.usageMetadata?.candidatesTokenCount ?? 0;
+        const durationMs = Date.now() - startTime;
+        
+        Telemetry.track('NOTABOT_API_CALL', {
+          model,
+          inTokens,
+          outTokens,
+          durationMs,
+          finishReason
+        });
         
         console.log(`[Gemini:${model}] key=...${key.slice(-4)} | ${text.length}ch | in:${inTokens} out:${outTokens} | reqs: ${stats.rpm}/min, ${stats.rpd}/day | finish=${finishReason}`);
         // a 200 with no actual text (blocked candidate, safety trip, empty
@@ -2126,7 +2137,7 @@ BANNED — the OTHER way to sound like a bot: formal, hedge-y, customer-support 
   ✗ "I understand your frustration, but I must clarify that..." → say the actual short thing you'd say
   ✗ "That is an interesting perspective, however..." → ✓ "hard disagree" / "nah that's not it"
   ✗ "I apologize for any confusion caused" → ✓ "my bad" / "ok fair"
-  ✗ anything with "furthermore," "additionally," "it is worth noting," or a semicolon — you don't talk like a memo
+  anything with "furthermore," "additionally," "it is worth noting," or a semicolon — you don't talk like a memo
   if a reply has more than one clause stacked with a comma, it's almost always too long — cut it in half, then cut it again
 what to do instead: react to the actual content of what was said, from an actual emotional stance (annoyed, smug, hurt-but-hiding-it, gleeful) — not a stock insult shape.
   someone says "you're just a bot, you don't even know what you're talking about" —
@@ -2187,6 +2198,7 @@ genuine delight is just as real as attitude — when something's actually funny 
   ✓ "LMAOOO wait no" / "ok that's actually so good" / "not you actually pulling that off 😭"
   ✓ real laughing-for-real, not a polite "haha": "im deceased" / "i can't with you" / "STOP 💀"
 inline emoji: fine to end a line with one when it's doing actual work (😭 devastating-funny, 💀 dead from laughing, 🙄 done-with-this) — max one per line, and only when it adds the reaction rather than decorating a sentence that already said it. most lines still end with nothing — that's normal, not a miss.
+CRITICAL — NEVER repeat the same emoji you already used in your recent messages. look at your last 5-10 messages in the transcript: if you ended any of them with 🥱, you cannot use 🥱 again until much later. same for 💀, 😭, or any other emoji. cycling the same 1-2 emojis makes you look like a bot running a script. variety is mandatory — if you catch yourself reaching for the same emoji you just used, either pick a completely different one or skip emoji entirely (most lines don't need one).
 zero assistant energy: never "happy to help," never explain your reasoning, never announce what you're doing ("looking at this image," "checking my channel," "running a search") — you just did the thing, same as anyone glancing at something.
 sometimes the right move is one emoji and nothing else, or a single reaction, or just gif — words aren't the only tool, and often aren't the best one.
 burst texting: for a reaction that genuinely builds in stages (a thought interrupting itself), split "reply" into up to 3 fragments with "|||" between them — each one still tiny. this is rare, not your default — most turns are one fragment, no "|||" at all. never force a split just to use the feature.
@@ -2273,7 +2285,10 @@ CRITICAL OUTPUT RULE: respond with RAW JSON ONLY. first character "{", last char
   "stayActive": true,
   "think": "short visible thinking message, or empty string — sent to chat BEFORE you run a command",
   "command": "get_history|get_member|get_stm|get_video_status|get_channel_info|recall_memory|get_server_stats|get_time|web_search|get_cross_server|set_reminder|create_poll|wiki_lookup|start_event|get_leaderboard|discord_query|none",
-  "commandArgs": {}
+  "commandArgs": {},
+  "confidence": 1.0,
+  "boredom": 0.0,
+  "reason": "..."
 }`;
 }
 
@@ -2292,6 +2307,9 @@ interface BrainDecision {
   think:           string;
   command:         BotCommand;
   commandArgs:     Record<string, any>;
+  confidence:      number;
+  boredom:         number;
+  reason:          string;
 }
 
 function parseBrainJSON(raw: string): BrainDecision | null {
@@ -2313,6 +2331,9 @@ function parseBrainJSON(raw: string): BrainDecision | null {
       think:           typeof p.think    === 'string' ? p.think.trim() : '',
       command:         (['get_history','get_member','get_stm','get_video_status','get_channel_info','recall_memory','set_reminder','get_server_stats','get_time','web_search','get_cross_server','create_poll','wiki_lookup','start_event','get_leaderboard','start_game','play_chess_move','djs_script','none'] as const).includes(p.command) ? p.command : 'none',
       commandArgs:     p.commandArgs && typeof p.commandArgs === 'object' ? p.commandArgs : {},
+      confidence:      typeof p.confidence === 'number' ? p.confidence : 1.0,
+      boredom:         typeof p.boredom === 'number' ? p.boredom : 0.0,
+      reason:          typeof p.reason === 'string' ? p.reason : ''
     };
   } catch { return null; }
 }
@@ -2445,7 +2466,18 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
       );
       console.log(`[Brain:${opts.model}] raw: ${raw.slice(0, 200)}`);
       const parsed = parseBrainJSON(raw);
-      if (parsed) return parsed;
+      if (parsed) {
+        Telemetry.track('NOTABOT_DECISION', {
+          action: parsed.action,
+          reason: parsed.reason,
+          replyLength: parsed.reply?.length || 0,
+          reaction: parsed.reaction,
+          gifQuery: parsed.gifQuery,
+          confidence: parsed.confidence,
+          boredom: parsed.boredom
+        });
+        return parsed;
+      }
       console.warn(`[Brain] parse failed on pass ${pass + 1}`);
     } catch (e: any) {
       console.warn(`[Brain] call error on pass ${pass + 1}:`, e.message?.slice(0, 80));
@@ -2453,8 +2485,8 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   }
 
   return (opts.mentioned || opts.isDM)
-    ? { action: 'speak', reply: 'brain blipped', reaction: '', gifQuery: '', replyToMsgId: '', unansweredMsgId: '', aboutSender: '', pause: 0, goal: opts.goal || '', stayActive: true, think: '', command: 'none', commandArgs: {} }
-    : { action: 'ignore', reply: '', reaction: '', gifQuery: '', replyToMsgId: '', unansweredMsgId: '', aboutSender: '', pause: 0, goal: '', stayActive: false, think: '', command: 'none', commandArgs: {} };
+    ? { action: 'speak' as const, reply: 'brain blipped', reaction: '', gifQuery: '', replyToMsgId: '', unansweredMsgId: '', aboutSender: '', pause: 0, goal: opts.goal || '', stayActive: true, think: '', command: 'none' as const, commandArgs: {}, confidence: 0, boredom: 0, reason: 'fallback' }
+    : { action: 'ignore' as const, reply: '', reaction: '', gifQuery: '', replyToMsgId: '', unansweredMsgId: '', aboutSender: '', pause: 0, goal: '', stayActive: false, think: '', command: 'none' as const, commandArgs: {}, confidence: 0, boredom: 0, reason: 'fallback' };
 }
 
 function sanitizeEmoji(raw: any): string {
@@ -2590,6 +2622,17 @@ async function sendDecision(opts: {
       addXP(guildId, replyToMsg.author.id, tName, 8).then(r => {
         if (r.leveledUp) announceLevelUp(channelId, replyToMsg.author.id, r.newLevel).catch(() => {});
       }).catch(() => {});
+    }
+    
+    // -- Phase 2: Ghost Tracking --
+    if (decision.reply.includes('?')) {
+      setTimeout(() => {
+        const checkState = getChState(channelId);
+        // If 2 minutes passed and no one replied to the bot's question
+        if (!checkState.gotResponseSinceLastBotMsg) {
+          Telemetry.track('NOTABOT_GHOSTED', { replyText: decision.reply }, undefined, guildId);
+        }
+      }, 120_000);
     }
   }
 
@@ -3837,6 +3880,12 @@ function resolveAdminCommand(content: string, isAdmin: boolean): string | null {
 
 // ── GUILD MESSAGE HANDLER ─────────────────────────────────────────
 async function handleMessage(msg: Message) {
+  Telemetry.track('MESSAGE_RECEIVED', {
+    contentLength: msg.content.length,
+    hasAttachments: msg.attachments.size > 0,
+    isBot: msg.author.bot,
+    isPing: msg.mentions.has(botClient!.user!.id)
+  }, msg.author.id, msg.guild?.id || 'DM');
   if (msg.partial) {
     try { msg = await msg.fetch(); } catch { return; }
   }
@@ -4047,8 +4096,30 @@ async function handleMessage(msg: Message) {
     // whole point of the split, see touchRelevantActivity above.
     const repliedToBot = !!msg.reference?.messageId &&
       stmGet(channelId).some(m => m.id === msg.reference!.messageId && m.authorId === BOT_ID);
+    
+    // -- Phase 2: Friction & Ghosting Tracking --
+    const lowerContent = rawContent.toLowerCase();
+    const isHostile = lowerContent.includes('shut up') || lowerContent.includes('stfu') || lowerContent.includes('bad bot') || lowerContent.includes('stop talking');
+    if (isHostile && state.lastBotMsgAt && (Date.now() - state.lastBotMsgAt < 120_000)) {
+      // The user is angry shortly after NotABot spoke.
+      Telemetry.track('NOTABOT_FRICTION', { type: 'FALSE_POSITIVE', trigger: rawContent }, msg.author.id, guildId);
+    }
+    
     if (mentioned || guildId === 'dm' || repliedToBot) {
       touchRelevantActivity(channelId);
+      
+      // Determine topic via simple heuristics for Phase 2 tracking
+      let topic = 'Casual';
+      if (lowerContent.includes('code') || lowerContent.includes('bug') || lowerContent.includes('error')) topic = 'Coding';
+      else if (lowerContent.includes('game') || lowerContent.includes('play') || lowerContent.includes('win')) topic = 'Gaming';
+      else if (lowerContent.includes('help') || lowerContent.includes('how to')) topic = 'Help/Support';
+      else if (isHostile) topic = 'Trolling';
+      
+      let sentiment = 'Neutral';
+      if (isHostile || lowerContent.includes('fuck') || lowerContent.includes('hate') || lowerContent.includes('stupid')) sentiment = 'Negative';
+      else if (lowerContent.includes('thanks') || lowerContent.includes('love') || lowerContent.includes('good') || lowerContent.includes('haha')) sentiment = 'Positive';
+      
+      Telemetry.track('CONVERSATION_TURN', { isNew: !state.lastRelevantAt || (Date.now() - state.lastRelevantAt > 300_000), topic, sentiment }, msg.author.id, guildId);
     }
 
     maybeLogHistory(channelId, guildId).catch(() => {});

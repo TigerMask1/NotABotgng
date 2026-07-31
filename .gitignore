@@ -6,3 +6,6 @@ coverage/
 *.log
 .env*
 !.env.example
+pipeline/venv/
+dashboard/node_modules/
+dashboard/dist/

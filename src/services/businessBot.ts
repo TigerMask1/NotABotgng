@@ -3,6 +3,7 @@ import {
   Client, GatewayIntentBits, Message, Partials, Events, EmbedBuilder
 } from 'discord.js';
 import { db } from './firebase.ts';
+import { Telemetry } from './telemetry.ts';
 import { groq } from './groqBot.ts';
 
 let botClient: Client | null = null;
@@ -266,6 +267,7 @@ export function getBusinessBotName() { return botClient?.user?.username || 'Busi
 
 // ── COMMAND ROUTER ────────────────────────────────────────────────────────────
 async function handleCommand(msg: Message, command: string, args: string[]) {
+  Telemetry.track('COMMAND_EXECUTE', { command, args }, msg.author.id, msg.guild?.id || 'DM');
   const userId   = msg.author.id;
   const username = msg.member?.displayName || msg.author.username;
 
@@ -377,6 +379,7 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
       userData.totalEarned += dailyAmt + interest + bonus;
       addXP(userData, 30 + streak * 5);
       await saveUser(userId, userData);
+      Telemetry.track('ECONOMY_DAILY', { amount: dailyAmt + interest + bonus, streak, interest, bonus }, userId, msg.guild?.id || 'DM');
 
       const embed = new EmbedBuilder()
         .setColor(0xf1c40f)
@@ -526,6 +529,7 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
       userData.totalEarned += winAmt;
       addXP(userData, 10);
       await saveUser(userId, userData);
+      Telemetry.track('ECONOMY_GAMBLE', { game: 'slots', amount: bet, payout: winAmt, won: winAmt > 0, reels }, userId, msg.guild?.id || 'DM');
 
       const embed = new EmbedBuilder()
         .setColor(winAmt > 0 ? 0xf1c40f : 0xff0000)
@@ -573,6 +577,7 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
         userData.wins++;
         addXP(userData, 60);
         await Promise.all([saveUser(userId, userData), saveUser(targetId, targetData as UserData)]);
+        Telemetry.track('ECONOMY_ROB', { success: true, stolen, targetId }, userId, msg.guild?.id || 'DM');
         msg.reply(`💰 **ROB SUCCESS!** You swiped 🪙 **${stolen.toLocaleString()}** from <@${targetId}>!${hasNuke ? ' (Nuke used 💣)' : ''}`);
       } else {
         const fine = Math.floor(userData.botcoin * 0.10);
@@ -581,6 +586,7 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
         userData.losses++;
         addXP(userData, 10);
         await saveUser(userId, userData);
+        Telemetry.track('ECONOMY_ROB', { success: false, fine, targetId }, userId, msg.guild?.id || 'DM');
         msg.reply(`🚔 **CAUGHT!** You got arrested robbing <@${targetId}>. Paid 🪙 **${fine.toLocaleString()}** fine and you're in jail for **30 minutes**. Use \`!profile\` to see your sentence.`);
       }
       break;
@@ -656,6 +662,7 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
         saveUser(winnerId, winner),
         saveUser(loserId, loser),
       ]);
+      Telemetry.track('ECONOMY_GAMBLE', { game: 'wager', amount: wager.amount, won: winnerId === userId, winnerId, loserId }, userId, msg.guild?.id || 'DM');
 
       const embed = new EmbedBuilder()
         .setColor(0xf1c40f)
@@ -870,6 +877,7 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
       userData.stocks[sym] = (userData.stocks[sym] || 0) + shares;
       addXP(userData, 20);
       await saveUser(userId, userData);
+      Telemetry.track('ECONOMY_STOCK_BUY', { symbol: sym, shares, cost }, userId, msg.guild?.id || 'DM');
       msg.reply(`📈 Bought **${shares}x ${stock.name}** [${sym}] for 🪙 **${cost.toLocaleString()}**. Avg: ${stock.price}/share.`);
       break;
     }
@@ -888,6 +896,7 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
       userData.totalEarned   += revenue;
       addXP(userData, 15);
       await saveUser(userId, userData);
+      Telemetry.track('ECONOMY_STOCK_SELL', { symbol: sym, shares, revenue }, userId, msg.guild?.id || 'DM');
       msg.reply(`📉 Sold **${shares}x ${sym}** for 🪙 **${revenue.toLocaleString()}**.`);
       break;
     }
@@ -1458,14 +1467,24 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
   while (loopCount < 5) {
     loopCount++;
     try {
+      const startTime = Date.now();
       const raw = await groq.call(systemPrompt, promptText, 0.3, undefined, false);
+      const durationMs = Date.now() - startTime;
       let parsed: any;
       try {
         parsed = JSON.parse(raw.replace(/```json/gi, '').replace(/```/g, '').trim());
       } catch {
+        Telemetry.track('NLP_FAILED', { durationMs, raw }, userId, msg.guild?.id || 'DM');
         await msg.reply('Sir, I had trouble parsing that. Please rephrase.').catch(() => {});
         return;
       }
+      
+      Telemetry.track('NLP_PROCESSED', {
+        durationMs,
+        action: parsed.action,
+        command: parsed.command,
+        args: parsed.args
+      }, userId, msg.guild?.id || 'DM');
 
       if (parsed.action === 'lookup') {
         let targetId = parsed.target === 'self' || parsed.target === `<@${userId}>` ? userId : parsed.target.replace(/[<@>]/g, '');

@@ -1,0 +1,335 @@
+import { db } from './firebase.ts';
+
+// ════════════════════════════════════════════════════════════════════════════
+// TELEMETRY ENGINE — Enterprise-grade, non-blocking data collection
+// ════════════════════════════════════════════════════════════════════════════
+
+export interface TelemetryEvent {
+  eventType: string;
+  timestamp: string;
+  hour: number;         // 0-23 for heatmaps
+  dayOfWeek: number;    // 0=Sun for heatmaps
+  userId?: string;
+  username?: string;
+  guildId?: string;
+  channelId?: string;
+  data: Record<string, any>;
+}
+
+// ── Rolling counters for the Express API (in-memory, no extra DB reads) ──
+interface RollingStats {
+  totalMessages: number;
+  totalCommands: number;
+  totalApiCalls: number;
+  totalTokensIn: number;
+  totalTokensOut: number;
+  totalApiLatencyMs: number;
+  totalNlpCalls: number;
+  totalNlpFailures: number;
+  totalNlpLatencyMs: number;
+  totalCoinsEarned: number;
+  totalCoinsLost: number;
+  totalGambles: number;
+  totalGambleWins: number;
+  totalGambleLosses: number;
+  totalStockBuys: number;
+  totalStockSells: number;
+  totalShopPurchases: number;
+  totalRobs: number;
+  totalRobSuccesses: number;
+  totalTrades: number;
+  totalBountiesPosted: number;
+  totalBountiesAwarded: number;
+  totalForges: number;
+  totalAuctions: number;
+  decisionsSpeak: number;
+  decisionsReact: number;
+  decisionsGif: number;
+  decisionsPlay: number;
+  decisionsIgnore: number;
+  decisionsSilent: number;
+  totalDMs: number;
+  uniqueUsers: Set<string>;
+  uniqueGuilds: Set<string>;
+  commandCounts: Record<string, number>;
+  userMessageCounts: Record<string, number>;
+  userCommandCounts: Record<string, number>;
+  hourlyActivity: number[];    // 24 slots
+  guildActivity: Record<string, number>;
+  channelActivity: Record<string, number>;
+  apiModelCounts: Record<string, number>;
+  
+  // -- Phase 2: NotABot Intelligence --
+  totalConversations: number;
+  totalConversationTurns: number;
+  falsePositives: number; // The "Shut Up" metric
+  falseNegatives: number; // The "Ignored" metric
+  ghostRates: number; // Unanswered questions
+  topicDistribution: Record<string, number>;
+  sentimentDistribution: Record<string, number>;
+  avgConfidence: number;
+  avgBoredom: number;
+  
+  recentEvents: TelemetryEvent[];    // last 100 events for live ticker
+  sessionStart: string;
+}
+
+function freshStats(): RollingStats {
+  return {
+    totalMessages: 0,
+    totalCommands: 0,
+    totalApiCalls: 0,
+    totalTokensIn: 0,
+    totalTokensOut: 0,
+    totalApiLatencyMs: 0,
+    totalNlpCalls: 0,
+    totalNlpFailures: 0,
+    totalNlpLatencyMs: 0,
+    totalCoinsEarned: 0,
+    totalCoinsLost: 0,
+    totalGambles: 0,
+    totalGambleWins: 0,
+    totalGambleLosses: 0,
+    totalStockBuys: 0,
+    totalStockSells: 0,
+    totalShopPurchases: 0,
+    totalRobs: 0,
+    totalRobSuccesses: 0,
+    totalTrades: 0,
+    totalBountiesPosted: 0,
+    totalBountiesAwarded: 0,
+    totalForges: 0,
+    totalAuctions: 0,
+    decisionsSpeak: 0,
+    decisionsReact: 0,
+    decisionsGif: 0,
+    decisionsPlay: 0,
+    decisionsIgnore: 0,
+    decisionsSilent: 0,
+    totalDMs: 0,
+    uniqueUsers: new Set(),
+    uniqueGuilds: new Set(),
+    commandCounts: {},
+    userMessageCounts: {},
+    userCommandCounts: {},
+    hourlyActivity: new Array(24).fill(0),
+    guildActivity: {},
+    channelActivity: {},
+    apiModelCounts: {},
+    
+    // -- Phase 2: NotABot Intelligence --
+    totalConversations: 0,
+    totalConversationTurns: 0,
+    falsePositives: 0,
+    falseNegatives: 0,
+    ghostRates: 0,
+    topicDistribution: {},
+    sentimentDistribution: {},
+    avgConfidence: 0,
+    avgBoredom: 0,
+    
+    recentEvents: [],
+    sessionStart: new Date().toISOString()
+  };
+}
+
+class TelemetryEngine {
+  private buffer: TelemetryEvent[] = [];
+  private batchSize = 50;
+  private flushIntervalMs = 15_000;
+  private interval: NodeJS.Timeout | null = null;
+  public stats: RollingStats = freshStats();
+
+  constructor() {
+    this.interval = setInterval(() => this.flush(), this.flushIntervalMs);
+  }
+
+  /** Fire-and-forget event tracking — never throws, never blocks */
+  public track(
+    eventType: string,
+    data: Record<string, any>,
+    userId?: string,
+    guildId?: string,
+    extra?: { username?: string; channelId?: string }
+  ) {
+    const now = new Date();
+    const event: TelemetryEvent = {
+      eventType,
+      timestamp: now.toISOString(),
+      hour: now.getHours(),
+      dayOfWeek: now.getDay(),
+      userId,
+      username: extra?.username,
+      guildId,
+      channelId: extra?.channelId,
+      data
+    };
+
+    this.buffer.push(event);
+
+    // ── Update rolling stats in-memory ──
+    this.updateRollingStats(event);
+
+    // Keep last 100 events for live ticker
+    this.stats.recentEvents.push(event);
+    if (this.stats.recentEvents.length > 100) this.stats.recentEvents.shift();
+
+    if (this.buffer.length >= this.batchSize) {
+      this.flush();
+    }
+  }
+
+  private updateRollingStats(e: TelemetryEvent) {
+    const s = this.stats;
+    if (e.userId) s.uniqueUsers.add(e.userId);
+    if (e.guildId && e.guildId !== 'DM') s.uniqueGuilds.add(e.guildId);
+    s.hourlyActivity[e.hour]++;
+    if (e.guildId) s.guildActivity[e.guildId] = (s.guildActivity[e.guildId] || 0) + 1;
+    if (e.channelId) s.channelActivity[e.channelId] = (s.channelActivity[e.channelId] || 0) + 1;
+
+    switch (e.eventType) {
+      case 'MESSAGE_RECEIVED':
+        s.totalMessages++;
+        if (e.userId) s.userMessageCounts[e.userId] = (s.userMessageCounts[e.userId] || 0) + 1;
+        if (e.guildId === 'DM') s.totalDMs++;
+        break;
+
+      case 'COMMAND_EXECUTE':
+        s.totalCommands++;
+        const cmd = e.data.command as string;
+        s.commandCounts[cmd] = (s.commandCounts[cmd] || 0) + 1;
+        if (e.userId) s.userCommandCounts[e.userId] = (s.userCommandCounts[e.userId] || 0) + 1;
+        break;
+
+      case 'NOTABOT_API_CALL':
+        s.totalApiCalls++;
+        s.totalTokensIn += e.data.inTokens || 0;
+        s.totalTokensOut += e.data.outTokens || 0;
+        s.totalApiLatencyMs += e.data.durationMs || 0;
+        const model = e.data.model || 'unknown';
+        s.apiModelCounts[model] = (s.apiModelCounts[model] || 0) + 1;
+        break;
+
+      case 'NOTABOT_DECISION':
+        switch (e.data.action) {
+          case 'speak': s.decisionsSpeak++; break;
+          case 'react': s.decisionsReact++; break;
+          case 'gif':   s.decisionsGif++;   break;
+          case 'play':  s.decisionsPlay++;  break;
+          case 'ignore': s.decisionsIgnore++; break;
+          case 'silent': s.decisionsSilent++; break;
+        }
+        if (e.data.confidence) {
+          // Rolling average formula
+          s.avgConfidence = s.avgConfidence === 0 ? e.data.confidence : (s.avgConfidence * 0.9) + (e.data.confidence * 0.1);
+        }
+        if (e.data.boredom) {
+          s.avgBoredom = s.avgBoredom === 0 ? e.data.boredom : (s.avgBoredom * 0.9) + (e.data.boredom * 0.1);
+        }
+        break;
+
+      case 'CONVERSATION_TURN':
+        s.totalConversationTurns++;
+        if (e.data.isNew) s.totalConversations++;
+        if (e.data.topic) s.topicDistribution[e.data.topic] = (s.topicDistribution[e.data.topic] || 0) + 1;
+        if (e.data.sentiment) s.sentimentDistribution[e.data.sentiment] = (s.sentimentDistribution[e.data.sentiment] || 0) + 1;
+        break;
+
+      case 'NOTABOT_FRICTION':
+        if (e.data.type === 'FALSE_POSITIVE') s.falsePositives++;
+        if (e.data.type === 'FALSE_NEGATIVE') s.falseNegatives++;
+        break;
+
+      case 'NOTABOT_GHOSTED':
+        s.ghostRates++;
+        break;
+
+      case 'NLP_PROCESSED':
+        s.totalNlpCalls++;
+        s.totalNlpLatencyMs += e.data.durationMs || 0;
+        break;
+
+      case 'NLP_FAILED':
+        s.totalNlpCalls++;
+        s.totalNlpFailures++;
+        s.totalNlpLatencyMs += e.data.durationMs || 0;
+        break;
+
+      case 'ECONOMY_GAMBLE':
+        s.totalGambles++;
+        if (e.data.won) { s.totalGambleWins++; s.totalCoinsEarned += e.data.payout || 0; }
+        else { s.totalGambleLosses++; s.totalCoinsLost += e.data.amount || 0; }
+        break;
+
+      case 'ECONOMY_ROB':
+        s.totalRobs++;
+        if (e.data.success) s.totalRobSuccesses++;
+        break;
+
+      case 'ECONOMY_STOCK_BUY':  s.totalStockBuys++;  break;
+      case 'ECONOMY_STOCK_SELL': s.totalStockSells++; break;
+      case 'ECONOMY_SHOP_BUY':  s.totalShopPurchases++; break;
+      case 'ECONOMY_TRADE':     s.totalTrades++;     break;
+      case 'ECONOMY_BOUNTY_POST':  s.totalBountiesPosted++;  break;
+      case 'ECONOMY_BOUNTY_AWARD': s.totalBountiesAwarded++; break;
+      case 'ECONOMY_FORGE':     s.totalForges++;     break;
+      case 'ECONOMY_AUCTION':   s.totalAuctions++;   break;
+      case 'ECONOMY_DAILY':     s.totalCoinsEarned += e.data.amount || 0; break;
+      case 'ECONOMY_PAY':       break; // transfer, not creation
+      case 'ECONOMY_WAGER':     s.totalGambles++; break;
+    }
+  }
+
+  /** Serialize stats for the dashboard API (Sets → counts) */
+  public getStatsSnapshot(): Record<string, any> {
+    const s = this.stats;
+    return {
+      ...s,
+      uniqueUsers: s.uniqueUsers.size,
+      uniqueGuilds: s.uniqueGuilds.size,
+      uniqueUsersList: [...s.uniqueUsers],
+      avgApiLatency: s.totalApiCalls > 0 ? Math.round(s.totalApiLatencyMs / s.totalApiCalls) : 0,
+      avgNlpLatency: s.totalNlpCalls > 0 ? Math.round(s.totalNlpLatencyMs / s.totalNlpCalls) : 0,
+      nlpSuccessRate: s.totalNlpCalls > 0 ? Math.round(((s.totalNlpCalls - s.totalNlpFailures) / s.totalNlpCalls) * 100) : 100,
+      gambleWinRate: s.totalGambles > 0 ? Math.round((s.totalGambleWins / s.totalGambles) * 100) : 0,
+      robSuccessRate: s.totalRobs > 0 ? Math.round((s.totalRobSuccesses / s.totalRobs) * 100) : 0,
+      economyInflation: s.totalCoinsEarned - s.totalCoinsLost,
+      avgConversationLength: s.totalConversations > 0 ? (s.totalConversationTurns / s.totalConversations).toFixed(1) : 0,
+      falsePositiveRate: s.decisionsSpeak > 0 ? ((s.falsePositives / s.decisionsSpeak) * 100).toFixed(1) : 0,
+      uptimeMs: Date.now() - new Date(s.sessionStart).getTime(),
+      // Top users by messages (sorted)
+      topUsers: Object.entries(s.userMessageCounts)
+        .sort(([,a], [,b]) => b - a)
+        .slice(0, 20)
+        .map(([id, count]) => ({ id, count })),
+      // Top commands
+      topCommands: Object.entries(s.commandCounts)
+        .sort(([,a], [,b]) => b - a)
+        .map(([cmd, count]) => ({ cmd, count })),
+      // Recent events for live ticker
+      recentEvents: s.recentEvents.slice(-50).reverse()
+    };
+  }
+
+  private async flush() {
+    if (this.buffer.length === 0) return;
+
+    const batch_events = this.buffer.splice(0, this.batchSize);
+
+    try {
+      const writeBatch = db.batch();
+      const colRef = db.collection('telemetryEvents');
+
+      for (const event of batch_events) {
+        writeBatch.set(colRef.doc(), event);
+      }
+
+      await writeBatch.commit();
+    } catch (e) {
+      console.error('[Telemetry] flush error:', e);
+      // Don't re-push to buffer to avoid memory leaks
+    }
+  }
+}
+
+export const Telemetry = new TelemetryEngine();
