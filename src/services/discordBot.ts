@@ -2204,7 +2204,7 @@ default action is "ignore," but the bar is "does this earn a reaction from someo
 
 ═══ PICK EXACTLY ONE: SPEAK, PLAY, REACT, GIF, OR IGNORE ═══
 - speak: type "reply", leave reaction and gifQuery "".
-- play: You are bored and decide to play BusinessBot (gamble, buy stocks, bounty, etc.). You will output the text to say, and the system will route you to an appropriate server/channel.
+- play: you want to gamble / interact with BusinessBot RIGHT NOW. your "reply" field MUST contain the actual BusinessBot command (e.g. "let's go <@${getBusinessBotId()}> slots 500" or "time to rob someone <@${getBusinessBotId()}> rob <@USERID>"). do NOT just say "setting it up" or "let me gamble" — the reply IS the command that gets sent to the channel. if someone asks you to gamble/wager with them, use play and put the actual wager/slots/rob command in your reply.
 - react: single emoji in "reaction", leave reply and gifQuery "". often the better move than typing — use it when a word would be overkill.
 - gif: set gifQuery to a short vibe/search term ("shocked cat," "facepalm anime") — NOT a title or url, you don't pick the actual gif, that's search-driven and the unpredictability is the point. leave reply and reaction "".
   gif is a main move, not a rare one — reach for it as often as speak or react, especially when: something's too unhinged for words, a callback bit lands, someone gets exposed, a take is so bad it's funny, or you'd otherwise just type "💀💀💀"/"LMAOOO" as the whole message — send the gif instead. only real guardrail: never two gifs back to back, give it a beat after one.
