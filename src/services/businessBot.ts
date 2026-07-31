@@ -844,11 +844,25 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
     }
 
     case 'buy': {
+      if (args[0]?.toLowerCase() === 'item') {
+        const itemId = args[1]?.toLowerCase();
+        const item   = ITEMS[itemId!];
+        if (!item || !item.shopPrice) { msg.reply('❌ That item is not in the shop. Use `!shop` to browse.'); return; }
+        if (userData.botcoin < item.shopPrice) { msg.reply(`❌ Costs 🪙 ${item.shopPrice.toLocaleString()}. You have 🪙 ${userData.botcoin.toLocaleString()}.`); return; }
+        userData.botcoin -= item.shopPrice;
+        userData.inventory[itemId!] = (userData.inventory[itemId!] || 0) + 1;
+        addXP(userData, 30);
+        await saveUser(userId, userData);
+        msg.reply(`🛒 Bought ${item.emoji} **${item.name}** for 🪙 ${item.shopPrice.toLocaleString()}!`);
+        break;
+      }
+
+      // Otherwise assume it's a stock
       const sym    = args[0]?.toUpperCase();
       const shares = parseInt(args[1], 10);
-      if (!sym || isNaN(shares) || shares <= 0) { msg.reply('Usage: `!buy <SYMBOL> <shares>`'); return; }
+      if (!sym || isNaN(shares) || shares <= 0) { msg.reply('Usage: `!buy <SYMBOL> <shares>` OR `!buy item <id>`'); return; }
       const stock = STOCKS[sym];
-      if (!stock) { msg.reply(`❌ Unknown symbol. Available: ${Object.keys(STOCKS).join(', ')}`); return; }
+      if (!stock) { msg.reply(`❌ Unknown stock symbol. Use \`!buy item <id>\` for shop items.`); return; }
       const cost = stock.price * shares;
       if (cost > userData.botcoin) { msg.reply(`❌ Costs 🪙 ${cost.toLocaleString()}. You have 🪙 ${userData.botcoin.toLocaleString()}.`); return; }
       userData.botcoin    -= cost;
@@ -916,20 +930,7 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
       break;
     }
 
-    case 'buy': {
-      // 'buy item' prefix to disambiguate from stocks
-      if (args[0]?.toLowerCase() !== 'item') break;
-      const itemId = args[1]?.toLowerCase();
-      const item   = ITEMS[itemId];
-      if (!item || !item.shopPrice) { msg.reply('❌ That item is not in the shop. Use `!shop` to browse.'); return; }
-      if (userData.botcoin < item.shopPrice) { msg.reply(`❌ Costs 🪙 ${item.shopPrice.toLocaleString()}. You have 🪙 ${userData.botcoin.toLocaleString()}.`); return; }
-      userData.botcoin -= item.shopPrice;
-      userData.inventory[itemId] = (userData.inventory[itemId] || 0) + 1;
-      addXP(userData, 30);
-      await saveUser(userId, userData);
-      msg.reply(`🛒 Bought ${item.emoji} **${item.name}** for 🪙 ${item.shopPrice.toLocaleString()}!`);
-      break;
-    }
+    // (buy item logic has been moved up into the main 'buy' case)
 
     // ── TRADE ─────────────────────────────────────────────────────────────
     case 'trade': {
@@ -1422,6 +1423,8 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
     'wager   -> args: ["<@id>", "<amount>"]   (needs @mention in message)',
     'accept  -> args: ["<@id>"]               (accept a wager)',
     'challenge -> args: ["<@id>", "<amount>", "<terms>"]',
+    'yield   -> args: ["<challenge_id>"]      (surrender a challenge)',
+    'award   -> args: ["<challenge_id>", "<@winner_id>"] (declare winner of a challenge)',
     'buy     -> args: ["<SYMBOL>", "<shares>"] OR args: ["item", "<item_id>"]',
     'sell    -> args: ["<SYMBOL>", "<shares>"]',
     'bounty  -> args: ["list"] OR ["post", "<amount>", "<task>"] OR ["award", "<bounty_id>", "<@user>"]',
