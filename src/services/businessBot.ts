@@ -1342,6 +1342,7 @@ async function handleCommand(msg: Message, command: string, args: string[]) {
           { name: '🤝 Trading',         value: '`!trade @user <item> for <item>` — Propose trade\n`!tradea <id>` — Accept trade\n`!traded <id>` — Decline trade' },
           { name: '🔨 Auctions',        value: '`!auction start <item_id>` — List item\n`!auction bid <key> <amt>` — Place bid\n`!auction list` — View active' },
           { name: '📜 Bounties',        value: '`!bounty post <amt> <task>` — Post task\n`!bounty list` — View open bounties\n`!bounty award <id> @user` — Pay out' },
+          { name: '🔧 Utility & Admin', value: '`!setname <name>` — Set profile name\n`!addmoney @user <amt>` — Admin spawn money\n`!removemoney @user <amt>` — Admin remove money' }
         )
         .setFooter({ text: 'Tip: Lucky Charm boosts coinflip odds. Piggy Bank earns more interest. Nuke helps rob.' });
       msg.reply({ embeds: [embed] });
