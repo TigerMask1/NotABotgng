@@ -4085,6 +4085,12 @@ async function handleMessage(msg: Message) {
       msg.reply(text).catch(() => {});
       return;
     }
+
+    // If it's still a prefix command at this point, it's not for NotABot (e.g. BusinessBot's !pay).
+    // Ignore it so the NLP brain doesn't hallucinate trying to reply to another bot's command.
+    if (/^![a-z]+/i.test(cmd)) {
+      return;
+    }
     const mentioned   = BOT_ID ? msg.mentions.has(BOT_ID) : false;
     const everyonePing = msg.mentions.everyone ?? false;
     const sender      = msg.member?.displayName || msg.author.username;
