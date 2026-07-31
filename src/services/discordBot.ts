@@ -888,6 +888,7 @@ function seedSTM(channelId: string, msgs: Message[]) {
 interface ChannelState {
   mode:                        'active' | 'passive';
   goal:                        string;   // why it's engaged right now, model-set
+  goalAge:                     number;   // how many turns the goal has been alive — goal is suppressed after 3 turns to prevent narrative hijacking
   lastActivityAt:              number;
   // like lastActivityAt, but ONLY touched when a message was actually relevant
   // to the bot (mentioned / DM / reply to one of its own messages). this is
@@ -911,11 +912,11 @@ const channelState = new Map<string, ChannelState>();
 function getChState(channelId: string): ChannelState {
   let s = channelState.get(channelId);
   if (!s) {
-    s = { mode: 'passive', goal: '', lastActivityAt: Date.now(), lastRelevantAt: Date.now(), lastBotMsgAt: 0, gotResponseSinceLastBotMsg: true, consecutiveUnpromptedReplies: 0, lastRepliedToSenderId: '' };
+    s = { mode: 'passive', goal: '', goalAge: 0, lastActivityAt: Date.now(), lastRelevantAt: Date.now(), lastBotMsgAt: 0, gotResponseSinceLastBotMsg: true, consecutiveUnpromptedReplies: 0, lastRepliedToSenderId: '' };
     channelState.set(channelId, s);
   }
   if (s.mode === 'active' && Date.now() - s.lastActivityAt > ACTIVE_IDLE_REVERT_MS) {
-    s.mode = 'passive'; s.goal = ''; s.consecutiveUnpromptedReplies = 0;
+    s.mode = 'passive'; s.goal = ''; s.goalAge = 0; s.consecutiveUnpromptedReplies = 0;
   }
   return s;
 }
@@ -923,16 +924,23 @@ function getChState(channelId: string): ChannelState {
 function goActive(channelId: string, goal: string) {
   const s = getChState(channelId);
   s.mode = 'active';
-  if (goal) s.goal = goal;
+  if (goal && goal !== s.goal) {
+    // New goal — reset the age counter so it gets full relevance window
+    s.goal = goal;
+    s.goalAge = 0;
+  } else if (goal) {
+    // Same goal, age it one turn
+    s.goalAge = (s.goalAge ?? 0) + 1;
+  }
   s.lastActivityAt = Date.now();
-  console.log(`[Mode] #${channelId.slice(-5)} active${s.goal ? ` — ${s.goal}` : ''}`);
+  console.log(`[Mode] #${channelId.slice(-5)} active${s.goal ? ` — ${s.goal} (age:${s.goalAge})` : ''}`);
   Telemetry.track('CHANNEL_MODE_CHANGE', { mode: 'active' }, undefined, undefined, { channelId });
 }
 
 function revertToPassive(channelId: string, reason = '') {
   const s = getChState(channelId);
   if (s.mode === 'passive') return;
-  s.mode = 'passive'; s.goal = ''; s.consecutiveUnpromptedReplies = 0;
+  s.mode = 'passive'; s.goal = ''; s.goalAge = 0; s.consecutiveUnpromptedReplies = 0;
   console.log(`[Mode] #${channelId.slice(-5)} passive${reason ? ` — ${reason}` : ''}`);
   Telemetry.track('CHANNEL_MODE_CHANGE', { mode: 'passive' }, undefined, undefined, { channelId });
 }
@@ -2374,6 +2382,7 @@ interface BrainOpts {
   crossChannelCtx?: string;  // what this user said in other channels recently
   consecutiveUnpromptedReplies?: number;
   guildId?:      string;
+  goalAge?:      number;   // how many turns the current goal has been alive
 }
 
 async function brain(opts: BrainOpts): Promise<BrainDecision> {
@@ -2411,7 +2420,10 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
     parts.push(`\nCRITICAL RULE: THIS SERVER IS SET TO FAMILY FRIENDLY MODE. You MUST NOT use any slurs, profanity, or toxic insults whatsoever. Keep banter clean and PG-13.`);
   }
 
-  if (opts.goal)          parts.push(`\nYOUR GOAL RIGHT NOW: ${opts.goal}`);
+  // Only inject the goal if it's fresh (< 3 turns old). A stale goal causes
+  // context-blending — the model forces unrelated new messages into the old
+  // narrative frame (e.g. "you traumatized me AND now you want money?").
+  if (opts.goal && (opts.goalAge ?? 0) < 3) parts.push(`\nYOUR GOAL RIGHT NOW: ${opts.goal}`);
   if (opts.memCtx)        parts.push(`\nSERVER MEMORY:\n${opts.memCtx}`);
   if (opts.personalCtx)      parts.push(`\nWHAT YOU KNOW ABOUT ${opts.sender.toUpperCase()} AS A PERSON (carries across every server/DM, not just this one):\n${opts.personalCtx}`);
   if (opts.crossChannelCtx)  parts.push(`\nWHAT ${opts.sender.toUpperCase()} RECENTLY SAID IN OTHER CHANNELS/SERVERS (so you have the full picture if they reference it):\n${opts.crossChannelCtx}`);
@@ -3782,7 +3794,7 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
     mentioned: anyMentioned, isDM: false, statusLine,
     inExchange, channelName: tChannelName, serverName: tServerName,
     everyonePing: tEveryonePing, endingConvo,
-    goal: state.goal, batchSize: batch.length,
+    goal: state.goal, goalAge: state.goalAge ?? 0, batchSize: batch.length,
     images,
     consecutiveUnpromptedReplies: state.consecutiveUnpromptedReplies,
     // [System Note] DO NOT REMOVE: senderId lets the brain context show <@id> for the sender.
