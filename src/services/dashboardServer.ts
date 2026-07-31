@@ -133,6 +133,173 @@ export function startDashboardServer(port = 4400) {
     }
   });
 
+  // ── EXPORT: Full JSON dump (download all metrics) ──
+  app.get('/api/export/json', (_, res) => {
+    const snapshot = Telemetry.getStatsSnapshot();
+    res.setHeader('Content-Disposition', `attachment; filename=notabot-metrics-${new Date().toISOString().slice(0,10)}.json`);
+    res.setHeader('Content-Type', 'application/json');
+    res.json({
+      exportedAt: new Date().toISOString(),
+      sessionStart: snapshot.sessionStart,
+      uptimeMs: snapshot.uptimeMs,
+      notabotIntelligence: {
+        totalConversations: snapshot.totalConversations,
+        totalConversationTurns: snapshot.totalConversationTurns,
+        avgConversationLength: snapshot.avgConversationLength,
+        falsePositives: snapshot.falsePositives,
+        falsePositiveRate: snapshot.falsePositiveRate,
+        ghostRates: snapshot.ghostRates,
+        topicDistribution: snapshot.topicDistribution,
+        sentimentDistribution: snapshot.sentimentDistribution,
+        avgConfidence: snapshot.avgConfidence,
+        avgBoredom: snapshot.avgBoredom,
+      },
+      aiDecisions: {
+        speak: snapshot.decisionsSpeak,
+        react: snapshot.decisionsReact,
+        gif: snapshot.decisionsGif,
+        play: snapshot.decisionsPlay,
+        ignore: snapshot.decisionsIgnore,
+        silent: snapshot.decisionsSilent,
+      },
+      apiPerformance: {
+        totalCalls: snapshot.totalApiCalls,
+        totalTokensIn: snapshot.totalTokensIn,
+        totalTokensOut: snapshot.totalTokensOut,
+        avgLatencyMs: snapshot.avgApiLatency,
+        modelUsage: snapshot.apiModelCounts,
+      },
+      engagement: {
+        totalMessages: snapshot.totalMessages,
+        uniqueUsers: snapshot.uniqueUsers,
+        uniqueGuilds: snapshot.uniqueGuilds,
+        hourlyActivity: snapshot.hourlyActivity,
+        topUsers: snapshot.topUsers,
+        guildActivity: snapshot.guildActivity,
+      },
+      economy: {
+        totalCoinsEarned: snapshot.totalCoinsEarned,
+        totalCoinsLost: snapshot.totalCoinsLost,
+        inflation: snapshot.economyInflation,
+        gambles: snapshot.totalGambles,
+        gambleWinRate: snapshot.gambleWinRate,
+        robs: snapshot.totalRobs,
+        robSuccessRate: snapshot.robSuccessRate,
+        stockBuys: snapshot.totalStockBuys,
+        stockSells: snapshot.totalStockSells,
+        trades: snapshot.totalTrades,
+      },
+      recentEvents: snapshot.recentEvents,
+    });
+  });
+
+  // ── EXPORT: CSV (flat table of recent events) ──
+  app.get('/api/export/csv', async (_, res) => {
+    try {
+      const snap = await db.collection('telemetryEvents')
+        .orderBy('timestamp', 'desc')
+        .limit(5000)
+        .get();
+      
+      const events = snap.docs.map(d => d.data());
+      if (!events.length) { res.status(200).send('No events yet'); return; }
+
+      const headers = ['timestamp', 'eventType', 'userId', 'guildId', 'data'];
+      const rows = events.map(e => [
+        e.timestamp,
+        e.eventType,
+        e.userId || '',
+        e.guildId || '',
+        JSON.stringify(e.data || {}).replace(/"/g, '""'),
+      ]);
+
+      const csv = [headers.join(','), ...rows.map(r => r.map(v => `"${v}"`).join(','))].join('\n');
+      res.setHeader('Content-Disposition', `attachment; filename=notabot-events-${new Date().toISOString().slice(0,10)}.csv`);
+      res.setHeader('Content-Type', 'text/csv');
+      res.send(csv);
+    } catch (e) {
+      res.status(500).json({ error: 'Failed to export CSV' });
+    }
+  });
+
+  // ── NotABot-Only Intelligence Summary ──
+  app.get('/api/notabot/intelligence', (_, res) => {
+    const s = Telemetry.getStatsSnapshot();
+    res.json({
+      conversationFunnel: {
+        totalConversations: s.totalConversations,
+        totalTurns: s.totalConversationTurns,
+        avgTurnsPerSession: s.avgConversationLength,
+      },
+      frictionAnalysis: {
+        totalFrictionEvents: s.falsePositives,
+        frictionRate: s.falsePositiveRate,
+        totalSpeakDecisions: s.decisionsSpeak,
+      },
+      ghostAnalysis: {
+        totalGhosted: s.ghostRates,
+      },
+      topicBreakdown: s.topicDistribution,
+      sentimentBreakdown: s.sentimentDistribution,
+      brainState: {
+        avgConfidence: s.avgConfidence,
+        avgBoredom: s.avgBoredom,
+      },
+      decisionMatrix: {
+        speak: s.decisionsSpeak,
+        react: s.decisionsReact,
+        gif: s.decisionsGif,
+        play: s.decisionsPlay,
+        ignore: s.decisionsIgnore,
+        silent: s.decisionsSilent,
+      },
+      apiHealth: {
+        totalCalls: s.totalApiCalls,
+        avgLatencyMs: s.avgApiLatency,
+        tokensIn: s.totalTokensIn,
+        tokensOut: s.totalTokensOut,
+      },
+      userEngagement: {
+        totalMessages: s.totalMessages,
+        uniqueUsers: s.uniqueUsers,
+        uniqueGuilds: s.uniqueGuilds,
+        topUsers: s.topUsers,
+        hourlyHeatmap: s.hourlyActivity,
+        avgResponseTimeMs: s.avgResponseTimeMs,
+        avgTurnsPerUser: s.avgTurnsPerUser,
+        retention: {
+          d1: s.retentionD1,
+          d7: s.retentionD7,
+          d30: s.retentionD30,
+        },
+      },
+      advancedIntelligence: {
+        commandDiscovery: {
+          nlpCount: s.nlpCommandCount,
+          prefixCount: s.prefixCommandCount,
+        },
+        concurrency: {
+          activeChannels: s.activeChannelsCount,
+          peakActiveChannels: s.peakConcurrentChannels,
+        },
+        proactive: {
+          successRate: s.proactiveSuccessRate,
+        },
+        coldOpen: {
+          successRate: s.coldOpenSuccessRate,
+        },
+        serverChurn: {
+          joins: s.guildJoins,
+          leaves: s.guildLeaves,
+        },
+        memoryRecall: {
+          successRate: s.memoryRecallSuccessRate,
+        },
+        emojiEffectiveness: s.topEmojis,
+      }
+    });
+  });
+
   // ── Serve static dashboard files ──
   const dashboardPath = path.resolve(__dirname, '../../dashboard/dist');
   app.use(express.static(dashboardPath));

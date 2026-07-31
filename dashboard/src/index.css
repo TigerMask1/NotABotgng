@@ -64,6 +64,28 @@ body {
   border: 1px solid rgba(16, 185, 129, 0.2);
 }
 
+.export-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #c4b5fd;
+  background: rgba(139, 92, 246, 0.15);
+  padding: 0.5rem 1rem;
+  border-radius: 9999px;
+  border: 1px solid rgba(139, 92, 246, 0.25);
+  text-decoration: none;
+  transition: all 0.2s ease;
+  cursor: pointer;
+}
+
+.export-btn:hover {
+  background: rgba(139, 92, 246, 0.3);
+  border-color: rgba(139, 92, 246, 0.5);
+  transform: translateY(-1px);
+}
+
 .pulse {
   width: 8px;
   height: 8px;

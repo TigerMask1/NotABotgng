@@ -70,6 +70,29 @@ interface RollingStats {
   avgConfidence: number;
   avgBoredom: number;
   
+  // -- Phase 3: Advanced Intelligence --
+  userSessionTurns: Record<string, number>;
+  totalResponseTimeMs: number;
+  responseCount: number;
+  firstSeenDates: Record<string, number>;
+  retentionD1: number;
+  retentionD7: number;
+  retentionD30: number;
+  nlpCommandCount: number;
+  prefixCommandCount: number;
+  activeChannelsCount: number;
+  peakConcurrentChannels: number;
+  emojiUsages: Record<string, number>;
+  emojiFollowUps: Record<string, number>;
+  proactiveStarts: number;
+  proactiveSuccesses: number;
+  coldOpens: number;
+  coldOpenSuccesses: number;
+  guildJoins: number;
+  guildLeaves: number;
+  memoryRecalls: number;
+  memoryRecallSuccesses: number;
+  
   recentEvents: TelemetryEvent[];    // last 100 events for live ticker
   sessionStart: string;
 }
@@ -128,6 +151,29 @@ function freshStats(): RollingStats {
     avgConfidence: 0,
     avgBoredom: 0,
     
+    // -- Phase 3: Advanced Intelligence --
+    userSessionTurns: {},
+    totalResponseTimeMs: 0,
+    responseCount: 0,
+    firstSeenDates: {},
+    retentionD1: 0,
+    retentionD7: 0,
+    retentionD30: 0,
+    nlpCommandCount: 0,
+    prefixCommandCount: 0,
+    activeChannelsCount: 0,
+    peakConcurrentChannels: 0,
+    emojiUsages: {},
+    emojiFollowUps: {},
+    proactiveStarts: 0,
+    proactiveSuccesses: 0,
+    coldOpens: 0,
+    coldOpenSuccesses: 0,
+    guildJoins: 0,
+    guildLeaves: 0,
+    memoryRecalls: 0,
+    memoryRecallSuccesses: 0,
+    
     recentEvents: [],
     sessionStart: new Date().toISOString()
   };
@@ -165,6 +211,13 @@ class TelemetryEngine {
       data
     };
 
+    // Firestore throws on undefined, so clean the object
+    Object.keys(event).forEach(key => {
+      if ((event as any)[key] === undefined) {
+        delete (event as any)[key];
+      }
+    });
+
     this.buffer.push(event);
 
     // ── Update rolling stats in-memory ──
@@ -199,6 +252,8 @@ class TelemetryEngine {
         const cmd = e.data.command as string;
         s.commandCounts[cmd] = (s.commandCounts[cmd] || 0) + 1;
         if (e.userId) s.userCommandCounts[e.userId] = (s.userCommandCounts[e.userId] || 0) + 1;
+        if (e.data.isNlp) s.nlpCommandCount++;
+        else s.prefixCommandCount++;
         break;
 
       case 'NOTABOT_API_CALL':
@@ -277,6 +332,56 @@ class TelemetryEngine {
       case 'ECONOMY_DAILY':     s.totalCoinsEarned += e.data.amount || 0; break;
       case 'ECONOMY_PAY':       break; // transfer, not creation
       case 'ECONOMY_WAGER':     s.totalGambles++; break;
+
+      // -- Phase 3: Advanced Intelligence --
+      case 'SESSION_TURN_DEPTH':
+        if (userId) {
+          s.userSessionTurns[userId] = Math.max(s.userSessionTurns[userId] || 0, e.data.turns || 0);
+        }
+        break;
+      case 'RESPONSE_TIME':
+        s.totalResponseTimeMs += e.data.latencyMs || 0;
+        s.responseCount++;
+        break;
+      case 'USER_SEEN':
+        if (userId) {
+          const nowMs = Date.now();
+          if (!s.firstSeenDates[userId]) {
+            s.firstSeenDates[userId] = nowMs;
+          } else {
+            const daysSinceFirst = (nowMs - s.firstSeenDates[userId]) / (1000 * 60 * 60 * 24);
+            if (daysSinceFirst >= 1 && daysSinceFirst < 2) s.retentionD1++;
+            else if (daysSinceFirst >= 7 && daysSinceFirst < 8) s.retentionD7++;
+            else if (daysSinceFirst >= 30 && daysSinceFirst < 31) s.retentionD30++;
+          }
+        }
+        break;
+      case 'CHANNEL_MODE_CHANGE':
+        if (e.data.mode === 'active') {
+          s.activeChannelsCount++;
+          if (s.activeChannelsCount > s.peakConcurrentChannels) s.peakConcurrentChannels = s.activeChannelsCount;
+        } else if (e.data.mode === 'passive' && s.activeChannelsCount > 0) {
+          s.activeChannelsCount--;
+        }
+        break;
+      case 'EMOJI_USED':
+        if (e.data.emoji) {
+          s.emojiUsages[e.data.emoji] = (s.emojiUsages[e.data.emoji] || 0) + 1;
+        }
+        break;
+      case 'EMOJI_FOLLOW_UP':
+        if (e.data.emoji) {
+          s.emojiFollowUps[e.data.emoji] = (s.emojiFollowUps[e.data.emoji] || 0) + 1;
+        }
+        break;
+      case 'PROACTIVE_START': s.proactiveStarts++; break;
+      case 'PROACTIVE_SUCCESS': s.proactiveSuccesses++; break;
+      case 'COLD_OPEN_START': s.coldOpens++; break;
+      case 'COLD_OPEN_SUCCESS': s.coldOpenSuccesses++; break;
+      case 'GUILD_JOIN': s.guildJoins++; break;
+      case 'GUILD_LEAVE': s.guildLeaves++; break;
+      case 'MEMORY_RECALL_USED': s.memoryRecalls++; break;
+      case 'MEMORY_RECALL_SUCCESS': s.memoryRecallSuccesses++; break;
     }
   }
 
@@ -297,6 +402,28 @@ class TelemetryEngine {
       avgConversationLength: s.totalConversations > 0 ? (s.totalConversationTurns / s.totalConversations).toFixed(1) : 0,
       falsePositiveRate: s.decisionsSpeak > 0 ? ((s.falsePositives / s.decisionsSpeak) * 100).toFixed(1) : 0,
       uptimeMs: Date.now() - new Date(s.sessionStart).getTime(),
+      
+      // Phase 3 Metrics
+      avgResponseTimeMs: s.responseCount > 0 ? Math.round(s.totalResponseTimeMs / s.responseCount) : 0,
+      retentionD1: s.retentionD1,
+      retentionD7: s.retentionD7,
+      retentionD30: s.retentionD30,
+      nlpCommandCount: s.nlpCommandCount,
+      prefixCommandCount: s.prefixCommandCount,
+      peakConcurrentChannels: s.peakConcurrentChannels,
+      activeChannelsCount: s.activeChannelsCount,
+      proactiveSuccessRate: s.proactiveStarts > 0 ? Math.round((s.proactiveSuccesses / s.proactiveStarts) * 100) : 0,
+      coldOpenSuccessRate: s.coldOpens > 0 ? Math.round((s.coldOpenSuccesses / s.coldOpens) * 100) : 0,
+      guildJoins: s.guildJoins,
+      guildLeaves: s.guildLeaves,
+      memoryRecallSuccessRate: s.memoryRecalls > 0 ? Math.round((s.memoryRecallSuccesses / s.memoryRecalls) * 100) : 0,
+      topEmojis: Object.entries(s.emojiUsages)
+        .sort(([,a], [,b]) => b - a)
+        .slice(0, 10)
+        .map(([emoji, count]) => ({ emoji, count, followUps: s.emojiFollowUps[emoji] || 0 })),
+      avgTurnsPerUser: Object.keys(s.userSessionTurns).length > 0 ? 
+        (Object.values(s.userSessionTurns).reduce((a, b) => a + b, 0) / Object.keys(s.userSessionTurns).length).toFixed(1) : 0,
+
       // Top users by messages (sorted)
       topUsers: Object.entries(s.userMessageCounts)
         .sort(([,a], [,b]) => b - a)

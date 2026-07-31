@@ -478,7 +478,11 @@ let coldOpenTargetUserId: string | null = null; // who it's currently "on" — n
 
 function clearColdOpenHop(userId: string) {
   const s = coldOpenStates.get(userId);
-  if (s?.hopTimer) { clearTimeout(s.hopTimer); s.hopTimer = null; }
+  if (s?.hopTimer) {
+    clearTimeout(s.hopTimer);
+    s.hopTimer = null;
+    Telemetry.track('COLD_OPEN_SUCCESS', { targetId: userId }, userId);
+  }
   if (s) s.pending = false;
   if (coldOpenTargetUserId === userId) { coldOpenTargetUserId = null; updatePresence(); }
 }
@@ -922,6 +926,7 @@ function goActive(channelId: string, goal: string) {
   if (goal) s.goal = goal;
   s.lastActivityAt = Date.now();
   console.log(`[Mode] #${channelId.slice(-5)} active${s.goal ? ` — ${s.goal}` : ''}`);
+  Telemetry.track('CHANNEL_MODE_CHANGE', { mode: 'active' }, undefined, undefined, { channelId });
 }
 
 function revertToPassive(channelId: string, reason = '') {
@@ -929,6 +934,7 @@ function revertToPassive(channelId: string, reason = '') {
   if (s.mode === 'passive') return;
   s.mode = 'passive'; s.goal = ''; s.consecutiveUnpromptedReplies = 0;
   console.log(`[Mode] #${channelId.slice(-5)} passive${reason ? ` — ${reason}` : ''}`);
+  Telemetry.track('CHANNEL_MODE_CHANGE', { mode: 'passive' }, undefined, undefined, { channelId });
 }
 
 function touchActivity(channelId: string) {
@@ -1969,6 +1975,7 @@ async function executeCommand(
     case 'recall_memory': {
       const query = String(args.query || '').trim();
       if (!query) return 'no query given — pass commandArgs.query';
+      Telemetry.track('MEMORY_RECALL_USED', { query }, undefined, guildId);
       return await recallMemory(guildId, query);
     }
     case 'get_server_stats': {
@@ -2508,6 +2515,15 @@ async function executeBrainDecision(opts: {
 }): Promise<BrainDecision> {
   let { decision } = opts;
 
+  // ── Action: react (add an emoji reaction to the target message) ─────
+  if (decision.action === 'react') {
+    if (opts.replyToMsg && decision.emoji) {
+      Telemetry.track('EMOJI_USED', { emoji: decision.emoji }, undefined, opts.guildId);
+      await opts.replyToMsg.react(decision.emoji).catch(() => {});
+    }
+    return decision;
+  }
+
   let alreadySaidSomethingAboutChecking = false;
   if (decision.think?.trim() && decision.command !== 'none') {
     const thinkText = decision.think.trim().slice(0, 100);
@@ -2565,6 +2581,10 @@ async function sendDecision(opts: {
 }) {
   const { channel, decision, channelId, guildId, replyToMsg } = opts;
   const state = getChState(channelId);
+  
+  if (replyToMsg && decision.action !== 'ignore' && decision.action !== 'silent') {
+    Telemetry.track('RESPONSE_TIME', { latencyMs: Date.now() - replyToMsg.createdTimestamp }, undefined, guildId);
+  }
 
   if (decision.action === 'react' && decision.reaction && replyToMsg) {
     try { await replyToMsg.react(decision.reaction); } catch {}
@@ -3346,6 +3366,7 @@ async function runProactiveEngagement() {
           decision = { ...decision, reply: resolveMentionNames(decision.reply) };
           ps.strikes = 0;
           goActive(bestChannelId, 'proactive start');
+          Telemetry.track('PROACTIVE_START', { targetChannel: bestChannelId }, undefined, guild.id);
           console.log(`[Proactive] fired in #${channelName} (${guild.name}) — quiet ${quietHours}h`);
 
           // +12 XP to whoever got @mentioned — bot sought them out specifically
@@ -3551,6 +3572,7 @@ async function runColdOpen() {
     }, COLD_OPEN_WAIT_FOR_REPLY_MS);
 
     coldOpenStates.set(pick.userId, { lastPingAt: Date.now(), pending: true, hopTimer });
+    Telemetry.track('COLD_OPEN_START', { targetId: pick.userId }, pick.userId, 'dm');
     console.log(`[ColdOpen] opened DM with ${pick.name} (${pick.online ? 'online' : 'offline'}, from ${guildName}, isNew:${isNewPerson})`);
   } catch (e) {
     console.error('[ColdOpen]', e);
@@ -3880,6 +3902,7 @@ function resolveAdminCommand(content: string, isAdmin: boolean): string | null {
 
 // ── GUILD MESSAGE HANDLER ─────────────────────────────────────────
 async function handleMessage(msg: Message) {
+  Telemetry.track('USER_SEEN', {}, msg.author.id, msg.guild?.id || 'DM');
   Telemetry.track('MESSAGE_RECEIVED', {
     contentLength: msg.content.length,
     hasAttachments: msg.attachments.size > 0,
@@ -4119,7 +4142,24 @@ async function handleMessage(msg: Message) {
       if (isHostile || lowerContent.includes('fuck') || lowerContent.includes('hate') || lowerContent.includes('stupid')) sentiment = 'Negative';
       else if (lowerContent.includes('thanks') || lowerContent.includes('love') || lowerContent.includes('good') || lowerContent.includes('haha')) sentiment = 'Positive';
       
-      Telemetry.track('CONVERSATION_TURN', { isNew: !state.lastRelevantAt || (Date.now() - state.lastRelevantAt > 300_000), topic, sentiment }, msg.author.id, guildId);
+      const isNewSession = !state.lastRelevantAt || (Date.now() - state.lastRelevantAt > 300_000);
+      state.consecutiveUnpromptedReplies = isNewSession ? 1 : state.consecutiveUnpromptedReplies + 1;
+      
+      Telemetry.track('CONVERSATION_TURN', { isNew: isNewSession, topic, sentiment }, msg.author.id, guildId);
+      Telemetry.track('SESSION_TURN_DEPTH', { turns: state.consecutiveUnpromptedReplies }, msg.author.id, guildId);
+      
+      if (state.goal === 'proactive start') {
+        Telemetry.track('PROACTIVE_SUCCESS', {}, msg.author.id, guildId);
+        state.goal = ''; // consumed
+      }
+      
+      if (repliedToBot && msg.reference?.messageId) {
+        const botMsg = stmGet(channelId).find(m => m.id === msg.reference!.messageId);
+        if (botMsg && /[\u{1f300}-\u{1f5ff}\u{1f900}-\u{1f9ff}\u{1f600}-\u{1f64f}\u{1f680}-\u{1f6ff}\u{2600}-\u{26ff}\u{2700}-\u{27bf}\u{1f1e6}-\u{1f1ff}\u{1f191}-\u{1f251}\u{1f004}\u{1f0cf}\u{1f170}-\u{1f171}\u{1f17e}-\u{1f17f}\u{1f18e}\u{3030}\u{2b50}\u{2b55}\u{2934}-\u{2935}\u{2b05}-\u{2b07}\u{2b1b}-\u{2b1c}\u{3297}\u{3299}\u{303d}\u{00a9}\u{00ae}\u{2122}\u{23f3}\u{24c2}\u{23e9}-\u{23ef}\u{25b6}\u{23f8}-\u{23fa}]/u.test(botMsg.content)) {
+          const matchedEmoji = botMsg.content.match(/[\u{1f300}-\u{1f5ff}\u{1f900}-\u{1f9ff}\u{1f600}-\u{1f64f}\u{1f680}-\u{1f6ff}\u{2600}-\u{26ff}\u{2700}-\u{27bf}\u{1f1e6}-\u{1f1ff}\u{1f191}-\u{1f251}\u{1f004}\u{1f0cf}\u{1f170}-\u{1f171}\u{1f17e}-\u{1f17f}\u{1f18e}\u{3030}\u{2b50}\u{2b55}\u{2934}-\u{2935}\u{2b05}-\u{2b07}\u{2b1b}-\u{2b1c}\u{3297}\u{3299}\u{303d}\u{00a9}\u{00ae}\u{2122}\u{23f3}\u{24c2}\u{23e9}-\u{23ef}\u{25b6}\u{23f8}-\u{23fa}]/u)?.[0];
+          if (matchedEmoji) Telemetry.track('EMOJI_FOLLOW_UP', { emoji: matchedEmoji }, undefined, guildId);
+        }
+      }
     }
 
     maybeLogHistory(channelId, guildId).catch(() => {});
@@ -4319,6 +4359,7 @@ export async function startBot(token: string) {
   // ── bot joins a new server ─────────────────────────────────────────
   botClient.on(Events.GuildCreate, async (guild) => {
     console.log(`[Join] added to a new server — "${guild.name}" (${guild.id})`);
+    Telemetry.track('GUILD_JOIN', { guildName: guild.name, memberCount: guild.memberCount }, undefined, guild.id);
     cacheServerName(guild.id, guild.name);
     await db.collection('servers').doc(guild.id).set({ name: guild.name, updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
 
@@ -4380,6 +4421,7 @@ export async function startBot(token: string) {
 
   botClient.on(Events.GuildDelete, (guild) => {
     console.log(`[Leave] removed from "${guild.name || guild.id}" (${guild.id})`);
+    Telemetry.track('GUILD_LEAVE', { guildName: guild.name }, undefined, guild.id);
     serverMuted.delete(guild.id);
     serverBotAllowlist.delete(guild.id);
     serverChannelAllowlist.delete(guild.id);

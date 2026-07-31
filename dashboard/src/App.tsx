@@ -140,9 +140,13 @@ export default function App() {
           <h1>NotABot Intelligence Core</h1>
           <p style={{ color: 'var(--text-secondary)' }}>Advanced Conversational Analytics</p>
         </div>
-        <div className="live-indicator">
-          <div className="pulse"></div>
-          LIVE
+        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+          <a href={`${API_BASE}/export/json`} className="export-btn" download>⬇ JSON</a>
+          <a href={`${API_BASE}/export/csv`} className="export-btn" download>⬇ CSV</a>
+          <div className="live-indicator">
+            <div className="pulse"></div>
+            LIVE
+          </div>
         </div>
       </header>
 
@@ -167,6 +171,30 @@ export default function App() {
           <h3>Brain State (Mood)</h3>
           <div className="value">{Math.round(stats.avgBoredom * 100)}%</div>
           <div className="sub-value">Avg Boredom | {Math.round(stats.avgConfidence * 100)}% Confidence</div>
+        </div>
+      </div>
+
+      {/* Advanced Intelligence KPIs */}
+      <div className="grid grid-cols-4" style={{ marginTop: '1.5rem' }}>
+        <div className="card">
+          <h3>Proactive & Cold Open</h3>
+          <div className="value">{stats.proactiveSuccessRate || 0}%</div>
+          <div className="sub-value">Proactive Reply Rate | {stats.coldOpenSuccessRate || 0}% Cold Open</div>
+        </div>
+        <div className="card">
+          <h3>Command Discovery</h3>
+          <div className="value">{stats.nlpCommandCount || 0}</div>
+          <div className="sub-value">NLP Commands | {stats.prefixCommandCount || 0} Prefix Commands</div>
+        </div>
+        <div className="card">
+          <h3>Bot Presence</h3>
+          <div className="value">{stats.peakConcurrentChannels || 0}</div>
+          <div className="sub-value">Peak Concurrent Active Channels</div>
+        </div>
+        <div className="card">
+          <h3>User Retention</h3>
+          <div className="value">{stats.retentionD1 || 0}</div>
+          <div className="sub-value">D1 | {stats.retentionD7 || 0} D7 | {stats.retentionD30 || 0} D30</div>
         </div>
       </div>
 

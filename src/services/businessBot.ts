@@ -266,8 +266,8 @@ export function getBusinessBotId()   { return botClient?.user?.id; }
 export function getBusinessBotName() { return botClient?.user?.username || 'BusinessBot'; }
 
 // ── COMMAND ROUTER ────────────────────────────────────────────────────────────
-async function handleCommand(msg: Message, command: string, args: string[]) {
-  Telemetry.track('COMMAND_EXECUTE', { command, args }, msg.author.id, msg.guild?.id || 'DM');
+async function handleCommand(msg: Message, command: string, args: string[], isNlp: boolean = false) {
+  Telemetry.track('COMMAND_EXECUTE', { command, args, isNlp }, msg.author.id, msg.guild?.id || 'DM');
   const userId   = msg.author.id;
   const username = msg.member?.displayName || msg.author.username;
 
@@ -1530,7 +1530,7 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
             return;
           }
         }
-        await handleCommand(msg, parsed.command, (parsed.args || []).map(String));
+        await handleCommand(msg, parsed.command, (parsed.args || []).map(String), true);
       }
 
       // Batch command execution (e.g. diversifying into multiple stocks)
@@ -1540,7 +1540,7 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
         }
         for (const cmd of parsed.commands) {
           if (cmd.command) {
-            await handleCommand(msg, cmd.command, (cmd.args || []).map(String));
+            await handleCommand(msg, cmd.command, (cmd.args || []).map(String), true);
           }
         }
       }

@@ -78,6 +78,11 @@ app.get("/", (_req, res) => {
       <span class="dot"></span>
       Service ${status === "running" ? "Online" : "Offline"}
     </div>
+    <div style="margin-top: 24px;">
+      <a href="http://localhost:4400" style="display: inline-block; padding: 10px 24px; background: #5865F2; color: #fff; text-decoration: none; border-radius: 8px; font-weight: 600; font-size: 0.9rem; transition: background 0.2s;">
+        Open Advanced Dashboard
+      </a>
+    </div>
     <p class="footer">© ${new Date().getFullYear()} NotABot · All systems nominal</p>
   </div>
 </body>
