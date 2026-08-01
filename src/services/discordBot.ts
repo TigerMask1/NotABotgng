@@ -1057,10 +1057,128 @@ function pickInterestChannelForGuild(guildId: string): string | null {
     if (state.lastActivityAt > bestTs) { bestTs = state.lastActivityAt; best = chId; }
   }
   if (best) return best;
-  // fallback: first text channel in the guild that we can see
+// fallback: first text channel in the guild that we can see
   const guild = botClient.guilds.cache.get(guildId);
   if (!guild) return null;
   return guild.channels.cache.find(c => c.isTextBased() && !c.isDMBased())?.id ?? null;
+}
+
+// ── INTENT QUEUE ───────────────────────────────────────────────────
+// A persistent to-do list for deferred actions (e.g. bounties, follow-ups).
+export interface Intent {
+  id: string;
+  what: string;
+  triggerUserId?: string;
+  triggerType: 'user_appears' | 'next_turn' | 'keyword' | 'time';
+  triggerKeyword?: string;
+  channelId: string;
+  guildId: string;
+  createdAt: string;
+  expiresAt: string;
+  status: 'pending' | 'resolved';
+}
+
+const intentStore = new Map<string, Intent[]>(); // keyed by guildId
+const INTENT_TTL_MS = 48 * 60 * 60 * 1000; // 48h max life
+
+// warm intents from db on boot
+async function loadPendingIntents(guildId: string) {
+  if (guildId === 'dm') return [];
+  if (intentStore.has(guildId)) return intentStore.get(guildId)!;
+  try {
+    const snap = await db.collection('intents').doc(guildId).collection('pending').where('status', '==', 'pending').get();
+    const intents = snap.docs.map(d => d.data() as Intent);
+    // silently prune expired ones
+    const nowStr = new Date().toISOString();
+    const valid = intents.filter(i => i.expiresAt > nowStr);
+    intentStore.set(guildId, valid);
+    return valid;
+  } catch (e) {
+    console.warn(`[Intent] load failed for ${guildId}:`, e);
+    return [];
+  }
+}
+
+async function addIntent(guildId: string, channelId: string, intentData: { what: string; triggerUserId?: string; triggerType: 'user_appears'|'next_turn'|'keyword'|'time'; triggerKeyword?: string; }) {
+  if (guildId === 'dm') return; // no persistent intents in DMs for now
+  const list = await loadPendingIntents(guildId);
+  // cap at 10 active intents per server to avoid prompt bloat
+  if (list.length >= 10) return;
+  // max 2 keyword triggers per server
+  if (intentData.triggerType === 'keyword' && list.filter(i => i.triggerType === 'keyword').length >= 2) return;
+
+  const now = new Date();
+  const intent: Intent = {
+    id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    what: intentData.what,
+    triggerUserId: intentData.triggerUserId,
+    triggerType: intentData.triggerType,
+    triggerKeyword: intentData.triggerKeyword,
+    channelId, guildId,
+    createdAt: now.toISOString(),
+    expiresAt: new Date(now.getTime() + INTENT_TTL_MS).toISOString(),
+    status: 'pending'
+  };
+
+  list.push(intent);
+  intentStore.set(guildId, list);
+  db.collection('intents').doc(guildId).collection('pending').doc(intent.id).set(intent).catch(() => {});
+  console.log(`[Intent] Added for #${channelId.slice(-5)}: ${intent.what}`);
+}
+
+async function resolveIntent(guildId: string, intentId: string) {
+  if (guildId === 'dm') return;
+  const list = await loadPendingIntents(guildId);
+  const idx = list.findIndex(i => i.id === intentId);
+  if (idx === -1) return;
+  const [intent] = list.splice(idx, 1);
+  intent.status = 'resolved';
+  intentStore.set(guildId, list);
+  db.collection('intents').doc(guildId).collection('pending').doc(intentId).set(intent, { merge: true }).catch(() => {});
+  console.log(`[Intent] Resolved: ${intentId}`);
+}
+
+// Check for triggers. Expired intents are pruned automatically.
+async function getTriggeredIntents(guildId: string, channelId: string, senderId: string, messageContent: string): Promise<Intent[]> {
+  if (guildId === 'dm') return [];
+  const list = await loadPendingIntents(guildId);
+  if (!list.length) return [];
+
+  const nowStr = new Date().toISOString();
+  const triggered: Intent[] = [];
+  const valid: Intent[] = [];
+  let changed = false;
+
+  const lowerContent = messageContent.toLowerCase();
+
+  for (const intent of list) {
+    if (intent.expiresAt <= nowStr) {
+      changed = true;
+      continue; // drop expired
+    }
+    valid.push(intent);
+
+    // Evaluate triggers
+    if (intent.triggerType === 'next_turn' && intent.channelId === channelId) {
+      triggered.push(intent);
+    } else if (intent.triggerType === 'user_appears' && intent.triggerUserId === senderId) {
+      triggered.push(intent);
+    } else if (intent.triggerType === 'keyword' && intent.triggerKeyword && lowerContent.includes(intent.triggerKeyword.toLowerCase())) {
+      triggered.push(intent);
+    } else if (intent.triggerType === 'time') { // Simplistic time trigger: triggers anytime after it's old enough (assume 5 mins if unspecified in setup, but we'll use a generic approach for now)
+       triggered.push(intent); // In a fuller implementation, time trigger would need a targetTime field. For now, we'll treat it as immediate surfacing for the next brain evaluation
+    }
+  }
+
+  if (changed) {
+    intentStore.set(guildId, valid);
+    // Cleanup in background
+    list.filter(i => i.expiresAt <= nowStr).forEach(i => {
+      db.collection('intents').doc(guildId).collection('pending').doc(i.id).delete().catch(() => {});
+    });
+  }
+
+  return triggered.slice(0, 3); // Max 3 surfaced per call
 }
 
 // ── FIREBASE / MEMORY ─────────────────────────────────────────────
@@ -1924,7 +2042,7 @@ async function runWeeklyNPC() {
 }
 
 // ── COMMAND EXECUTION ─────────────────────────────────────────────
-type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'get_channel_info' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'get_cross_server' | 'set_reminder' | 'create_poll' | 'wiki_lookup' | 'start_event' | 'get_leaderboard' | 'start_game' | 'play_chess_move' | 'djs_script' | 'none';
+type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'get_channel_info' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'get_cross_server' | 'set_reminder' | 'create_poll' | 'wiki_lookup' | 'start_event' | 'get_leaderboard' | 'start_game' | 'play_chess_move' | 'djs_script' | 'resolve_intent' | 'none';
 
 async function executeCommand(
   command: BotCommand,
@@ -1955,16 +2073,6 @@ async function executeCommand(
       return stmFormat(stmGet(channelId));
     }
     case 'get_video_status': {
-      // BUG FIX: this used to return only the bare video ID ("last known
-      // upload id: f_xiXNOX-1s") with no actual link anywhere in the string.
-      // when asked to share/link the video, the model had nothing real to
-      // point to — it correctly refused to fabricate a video URL (that part
-      // of the no-fabrication rule was working exactly as intended), but
-      // fell back to the one link it's allowed to output verbatim: the
-      // hardcoded channel URL. result: every "check out my video" came out
-      // as the channel link instead. fix is just giving it the real link —
-      // YouTube video IDs map deterministically to a watch URL, no extra
-      // API call needed.
       const queued = pendingVideoQueue.length
         ? pendingVideoQueue
             .map(v => `"${v.title}" (${v.url}) — queued ${humanDuration(Date.now() - v.queuedAt)}`)
@@ -2100,6 +2208,11 @@ async function executeCommand(
       }
       const url = chessManager.getBoardUrl(game.chess.fen(), move);
       return `move ${move} played successfully. board: ${url}`;
+    }
+    case 'resolve_intent': {
+      if (!args.id) return 'error: missing intent id';
+      await resolveIntent(guildId, args.id);
+      return `intent ${args.id} resolved.`;
     }
     default:
       return 'unknown command';
@@ -2258,6 +2371,19 @@ a marker line shows what's already handled vs new. default: say nothing to the w
 - you only run a command because YOU want to know something, never as a favor or research-assistant move.
 - callbacks to old threads: rare, vague, never quote someone's private stuff back at them.
 
+═══ INTENTS (YOUR TO-DO LIST) ═══
+you can set a deferred intent — something you want to do later when the moment 
+is right. set the "intent" field in your JSON when you decide you want to do 
+something but can't right now (target isn't online, you're mid-conversation 
+about something else, timing's wrong).
+
+when the trigger fires (the person appears, the keyword comes up, etc.), you'll 
+see your intent in the prompt under PENDING INTENTS. that's your cue — act on 
+it naturally, don't announce "I had a plan to..." just DO the thing.
+
+after you've acted on it (or decided to drop it), run resolve_intent with the 
+intent id.
+
 ═══ PACING ═══
 after 2-3 replies in a row, gauge if it's wound down — if so, pause 5-15 (minutes) or stayActive:false. never step back out of obligation, only when it actually feels done. "goal" = a few words on why you're engaged, update or clear it as it shifts.
 
@@ -2301,6 +2427,7 @@ CRITICAL OUTPUT RULE: respond with RAW JSON ONLY. first character "{", last char
   "think": "short visible thinking message, or empty string — sent to chat BEFORE you run a command",
   "command": "get_history|get_member|get_stm|get_video_status|get_channel_info|recall_memory|get_server_stats|get_time|web_search|get_cross_server|set_reminder|create_poll|wiki_lookup|start_event|get_leaderboard|discord_query|none",
   "commandArgs": {},
+  "intent": "optional object { what: '...', triggerUserId?: '<@id>', triggerType: 'user_appears|next_turn|keyword|time', triggerKeyword?: 'word' } — omit if no intent",
   "confidence": 1.0,
   "boredom": 0.0,
   "reason": "..."
@@ -2322,6 +2449,7 @@ interface BrainDecision {
   think:           string;
   command:         BotCommand;
   commandArgs:     Record<string, any>;
+  intent?:         { what: string; triggerUserId?: string; triggerType: 'user_appears'|'next_turn'|'keyword'|'time'; triggerKeyword?: string; };
   confidence:      number;
   boredom:         number;
   reason:          string;
@@ -2344,8 +2472,9 @@ function parseBrainJSON(raw: string): BrainDecision | null {
       goal:            typeof p.goal     === 'string' ? p.goal.trim().slice(0, 120) : '',
       stayActive:      typeof p.stayActive === 'boolean' ? p.stayActive : true,
       think:           typeof p.think    === 'string' ? p.think.trim() : '',
-      command:         (['get_history','get_member','get_stm','get_video_status','get_channel_info','recall_memory','set_reminder','get_server_stats','get_time','web_search','get_cross_server','create_poll','wiki_lookup','start_event','get_leaderboard','start_game','play_chess_move','djs_script','none'] as const).includes(p.command) ? p.command : 'none',
+      command:         (['get_history','get_member','get_stm','get_video_status','get_channel_info','recall_memory','set_reminder','get_server_stats','get_time','web_search','get_cross_server','create_poll','wiki_lookup','start_event','get_leaderboard','start_game','play_chess_move','djs_script','resolve_intent','none'] as const).includes(p.command) ? p.command : 'none',
       commandArgs:     p.commandArgs && typeof p.commandArgs === 'object' ? p.commandArgs : {},
+      intent:          p.intent && typeof p.intent === 'object' ? p.intent : undefined,
       confidence:      typeof p.confidence === 'number' ? p.confidence : 1.0,
       boredom:         typeof p.boredom === 'number' ? p.boredom : 0.0,
       reason:          typeof p.reason === 'string' ? p.reason : ''
@@ -2383,6 +2512,7 @@ interface BrainOpts {
   consecutiveUnpromptedReplies?: number;
   guildId?:      string;
   goalAge?:      number;   // how many turns the current goal has been alive
+  intentCtx?:    string;
 }
 
 async function brain(opts: BrainOpts): Promise<BrainDecision> {
@@ -2424,6 +2554,7 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
   // context-blending — the model forces unrelated new messages into the old
   // narrative frame (e.g. "you traumatized me AND now you want money?").
   if (opts.goal && (opts.goalAge ?? 0) < 3) parts.push(`\nYOUR GOAL RIGHT NOW: ${opts.goal}`);
+  if (opts.intentCtx)     parts.push(`\nPENDING INTENTS (things YOU decided to do earlier — act on them or dismiss them):\n${opts.intentCtx}`);
   if (opts.memCtx)        parts.push(`\nSERVER MEMORY:\n${opts.memCtx}`);
   if (opts.personalCtx)      parts.push(`\nWHAT YOU KNOW ABOUT ${opts.sender.toUpperCase()} AS A PERSON (carries across every server/DM, not just this one):\n${opts.personalCtx}`);
   if (opts.crossChannelCtx)  parts.push(`\nWHAT ${opts.sender.toUpperCase()} RECENTLY SAID IN OTHER CHANNELS/SERVERS (so you have the full picture if they reference it):\n${opts.crossChannelCtx}`);
@@ -3751,11 +3882,16 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
     } catch {}
   }
 
-  const [memberData, memCtx, personalCtx] = await Promise.all([
+  const [memberData, memCtx, personalCtx, triggeredIntents] = await Promise.all([
     getMember(guildId, last.author.id),
     buildMemCtx(guildId),
     getPersonalCtx(last.author.id),
+    getTriggeredIntents(guildId, channelId, last.author.id, tContent),
   ]);
+
+  const intentCtx = triggeredIntents.length
+    ? triggeredIntents.map(i => `- "${i.what}" (id: ${i.id})`).join('\n')
+    : undefined;
   const bond  = typeof memberData.bond === 'number' ? memberData.bond : 50;
   const state = getChState(channelId);
   const crossChannelCtx = getRecentCrossChannelCtx(last.author.id, channelId);
@@ -3790,7 +3926,7 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
     model: ACTIVE_MODEL,
     sender: tSender, bond, message: tContent,
     transcript: stmFormatWithMarker(liveMsgs, channelId),
-    thread: threadCtx, memCtx, personalCtx, crossChannelCtx: crossChannelCtx || undefined,
+    thread: threadCtx, memCtx, personalCtx, crossChannelCtx: crossChannelCtx || undefined, intentCtx,
     mentioned: anyMentioned, isDM: false, statusLine,
     inExchange, channelName: tChannelName, serverName: tServerName,
     everyonePing: tEveryonePing, endingConvo,
@@ -3819,6 +3955,7 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
 
   decision = await executeBrainDecision({ decision, brainOpts, channel: last.channel, replyToMsg: last, channelId, guildId });
   if (decision.aboutSender) notePersonState(last.author.id, decision.aboutSender, tServerName);
+  if (decision.intent) await addIntent(guildId, channelId, decision.intent);
 
   // bookkeeping only — NotABot's own call stands. this just keeps the "how
   // many in a row have I volunteered" number accurate for the NEXT call's
@@ -4312,6 +4449,7 @@ export async function startBot(token: string) {
 
     for (const g of botClient!.guilds.cache.values()) {
       cacheServerName(g.id, g.name);
+      await loadPendingIntents(g.id); // warm intents from DB
       await db.collection('servers').doc(g.id).set({ name: g.name, updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
       // restore per-server mute state persisted across restarts
       try {
