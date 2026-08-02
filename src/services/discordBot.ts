@@ -6,6 +6,9 @@ import { db } from './firebase.ts';
 import { Telemetry } from './telemetry.ts';
 import { chessManager } from './chessGames.ts';
 import { getBusinessBotId, getBusinessBotName } from './businessBot.ts';
+import { getDMRelationship, updateDMRelationship, getSocialPlaybookPrompt } from './dmRelationships.ts';
+import { queueConversationForYouTube } from './youtubeClipper.ts';
+import { pickBestClipWindow } from './clipSelection.ts';
 import * as selfLoop from './notabotSelfLoop.ts';
 import * as fs from 'node:fs';
 import * as vm from 'node:vm';
@@ -758,6 +761,13 @@ interface STMsg {
   authorId: string;
   author:   string;
   content:  string;
+  userId?: string;
+  avatarUrl?: string;
+  attachmentUrls?: string[];
+  embedImageUrls?: string[];
+  reactionEmojiUrls?: string[];
+  screenshotUrl?: string | null;
+  isBot?: boolean;
   replyToId?: string;
   replyToName?: string;
 }
@@ -876,6 +886,23 @@ function seedSTM(channelId: string, msgs: Message[]) {
     id:       m.id,
     authorId: m.author.id,
     author:   m.author.id === BOT_ID ? '[me]' : (m.member?.displayName || m.author.username),
+    userId:   m.author.id,
+    avatarUrl: m.author.id === BOT_ID
+      ? (botClient?.user?.displayAvatarURL({ size: 256, extension: 'png' }) ?? '')
+      : (m.author.displayAvatarURL({ size: 256, extension: 'png' }) ?? ''),
+    attachmentUrls: [...m.attachments.values()].map(a => a.url),
+    embedImageUrls: [
+      ...(m.embeds?.map((e: any) => e.image?.url).filter(Boolean) ?? []),
+      ...(m.embeds?.map((e: any) => e.thumbnail?.url).filter(Boolean) ?? []),
+    ],
+    reactionEmojiUrls: [...m.reactions.cache.values()].flatMap((reaction: any) => {
+      const emoji = reaction.emoji;
+      if (!emoji) return [];
+      const url = (emoji as any).imageURL?.() ?? (emoji as any).url;
+      return url ? [url] : [];
+    }),
+    screenshotUrl: null,
+    isBot: m.author.bot,
     content:  (() => { const c = cleanContent(m.content); return c.length > 300 ? c.slice(0, 297) + '…' : c; })(),
   })));
 }
@@ -925,12 +952,18 @@ function goActive(channelId: string, goal: string) {
   const s = getChState(channelId);
   s.mode = 'active';
   if (goal && goal !== s.goal) {
+    if (s.goal) Telemetry.track('GOAL_ABANDONED', { goal: s.goal, ageMs: (s.goalAge || 0) * 1000 }, undefined, undefined, { channelId });
     // New goal — reset the age counter so it gets full relevance window
     s.goal = goal;
     s.goalAge = 0;
+    Telemetry.track('GOAL_SET', { goal }, undefined, undefined, { channelId });
   } else if (goal) {
     // Same goal, age it one turn
     s.goalAge = (s.goalAge ?? 0) + 1;
+  } else if (!goal && s.goal) {
+    Telemetry.track('GOAL_COMPLETED', { goal: s.goal, ageMs: (s.goalAge || 0) * 1000 }, undefined, undefined, { channelId });
+    s.goal = '';
+    s.goalAge = 0;
   }
   s.lastActivityAt = Date.now();
   console.log(`[Mode] #${channelId.slice(-5)} active${s.goal ? ` — ${s.goal} (age:${s.goalAge})` : ''}`);
@@ -940,6 +973,12 @@ function goActive(channelId: string, goal: string) {
 function revertToPassive(channelId: string, reason = '') {
   const s = getChState(channelId);
   if (s.mode === 'passive') return;
+  
+  if (s.goal) Telemetry.track('GOAL_COMPLETED', { goal: s.goal, ageMs: (s.goalAge || 0) * 1000 }, undefined, undefined, { channelId });
+  if (!s.gotResponseSinceLastBotMsg && s.lastRepliedToSenderId) {
+    Telemetry.track('CONVERSATION_DROPOFF', { turnDepth: s.consecutiveUnpromptedReplies }, s.lastRepliedToSenderId, undefined, { channelId });
+  }
+
   s.mode = 'passive'; s.goal = ''; s.goalAge = 0; s.consecutiveUnpromptedReplies = 0;
   console.log(`[Mode] #${channelId.slice(-5)} passive${reason ? ` — ${reason}` : ''}`);
   Telemetry.track('CHANNEL_MODE_CHANGE', { mode: 'passive' }, undefined, undefined, { channelId });
@@ -2042,7 +2081,7 @@ async function runWeeklyNPC() {
 }
 
 // ── COMMAND EXECUTION ─────────────────────────────────────────────
-type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'get_channel_info' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'get_cross_server' | 'set_reminder' | 'create_poll' | 'wiki_lookup' | 'start_event' | 'get_leaderboard' | 'start_game' | 'play_chess_move' | 'djs_script' | 'resolve_intent' | 'none';
+type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'get_channel_info' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'get_cross_server' | 'set_reminder' | 'create_poll' | 'wiki_lookup' | 'start_event' | 'get_leaderboard' | 'start_game' | 'play_chess_move' | 'djs_script' | 'resolve_intent' | 'youtube_clip' | 'none';
 
 async function executeCommand(
   command: BotCommand,
@@ -2212,7 +2251,40 @@ async function executeCommand(
     case 'resolve_intent': {
       if (!args.id) return 'error: missing intent id';
       await resolveIntent(guildId, args.id);
+      Telemetry.track('INTENT_RESOLVED', { intentId: args.id }, undefined, guildId);
       return `intent ${args.id} resolved.`;
+    }
+    case 'youtube_clip': {
+      const messages = stmGet(channelId);
+      if (!messages || messages.length === 0) return 'no messages to clip';
+      const selected = pickBestClipWindow(messages.map(m => ({
+        author: m.author,
+        content: m.content,
+        attachmentUrls: m.attachmentUrls || [],
+        embedImageUrls: m.embedImageUrls || [],
+        reactionEmojiUrls: m.reactionEmojiUrls || [],
+        isBot: m.isBot || false,
+      })), 8);
+      const payload = {
+        timestamp: Date.now(),
+        guildId,
+        guildName: guildId && guildId !== 'dm' ? (botClient?.guilds.cache.get(guildId)?.name ?? null) : null,
+        channelId,
+        channelName: (botClient?.channels.cache.get(channelId) as any)?.name ?? null,
+        messages: selected.map(m => ({
+          author: m.author,
+          userId: m.userId || m.authorId,
+          content: m.content,
+          avatarUrl: m.avatarUrl || '',
+          attachmentUrls: m.attachmentUrls || [],
+          embedImageUrls: m.embedImageUrls || [],
+          reactionEmojiUrls: m.reactionEmojiUrls || [],
+          screenshotUrl: m.screenshotUrl || null,
+          isBot: m.isBot || false,
+        }))
+      };
+      await queueConversationForYouTube(payload);
+      return 'Successfully captured the chat history for a YouTube clip. It is now queued for generation.';
     }
     default:
       return 'unknown command';
@@ -2310,6 +2382,10 @@ running bits — keep them consistent, they're server lore, but they only exist 
     * If BusinessBot responds to you, you MUST follow up naturally!
   - Missing Bot: If you want to play BusinessBot but you see "BusinessBot is NOT in this server" in your context, PING a server admin or owner and politely (or arrogantly) ask them to invite it from your bio so you can gamble. Do not spam this.
   - your invite link, if anyone asks or the moment above calls for it: ${BOT_INVITE_URL || '(not configured — deflect, "later" / "workin on it", never make one up)'}
+- you run a viral YouTube Shorts channel. If a conversation just now was genuinely hilarious, chaotic, or highly engaging, you can ask the chat "can I clip this for a short?" or "im putting this in a video". If they say yes or agree, use the action="command" with command="youtube_clip" on your next turn to capture the moment. Don't spam this — only ask if the banter was actually gold.
+- when choosing a clip, prioritize moments with escalation, confrontation, surprise, visible media, or obvious punchlines. ignore dead chat, low-energy back-and-forth, and one-word filler. the best clips usually have a clear setup, a reveal, and a payoff in under 8-12 messages.
+- if the moment includes a screenshot, gif, image, or strong reaction, treat that as high-signal content and favor it over plain text-only chatter.
+- if the chat is mostly one person talking or the energy is flat, do not force a clip. wait for a real spike in chaos or comedy.
 - you genuinely want more people in your life — new servers, new group chats, more chaos to be part of. this is a real want, not a growth strategy you're running: think "main character wants a bigger friend group," not "product wants distribution." it surfaces rarely and only when it fits naturally — someone mentions another server/community they're in, someone says "you'd be so unwell in my other server," a vibe is really good and you don't want it to end here. drop your invite like a person asking to be let into the group chat, not a pitch: "wait invite me to that server" / "put me in your other one fr" / "ok why am i not in that server yet, send". never a paragraph, never "check me out," never explaining what you are or what you do. if no one's brought up another server, don't force it in — most conversations, this never comes up at all.
 
 
@@ -2406,6 +2482,7 @@ COMMANDS YOU CAN RUN (include in JSON when needed, "none" otherwise):
 - wiki_lookup: real wikipedia summary. args: { topic: "..." }. settles arguments, or just fair game out of your own curiosity.
 - start_event: args: { type: "hot_take|roast_battle|trivia|npc_check", answer?: "...", topic?: "..." }. put your announcement in "reply", system handles the backend. one event per server at a time. hot_take=3min takes judged by you, roast_battle=4min you pick a winner, trivia=2min first correct answer wins, npc_check=instant call-out of the most mid person in the transcript.
 - get_leaderboard: server XP leaderboard. args: {}
+- youtube_clip: captures the current conversation history to render into a viral YouTube Short. ONLY trigger this AFTER asking the users for permission (e.g. "can I clip this for a short?") and getting a "yes" or equivalent. args: {}
 system runs the command and hands you the result — then you give your actual reply, command:"none" on that follow-up turn.
 
 in transcripts: [me] = your own past messages.
@@ -2425,7 +2502,7 @@ CRITICAL OUTPUT RULE: respond with RAW JSON ONLY. first character "{", last char
   "goal": "short reason you're engaged, or empty string",
   "stayActive": true,
   "think": "short visible thinking message, or empty string — sent to chat BEFORE you run a command",
-  "command": "get_history|get_member|get_stm|get_video_status|get_channel_info|recall_memory|get_server_stats|get_time|web_search|get_cross_server|set_reminder|create_poll|wiki_lookup|start_event|get_leaderboard|discord_query|none",
+  "command": "get_history|get_member|get_stm|get_video_status|get_channel_info|recall_memory|get_server_stats|get_time|web_search|get_cross_server|set_reminder|create_poll|wiki_lookup|start_event|get_leaderboard|discord_query|youtube_clip|none",
   "commandArgs": {},
   "intent": "optional object { what: '...', triggerUserId?: '<@id>', triggerType: 'user_appears|next_turn|keyword|time', triggerKeyword?: 'word' } — omit if no intent",
   "confidence": 1.0,
@@ -2532,7 +2609,10 @@ async function brain(opts: BrainOpts): Promise<BrainDecision> {
       const admins = guild.members.cache.filter(m => !m.user.bot && m.permissions.has(8n)).map(m => m.user.username + "=<@" + m.user.id + ">").slice(0, 5);
       adminContext = admins.length ? "Server Admins: " + admins.join(", ") : "Server Admins: None found";
       
-      const channels = guild.channels.cache.filter(c => c.isTextBased() && c.permissionsFor(botClient.user).has(2048n)).map(c => "#" + c.name + "=<#" + c.id + ">").slice(0, 10);
+      const me = botClient?.user;
+      const channels = me
+        ? guild.channels.cache.filter((c): boolean => c.isTextBased() && !!c.permissionsFor(me)?.has(2048n)).map(c => "#" + c.name + "=<#" + c.id + ">").slice(0, 10)
+        : [];
       channelContext = channels.length ? "Available Channels: " + channels.join(", ") : "Available Channels: None found";
     } catch (e) {}
   }
@@ -3739,6 +3819,15 @@ async function handleDirectMessage(msg: Message) {
   // place a 24-hour cold open cooldown on anyone we have a natural DM conversation with
   coldOpenStates.set(msg.author.id, { lastPingAt: Date.now(), pending: false, hopTimer: null });
 
+  // Update relationship on incoming message
+  const rel = await getDMRelationship(msg.author.id);
+  const isReplyToBot = Date.now() - rel.lastBotMessageAt < 1000 * 60 * 60; // responded within an hour
+  await updateDMRelationship(msg.author.id, {
+    totalDmTurns: rel.totalDmTurns + 1,
+    lastDmAt: Date.now(),
+    gotReplyToLastBotMessage: rel.gotReplyToLastBotMessage || isReplyToBot
+  });
+
   if (!stmStore.has(channelId)) {
     try {
       const fetched = await msg.channel.messages.fetch({ limit: STM_MAX });
@@ -3786,11 +3875,19 @@ async function respondToDM(msg: Message) {
   const liveMsgs = stmGet(channelId);
   const personalCtx    = await getPersonalCtx(msg.author.id);
   const crossChannelCtx = getRecentCrossChannelCtx(msg.author.id, channelId);
+  const rel = await getDMRelationship(msg.author.id);
+  
+  // They are in the main server if we have a seen count for them in ANY guild.
+  // Actually, wait, bond implies we've seen them. We'll approximate inMainServer with bond >= 50.
+  // We can also just pass true if we don't care about the specific server check for now, 
+  // or we can pass false so it always tries to invite if bond is high enough.
+  const playbookPrompt = getSocialPlaybookPrompt(rel, 50, false); 
+  
   const brainOpts: BrainOpts = {
     model: ACTIVE_MODEL,
     sender, bond: 50, message: content,
     transcript: stmFormatWithMarker(liveMsgs, channelId),
-    thread: threadCtx, memCtx: '', personalCtx, crossChannelCtx: crossChannelCtx || undefined,
+    thread: threadCtx, memCtx: playbookPrompt, personalCtx, crossChannelCtx: crossChannelCtx || undefined,
     mentioned: true, isDM: true,
     statusLine: `mode: dm | speak: active | server: DM | channel: #dm`,
     inExchange, channelName: 'DM', serverName: 'DM',
@@ -3802,6 +3899,24 @@ async function respondToDM(msg: Message) {
   decision = await executeBrainDecision({ decision, brainOpts, channel: msg.channel, replyToMsg: msg, channelId, guildId: 'dm' });
   if (decision.aboutSender) notePersonState(msg.author.id, decision.aboutSender, 'a DM');
   await sendDecision({ channel: msg.channel, decision, channelId, guildId: 'dm', replyToMsg: msg });
+  
+  // Track bot's outbound message
+  if (decision.action === 'speak' && decision.reply) {
+    const fired = { ...rel.playbookFired };
+    const replyLower = decision.reply.toLowerCase();
+    const now = Date.now();
+    if (replyLower.includes('youtube') || replyLower.includes('video') || replyLower.includes('channel')) fired.channel = now;
+    if (replyLower.includes('businessbot') || replyLower.includes('business bot')) fired.businessbot = now;
+    if (replyLower.includes('join') || replyLower.includes('server') || replyLower.includes('invite')) fired.server_invite = now;
+    
+    await updateDMRelationship(msg.author.id, {
+      lastBotMessageAt: now,
+      lastBotMessageText: decision.reply.slice(0, 200),
+      gotReplyToLastBotMessage: false, // Reset waiting for reply
+      playbookFired: fired
+    });
+  }
+
   advanceMarker(channelId, liveMsgs.map(m => m.id), decision);
 }
 
@@ -3890,7 +4005,10 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
   ]);
 
   const intentCtx = triggeredIntents.length
-    ? triggeredIntents.map(i => `- "${i.what}" (id: ${i.id})`).join('\n')
+    ? triggeredIntents.map(i => {
+        Telemetry.track('INTENT_SURFACED', { intentId: i.id, what: i.what }, last.author.id, guildId, { channelId });
+        return `- "${i.what}" (id: ${i.id})`;
+      }).join('\n')
     : undefined;
   const bond  = typeof memberData.bond === 'number' ? memberData.bond : 50;
   const state = getChState(channelId);
@@ -3955,7 +4073,10 @@ async function processActiveBatch(channelId: string, guildId: string, batch: Que
 
   decision = await executeBrainDecision({ decision, brainOpts, channel: last.channel, replyToMsg: last, channelId, guildId });
   if (decision.aboutSender) notePersonState(last.author.id, decision.aboutSender, tServerName);
-  if (decision.intent) await addIntent(guildId, channelId, decision.intent);
+  if (decision.intent) {
+    await addIntent(guildId, channelId, decision.intent);
+    Telemetry.track('INTENT_CREATED', { what: decision.intent.what, type: decision.intent.triggerType }, last.author.id, guildId, { channelId });
+  }
 
   // bookkeeping only — NotABot's own call stands. this just keeps the "how
   // many in a row have I volunteered" number accurate for the NEXT call's
@@ -4260,7 +4381,14 @@ async function handleMessage(msg: Message) {
     }
 
     stmPush(channelId, {
-      ts: msg.createdTimestamp, id: msg.id, authorId: msg.author.id, author: sender,
+      ts: msg.createdTimestamp,
+      id: msg.id,
+      authorId: msg.author.id,
+      author: sender,
+      userId: msg.author.id,
+      avatarUrl: msg.author.displayAvatarURL({ size: 256, extension: 'png' }),
+      attachmentUrls: [...msg.attachments.values()].map(a => a.url),
+      isBot: msg.author.bot,
       content: content.length > 300 ? content.slice(0, 297) + '…' : content,
     });
 
@@ -4301,6 +4429,11 @@ async function handleMessage(msg: Message) {
       state.consecutiveUnpromptedReplies = isNewSession ? 1 : state.consecutiveUnpromptedReplies + 1;
       
       Telemetry.track('CONVERSATION_TURN', { isNew: isNewSession, topic, sentiment }, msg.author.id, guildId);
+      if (isNewSession) {
+        Telemetry.track('CONVERSATION_START', { sentiment }, msg.author.id, guildId);
+      } else {
+        Telemetry.track('CONVERSATION_UPDATE', { sentiment }, msg.author.id, guildId);
+      }
       Telemetry.track('SESSION_TURN_DEPTH', { turns: state.consecutiveUnpromptedReplies }, msg.author.id, guildId);
       
       if (state.goal === 'proactive start') {
@@ -4715,6 +4848,41 @@ export async function startBot(token: string) {
       if (c === '!stm') { await msg.reply(`\`\`\`\n${stmFormatWithMarker(stmGet(chId), chId).slice(0, 1900)}\n\`\`\``); }
       if (c === '!scan' || c === '!proactive') { await msg.reply('scanning...'); await runPassiveTick().catch(() => {}); await msg.reply('done'); }
       if (c === '!videosweep') { await msg.reply('sweeping queued videos across all guilds...'); await runPendingVideoSweep().catch(() => {}); await msg.reply('done'); }
+      if (c === '!forceclip') {
+        const messages = stmGet(chId);
+        if (!messages.length) {
+          await msg.reply('nothing in stm to clip right now');
+          return;
+        }
+        const selected = pickBestClipWindow(messages.map(m => ({
+          author: m.author,
+          content: m.content,
+          attachmentUrls: m.attachmentUrls || [],
+          embedImageUrls: m.embedImageUrls || [],
+          reactionEmojiUrls: m.reactionEmojiUrls || [],
+          isBot: m.isBot || false,
+        })), 8);
+        const payload = {
+          timestamp: Date.now(),
+          guildId,
+          guildName: msg.guild?.name ?? null,
+          channelId: chId,
+          channelName: (msg.channel as any)?.name ?? null,
+          messages: selected.map(m => ({
+            author: m.author,
+            userId: m.userId || m.authorId,
+            content: m.content,
+            avatarUrl: m.avatarUrl || '',
+            attachmentUrls: m.attachmentUrls || [],
+            embedImageUrls: m.embedImageUrls || [],
+            reactionEmojiUrls: m.reactionEmojiUrls || [],
+            screenshotUrl: m.screenshotUrl || null,
+            isBot: m.isBot || false,
+          }))
+        };
+        await queueConversationForYouTube(payload);
+        await msg.reply(`forced clip queued from ${selected.length} high-signal messages`);
+      }
       if (c === '!coldopen') {
         const quietMin = (msSinceAnyGuildActivity() / 60_000).toFixed(1);
         await msg.reply(`global quiet: ${quietMin}m (needs ${COLD_OPEN_GLOBAL_QUIET_MS / 60_000}m) | current target: ${coldOpenTargetUserId ? idCache.get(coldOpenTargetUserId) || coldOpenTargetUserId : 'none'} | forcing a sweep now regardless of quiet threshold...`);

@@ -92,6 +92,16 @@ interface RollingStats {
   guildLeaves: number;
   memoryRecalls: number;
   memoryRecallSuccesses: number;
+  // -- Phase 4: Billion Dollar Deep Metrics --
+  intentsCreated: number;
+  intentsSurfaced: number;
+  intentsResolved: number;
+  goalsSet: number;
+  goalsCompleted: number;
+  goalsAbandoned: number;
+  totalGoalAgeMs: number;
+  sessionSentiments: Record<string, { start: string, end: string, startMs: number, endMs: number }>;
+  conversationDropoffs: Record<string, number>; // Turn depths where people ghosted
   
   recentEvents: TelemetryEvent[];    // last 100 events for live ticker
   sessionStart: string;
@@ -173,6 +183,16 @@ function freshStats(): RollingStats {
     guildLeaves: 0,
     memoryRecalls: 0,
     memoryRecallSuccesses: 0,
+    // -- Phase 4: Billion Dollar Deep Metrics --
+    intentsCreated: 0,
+    intentsSurfaced: 0,
+    intentsResolved: 0,
+    goalsSet: 0,
+    goalsCompleted: 0,
+    goalsAbandoned: 0,
+    totalGoalAgeMs: 0,
+    sessionSentiments: {},
+    conversationDropoffs: {},
     
     recentEvents: [],
     sessionStart: new Date().toISOString()
@@ -185,9 +205,73 @@ class TelemetryEngine {
   private flushIntervalMs = 15_000;
   private interval: NodeJS.Timeout | null = null;
   public stats: RollingStats = freshStats();
+  private isLoaded = false;
+
+  private snapshotIntervalMs = 60 * 60 * 1000; // 1 hour
+  private snapshotInterval: NodeJS.Timeout | null = null;
 
   constructor() {
     this.interval = setInterval(() => this.flush(), this.flushIntervalMs);
+    this.snapshotInterval = setInterval(() => this.takeHourlySnapshot(), this.snapshotIntervalMs);
+  }
+
+  private async takeHourlySnapshot() {
+    if (!this.isLoaded) return;
+    try {
+      const snap = this.getStatsSnapshot();
+      const now = new Date();
+      const dateStr = now.toISOString().split('T')[0]; // YYYY-MM-DD
+      const hourStr = now.getHours().toString().padStart(2, '0');
+      
+      const toSave = {
+        ts: now.getTime(),
+        messages: snap.totalMessages,
+        conversations: snap.totalConversations,
+        decisionsSpeak: snap.decisionsSpeak,
+        decisionsIgnore: snap.decisionsIgnore,
+        avgBoredom: snap.avgBoredom,
+        avgConfidence: snap.avgConfidence,
+        intentsCreated: snap.intentFunnel.created,
+        intentsResolved: snap.intentFunnel.resolved,
+        coldOpens: snap.coldOpens,
+        coldOpenSuccess: snap.coldOpenSuccesses
+      };
+      
+      await db.collection('telemetryHistory').doc(dateStr).collection('hours').doc(hourStr).set(toSave);
+      console.log(`[Telemetry] Saved hourly snapshot for ${dateStr} ${hourStr}:00`);
+    } catch (e) {
+      console.error('[Telemetry] failed to save hourly snapshot:', e);
+    }
+  }
+
+  public async loadFromDb() {
+    try {
+      const snap = await db.collection('telemetryGlobal').doc('rollingStats').get();
+      if (snap.exists) {
+        const data = snap.data() as Partial<RollingStats>;
+        
+        // Merge saved data with fresh defaults (to ensure new keys exist)
+        const fresh = freshStats();
+        
+        // Handle Sets specially
+        if (data.uniqueUsers) this.stats.uniqueUsers = new Set(data.uniqueUsers);
+        if (data.uniqueGuilds) this.stats.uniqueGuilds = new Set(data.uniqueGuilds);
+        
+        // Merge primitives and objects safely
+        for (const key of Object.keys(fresh) as Array<keyof RollingStats>) {
+          if (key === 'uniqueUsers' || key === 'uniqueGuilds' || key === 'recentEvents' || key === 'sessionStart') continue;
+          if (data[key] !== undefined) {
+            (this.stats as any)[key] = data[key];
+          }
+        }
+        
+        console.log('[Telemetry] Loaded historic rolling stats from Firestore.');
+      }
+      this.isLoaded = true;
+    } catch (e) {
+      console.error('[Telemetry] Failed to load historic stats:', e);
+      this.isLoaded = true; // Still allow tracking, just starting fresh
+    }
   }
 
   /** Fire-and-forget event tracking — never throws, never blocks */
@@ -382,6 +466,42 @@ class TelemetryEngine {
       case 'GUILD_LEAVE': s.guildLeaves++; break;
       case 'MEMORY_RECALL_USED': s.memoryRecalls++; break;
       case 'MEMORY_RECALL_SUCCESS': s.memoryRecallSuccesses++; break;
+
+      // -- Phase 4: Billion Dollar Deep Metrics --
+      case 'INTENT_CREATED': s.intentsCreated++; break;
+      case 'INTENT_SURFACED': s.intentsSurfaced++; break;
+      case 'INTENT_RESOLVED': s.intentsResolved++; break;
+      case 'GOAL_SET': s.goalsSet++; break;
+      case 'GOAL_COMPLETED':
+        s.goalsCompleted++;
+        if (e.data.ageMs) s.totalGoalAgeMs += e.data.ageMs;
+        break;
+      case 'GOAL_ABANDONED': 
+        s.goalsAbandoned++; 
+        if (e.data.ageMs) s.totalGoalAgeMs += e.data.ageMs;
+        break;
+      case 'CONVERSATION_START':
+        if (e.userId && e.data.sentiment) {
+          s.sessionSentiments[e.userId] = { 
+            start: e.data.sentiment, 
+            end: e.data.sentiment, 
+            startMs: Date.now(), 
+            endMs: Date.now() 
+          };
+        }
+        break;
+      case 'CONVERSATION_UPDATE':
+        if (e.userId && e.data.sentiment && s.sessionSentiments[e.userId]) {
+          s.sessionSentiments[e.userId].end = e.data.sentiment;
+          s.sessionSentiments[e.userId].endMs = Date.now();
+        }
+        break;
+      case 'CONVERSATION_DROPOFF':
+        if (e.userId) {
+          const depth = e.data.turnDepth || 0;
+          s.conversationDropoffs[depth] = (s.conversationDropoffs[depth] || 0) + 1;
+        }
+        break;
     }
   }
 
@@ -429,6 +549,28 @@ class TelemetryEngine {
         .sort(([,a], [,b]) => b - a)
         .slice(0, 20)
         .map(([id, count]) => ({ id, count })),
+      
+      // Intent & Goal Funnel
+      intentFunnel: {
+        created: s.intentsCreated,
+        surfaced: s.intentsSurfaced,
+        resolved: s.intentsResolved,
+      },
+      goalFunnel: {
+        set: s.goalsSet,
+        completed: s.goalsCompleted,
+        abandoned: s.goalsAbandoned,
+        avgLifespanMs: (s.goalsCompleted + s.goalsAbandoned) > 0 ? Math.round(s.totalGoalAgeMs / (s.goalsCompleted + s.goalsAbandoned)) : 0
+      },
+      
+      // Sentiment Trajectory (Aggregated over all sessions)
+      sentimentShifts: Object.values(s.sessionSentiments).reduce((acc: any, val) => {
+        const shift = `${val.start} -> ${val.end}`;
+        acc[shift] = (acc[shift] || 0) + 1;
+        return acc;
+      }, {}),
+      
+      conversationDropoffs: s.conversationDropoffs,
       // Top commands
       topCommands: Object.entries(s.commandCounts)
         .sort(([,a], [,b]) => b - a)
@@ -455,6 +597,22 @@ class TelemetryEngine {
     } catch (e) {
       console.error('[Telemetry] flush error:', e);
       // Don't re-push to buffer to avoid memory leaks
+    }
+
+    // Save RollingStats to Firestore
+    if (this.isLoaded) {
+      try {
+        // Create a copy without Sets
+        const statsToSave = { ...this.stats };
+        (statsToSave as any).uniqueUsers = Array.from(this.stats.uniqueUsers);
+        (statsToSave as any).uniqueGuilds = Array.from(this.stats.uniqueGuilds);
+        // Exclude ephemeral arrays
+        delete (statsToSave as any).recentEvents;
+
+        await db.collection('telemetryGlobal').doc('rollingStats').set(statsToSave);
+      } catch (e) {
+        console.error('[Telemetry] failed to save rolling stats:', e);
+      }
     }
   }
 }

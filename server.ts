@@ -128,6 +128,10 @@ mountDashboardServer(app);
 app.listen(Number(PORT), "0.0.0.0", () => {
   console.log(`[server] Running on http://localhost:${PORT}`);
 
+  import("./src/services/telemetry.ts").then((mod) => {
+    mod.Telemetry.loadFromDb();
+  });
+
   if (process.env.DISCORD_TOKEN) {
     console.log("[server] Auto-starting Discord bot...");
     startBot(process.env.DISCORD_TOKEN).catch((err) =>

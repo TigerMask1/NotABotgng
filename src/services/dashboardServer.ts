@@ -186,6 +186,12 @@ export function mountDashboardServer(app: express.Application) {
         stockSells: snapshot.totalStockSells,
         trades: snapshot.totalTrades,
       },
+      notabotDeepMetrics: {
+        intentFunnel: snapshot.intentFunnel,
+        goalFunnel: snapshot.goalFunnel,
+        sentimentShifts: snapshot.sentimentShifts,
+        conversationDropoffs: snapshot.conversationDropoffs
+      },
       recentEvents: snapshot.recentEvents,
     });
   });
@@ -219,6 +225,29 @@ export function mountDashboardServer(app: express.Application) {
     }
   });
 
+  // ── EXPORT: HISTORY SNAPSHOTS ──
+  app.get('/api/history', async (req, res) => {
+    try {
+      const days = Number(req.query.days) || 7;
+      const snapshots: any[] = [];
+      const now = new Date();
+      
+      for (let i = 0; i < days; i++) {
+        const d = new Date(now.getTime() - (i * 24 * 60 * 60 * 1000));
+        const dateStr = d.toISOString().split('T')[0];
+        const snap = await db.collection('telemetryHistory').doc(dateStr).collection('hours').get();
+        snapshots.push(...snap.docs.map(doc => doc.data()));
+      }
+      
+      // Sort chronologically
+      snapshots.sort((a, b) => a.ts - b.ts);
+      res.json(snapshots);
+    } catch (e) {
+      console.error('[Dashboard] Error fetching history:', e);
+      res.status(500).json({ error: 'Failed to fetch history' });
+    }
+  });
+
   // ── NotABot-Only Intelligence Summary ──
   app.get('/api/notabot/intelligence', (_, res) => {
     const s = Telemetry.getStatsSnapshot();
@@ -238,6 +267,10 @@ export function mountDashboardServer(app: express.Application) {
       },
       topicBreakdown: s.topicDistribution,
       sentimentBreakdown: s.sentimentDistribution,
+      sentimentShifts: s.sentimentShifts,
+      conversationDropoffs: s.conversationDropoffs,
+      intentFunnel: s.intentFunnel,
+      goalFunnel: s.goalFunnel,
       brainState: {
         avgConfidence: s.avgConfidence,
         avgBoredom: s.avgBoredom,
