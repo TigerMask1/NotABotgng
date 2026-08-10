@@ -1,0 +1,51 @@
+name: YouTube Automation Pipeline
+
+on:
+  schedule:
+    # Run 5 times a day: 00:00, 04:00, 10:00, 16:00, 20:00 (UTC)
+    - cron: '0 0,4,10,16,20 * * *'
+  workflow_dispatch: # Allow manual triggers
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          pip install -r ytautomation/requirements.txt
+          
+      - name: Create .env file from secrets
+        run: |
+          cd ytautomation
+          echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> .env
+          echo "FIREBASE_PROJECT_ID=${{ secrets.FIREBASE_PROJECT_ID }}" >> .env
+          echo "FIREBASE_CLIENT_EMAIL=${{ secrets.FIREBASE_CLIENT_EMAIL }}" >> .env
+          echo "FIREBASE_PRIVATE_KEY=${{ secrets.FIREBASE_PRIVATE_KEY }}" >> .env
+          echo "YT_CLIENT_ID=${{ secrets.YT_CLIENT_ID }}" >> .env
+          echo "YT_CLIENT_SECRET=${{ secrets.YT_CLIENT_SECRET }}" >> .env
+          echo "YT_REFRESH_TOKEN=${{ secrets.YT_REFRESH_TOKEN }}" >> .env
+          
+      - name: Run Pipeline (Shorts only)
+        run: |
+          cd ytautomation/scripts
+          python daily_pipeline.py --shorts-only
+          
+      - name: Upload Output Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-shorts
+          path: ytautomation/output/
+          retention-days: 7
