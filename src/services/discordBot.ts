@@ -2084,7 +2084,7 @@ async function executeCommand(
           screenshotUrl: m.screenshotUrl || null,
           isBot: m.isBot || false,
         })),
-        clipMode: decision.commandArgs?.mode === 'unhinged' ? 'unhinged' : 'normal'
+        clipMode: args.mode === 'unhinged' ? 'unhinged' : 'normal'
       };
       await queueConversationForYouTube(payload);
       Telemetry.track('CLIP_QUEUED', { channelId, messageCount: selected.length }, undefined, guildId);
@@ -2117,10 +2117,11 @@ async function executeCommand(
           reactionEmojiUrls: m.reactionEmojiUrls || [],
           screenshotUrl: m.screenshotUrl || null,
           isBot: m.isBot || false,
-        }))
+        })),
+        clipMode: args.mode === 'unhinged' ? 'unhinged' : 'normal'
       };
       await queueConversationForYouTube(payload);
-      return `Captured ${rec.messages.length} messages from the live recording. Queued for YouTube.`;
+      return `Captured ${rec.messages.length} messages from the live recording. Queued for YouTube. Mode: ${payload.clipMode}`;
     }
     case 'react_to_message': {
       // Passive emoji reaction to a specific message — for watching mode.
