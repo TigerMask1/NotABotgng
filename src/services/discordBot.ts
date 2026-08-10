@@ -2687,10 +2687,10 @@ async function sendDecision(opts: {
   guildId:    string;
   replyToMsg?: Message;
 }) {
-  const { decision, replyToMsg } = opts;
+  const { decision, replyToMsg, channelId, guildId } = opts;
   let targetChannel = opts.channel;
-  let targetChannelId = opts.channelId;
-  let targetGuildId = opts.guildId;
+  let targetChannelId = channelId;
+  let targetGuildId = guildId;
 
   // Resolve replyScope if requested
   if (decision.replyScope && decision.replyScope !== 'here') {
