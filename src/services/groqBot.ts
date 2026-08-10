@@ -78,14 +78,21 @@ export class GroqManager {
           lastError = e.message ?? String(e);
           console.warn(`[Groq:${model}] attempt ${attempt + 1}: ${e.message?.slice(0, 80)}`);
           
-          // If the model itself is not found or invalid (404/400), don't keep retrying this model, break to the next model
-          if (e.message?.includes('404') || e.message?.includes('400')) {
-            break;
-          }
+        // If the model itself is not found or invalid (404/400), don't keep retrying this model, break to the next model
+        if (e.message?.includes('404') || e.message?.includes('400')) {
+          break;
         }
       }
+      }
     }
-    throw new Error(`[Groq] all attempts and models failed. Last error: ${lastError}`);
+
+    console.warn(`[Groq] All attempts failed (${lastError}). Falling back to Gemini...`);
+    try {
+      const { gemini } = await import('./geminiBot.ts');
+      return await gemini.call(systemPrompt, userPrompt, temp, 'gemini-3.1-flash-lite', [], jsonMode ? undefined : 0);
+    } catch (fallbackError: any) {
+      throw new Error(`[Groq] all attempts failed and Gemini fallback also failed. Groq Error: ${lastError}. Gemini Error: ${fallbackError.message}`);
+    }
   }
 }
 

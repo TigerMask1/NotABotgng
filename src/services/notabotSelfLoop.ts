@@ -229,7 +229,7 @@ export async function runSelfLoopTick(): Promise<void> {
 
     await new Promise(r => setTimeout(r, 1000 + Math.random() * 1500));
 
-    await playChannel.channel.send({ content: decision.message, allowedMentions: { parse: ['users'] } });
+    await playChannel.channel.send({ content: decision.message, allowedMentions: { parse: [] } });
     console.log(`[SelfLoop] sent: "${decision.message.slice(0, 60)}..."`);
 
     // Step 5: Wait for BusinessBot's reply

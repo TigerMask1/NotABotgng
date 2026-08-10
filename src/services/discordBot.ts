@@ -31,211 +31,7 @@ const BG_MODEL      = 'gemma-4-31b-it';        // profiler / compress / history-
 // nothing persisted — fetched fresh per brain() call and thrown away after.
 interface ImagePart { mimeType: string; data: string; }
 
-// ── GEMINI MANAGER ────────────────────────────────────────────────
-class GeminiManager {
-  private keys: string[];
-  private idx = 0;
-  private cooldowns = new Map<string, number>();
-
-  // API Tracking
-  private keyStats = new Map<string, { rpm: number; rpd: number; lastMin: number; lastDay: number }>();
-
-  private getPacificDay(nowMs: number) {
-    // Pacific time is UTC-7 (PDT) or UTC-8 (PST). 
-    // We'll use UTC-7 (which aligns with 12:30 PM IST during daylight saving) 
-    // to approximate the midnight PT reset.
-    return Math.floor((nowMs - 7 * 3600_000) / 86400_000);
-  }
-
-  private trackRequest(key: string): { rpm: number; rpd: number } {
-    const nowMs = Date.now();
-    const currMin = Math.floor(nowMs / 60_000);
-    const currDay = this.getPacificDay(nowMs);
-    
-    let stats = this.keyStats.get(key);
-    if (!stats) {
-      stats = { rpm: 0, rpd: 0, lastMin: currMin, lastDay: currDay };
-      this.keyStats.set(key, stats);
-    }
-    
-    if (stats.lastMin !== currMin) { stats.rpm = 0; stats.lastMin = currMin; }
-    if (stats.lastDay !== currDay) { stats.rpd = 0; stats.lastDay = currDay; }
-    
-    stats.rpm++;
-    stats.rpd++;
-    return { rpm: stats.rpm, rpd: stats.rpd };
-  }
-
-  constructor() {
-    const raw = process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '';
-    this.keys = raw.split(',').map(k => k.trim()).filter(Boolean);
-    if (!this.keys.length) console.error('[Gemini] no keys found in GEMINI_API_KEYS');
-    else console.log(`[Gemini] ${this.keys.length} key(s) loaded`);
-  }
-
-  private pickKey(): string | null {
-    const now = Date.now();
-    for (let i = 0; i < this.keys.length; i++) {
-      const k = this.keys[(this.idx + i) % this.keys.length];
-      if (!this.cooldowns.get(k) || now > this.cooldowns.get(k)!) {
-        this.idx = (this.idx + i + 1) % this.keys.length;
-        return k;
-      }
-    }
-    let best = this.keys[0], bestCd = Infinity;
-    for (const k of this.keys) {
-      const cd = this.cooldowns.get(k) ?? 0;
-      if (cd < bestCd) { bestCd = cd; best = k; }
-    }
-    return best;
-  }
-
-  // responseMimeType forces JSON on models that honor it. some smaller/open
-  // models (gemma) don't reliably honor it and will instead narrate prose
-  // about what it's going to do — maxOutputTokens cuts that off before it
-  // burns the whole generation on rambling instead of ever emitting "{".
-  async call(
-    systemPrompt: string,
-    userPrompt: string,
-    temp = 0.9,
-    model = ACTIVE_MODEL,
-    images: ImagePart[] = [],
-    maxOutputTokens?: number,
-  ): Promise<string> {
-    // images go BEFORE the text part — that's the order Gemini's multimodal
-    // input expects for best grounding (look at the picture, then read what's
-    // being asked about it, not the other way around).
-    const userParts = [
-      ...images.map(img => ({ inlineData: { mimeType: img.mimeType, data: img.data } })),
-      { text: userPrompt },
-    ];
-    const generationConfig: Record<string, any> = { temperature: temp, responseMimeType: 'application/json' };
-    if (maxOutputTokens) generationConfig.maxOutputTokens = maxOutputTokens;
-
-    const requestBody = {
-      systemInstruction: { parts: [{ text: systemPrompt }] },
-      contents: [{ role: 'user', parts: userParts }],
-      generationConfig,
-    };
-
-    if (DEBUG_LOG_REQUESTS) {
-      try {
-        // redact actual base64 image bytes — you want to see the shape of the
-        // request, not megabytes of encoded pixels in a text file.
-        const loggable = {
-          ...requestBody,
-          contents: [{
-            role: 'user',
-            parts: userParts.map((p: any) =>
-              p.inlineData ? { inlineData: { mimeType: p.inlineData.mimeType, data: `[base64 omitted, ${Math.round(p.inlineData.data.length * 0.75 / 1024)}kb]` } } : p
-            ),
-          }],
-        };
-        const dump = [
-          `── ${new Date().toISOString()} ──`,
-          `endpoint: https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-          `model: ${model} | temp: ${temp} | maxOutputTokens: ${maxOutputTokens ?? '(none)'}`,
-          '',
-          '--- FULL REQUEST BODY (what actually gets POSTed) ---',
-          JSON.stringify(loggable, null, 2),
-        ].join('\n');
-        fs.writeFileSync('./debug_last_request.txt', dump, 'utf8');
-      } catch (e: any) {
-        console.warn('[Debug] failed to write request dump:', e.message?.slice(0, 80));
-      }
-    }
-
-    let lastError = '';
-    const startTime = Date.now();
-    const maxAttempts = Math.min(4, Math.max(this.keys.length, 1) * 2);
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const key = this.pickKey();
-      if (!key) { lastError = 'no keys available'; throw new Error('[Gemini] no keys available'); }
-      try {
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(requestBody),
-          }
-        );
-        if (res.status === 429) {
-          const body = await res.json().catch(() => ({})) as any;
-          const retryMs = ((body?.error?.details?.[0]?.retryDelay?.seconds ?? 10) as number) * 1000;
-          this.cooldowns.set(key, Date.now() + retryMs);
-          
-          const errMsg = body?.error?.message || '';
-          let limitType = 'Unknown 429';
-          if (errMsg.includes('Resource has been exhausted')) limitType = 'RPM (Resource exhausted)';
-          else if (errMsg.includes('Tokens per minute')) limitType = 'TPM (Tokens per minute)';
-          else if (errMsg.includes('Daily request limit')) limitType = 'RPD (Daily limit)';
-          else if (errMsg.includes('quota')) limitType = 'Quota Exceeded';
-          
-          console.warn(`[Gemini] ...${key.slice(-4)} 429 ${limitType} — cd ${retryMs / 1000}s. Msg: ${errMsg}`);
-          lastError = `429 Rate Limit: ${limitType}`;
-          continue;
-        }
-        if (!res.ok) {
-          const err = await res.text().catch(() => res.statusText);
-          throw new Error(`Gemini ${res.status}: ${err.slice(0, 120)}`);
-        }
-        
-        const stats = this.trackRequest(key);
-        const data = await res.json() as any;
-        const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
-        const finishReason = data.candidates?.[0]?.finishReason ?? 'unknown';
-        
-        const inTokens = data.usageMetadata?.promptTokenCount ?? 0;
-        const outTokens = data.usageMetadata?.candidatesTokenCount ?? 0;
-        const durationMs = Date.now() - startTime;
-        
-        Telemetry.track('NOTABOT_API_CALL', {
-          model,
-          inTokens,
-          outTokens,
-          durationMs,
-          finishReason
-        });
-        
-        console.log(`[Gemini:${model}] key=...${key.slice(-4)} | ${text.length}ch | in:${inTokens} out:${outTokens} | reqs: ${stats.rpm}/min, ${stats.rpd}/day | finish=${finishReason}`);
-        // a 200 with no actual text (blocked candidate, safety trip, empty
-        // generation, etc.) is NOT a usable result — retry like any other
-        // failure instead of letting an empty string masquerade as success.
-        if (!text.trim()) {
-          console.warn(`[Gemini] ...${key.slice(-4)} returned empty text (finish=${finishReason}) — retrying`);
-          lastError = `empty text (finish=${finishReason})`;
-          continue;
-        }
-        return text;
-      } catch (e: any) {
-        lastError = e.message ?? String(e);
-        if (e.message?.includes('429')) continue;
-        console.error(`[Gemini] attempt ${attempt + 1}: ${e.message?.slice(0, 80)}`);
-        if (attempt < Math.max(this.keys.length, 1) * 2 - 1)
-          await sleep(Math.min(1500 * 2 ** attempt, 10_000));
-      }
-    }
-    throw new Error(`[Gemini] all attempts failed. Last error: ${lastError}`);
-  }
-
-  canCall(): boolean { return this.keys.length > 0; }
-
-  // public accessor so other managers (embeddings) can share the same key pool
-  // without reaching into the private rotation state directly.
-  getKey(): string | null { return this.pickKey(); }
-
-  status(): string {
-    const now = Date.now();
-    const keys = this.keys.map(k =>
-      `...${k.slice(-4)}${(this.cooldowns.get(k) ?? 0) > now
-        ? ` (cd ${Math.ceil(((this.cooldowns.get(k) ?? 0) - now) / 1000)}s)` : ''}`
-    ).join(' | ');
-    return `gemini: ${this.keys.length} key(s) | ${keys || 'none'}`;
-  }
-}
-
-const gemini = new GeminiManager();
+import { gemini, GeminiManager } from './geminiBot.ts';
 
 // ── EMBEDDING MANAGER (Google text-embedding-004, same key pool as Gemini) ──
 // used for semantic memory recall — turns facts/jokes/arcs into vectors so
@@ -2407,7 +2203,7 @@ zero assistant energy: never "happy to help," never explain your reasoning, neve
 sometimes the right move is one emoji and nothing else, or a single reaction, or just gif — words aren't the only tool, and often aren't the best one.
 burst texting: for a reaction that genuinely builds in stages (a thought interrupting itself), split "reply" into up to 3 fragments with "|||" between them — each one still tiny. this is rare, not your default — most turns are one fragment, no "|||" at all. never force a split just to use the feature.
 you know your channel link: http://www.youtube.com/@NotABot_GnG — this is the channel handle ONLY, drop it when someone's asking about the channel itself, never as a substitute for a video link, and never right after you already dropped it recently.
-you can actually ping someone: write @Name (their display name, exactly as it shows in the chat above) anywhere in your reply and it becomes a real notification-ping when it sends — use it when you're genuinely calling someone out, pulling them into what you're saying, or want to make sure they specifically see it, not on every mention of someone's name. if the name doesn't match anyone real, it just stays as plain text — no harm either way, so don't overthink it.
+you can actually ping someone: write @Name (their display name, exactly as it shows in the chat above) anywhere in your reply and it becomes a real notification-ping when it sends — BUT DO NOT SPAM THIS. ONLY ping someone if they pinged you first, or if you are replying to a direct question they asked. Randomly pinging users annoys them and gets you kicked out of servers. If you do ping, use it sparingly. if the name doesn't match anyone real, it just stays as plain text — no harm either way, so don't overthink it.
 
 discord_query is your general lookup into any server you're actually in — not just the one this conversation is happening in. channels, roles, a specific person's join date/roles, who has a given role, recent or keyword-searched messages in a channel. commandArgs must be {"target": "channels"|"roles"|"guild_info"|"user_info"|"members_with_role"|"recent_messages"|"search_messages"}, plus guildName if you want a DIFFERENT server than the one you're in right now (e.g. someone asks about a person/thing from another server you're both in), plus whichever of userName/roleName/channelName/query/limit that target needs. someone asking "does X know about Y" or "what did X say about Z" where X is in a different server is exactly what guildName + search_messages is for — actually check, don't just say you have no idea. wrong target/guild/missing arg → the result just tells you what's valid, retry with that. this only searches recent history (limit caps at 50), not the server's entire past — if it comes back empty, that means "not in what I could check," not "definitely never happened."
 
@@ -2817,9 +2613,10 @@ async function sendDecision(opts: {
     const gifUrl = await giphySearch(decision.gifQuery);
     try { await channel.sendTyping(); } catch {}
     await sleep(400);
+    // Gifs never contain user pings — suppress all mentions.
     if (gifUrl) {
       try {
-        const sent = await channel.send({ content: gifUrl, allowedMentions: { parse: ['users'] } });
+        const sent = await channel.send({ content: gifUrl, allowedMentions: { parse: [] } });
         stmPush(channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: '[sent a gif]' });
       } catch (err) { console.error('[sendDecision] fail sending gif:', err); }
     } else {
@@ -2827,7 +2624,7 @@ async function sendDecision(opts: {
       // no results, or the request failed: just say so in character, no fake url.
       const fallback = 'couldnt find one lol';
       try {
-        const sent = await channel.send({ content: fallback, allowedMentions: { parse: ['users'] } });
+        const sent = await channel.send({ content: fallback, allowedMentions: { parse: [] } });
         stmPush(channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: fallback });
       } catch (err) { console.error('[sendDecision] fail sending fallback gif text:', err); }
     }
@@ -2837,21 +2634,30 @@ async function sendDecision(opts: {
     if (guildId !== 'dm' && replyToMsg) updateBond(guildId, replyToMsg.author.id, 1).catch(() => {});
   }
 
-  if (decision.action === 'speak' && decision.reply?.trim()) {
-    const fragments = decision.reply.split('|||').map(f => resolveMentionNames(f.trim())).filter(Boolean).slice(0, 3);
-    let isFirst = true;
+  if (decision.action === 'speak' || decision.action === 'play') {
+    if (!decision.reply?.trim()) return;
+    const cleanReply = decision.reply.replace(/<@unknown-user>/gi, '').replace(/@unknown-user/gi, '');
+    const fragments = cleanReply.split('|||').map(f => resolveMentionNames(f.trim())).filter(Boolean).slice(0, 3);
+    // Only allow pinging the person who actually triggered this reply.
+    // The AI can see many user IDs in the transcript and may write them in its
+    // reply — we must not let those become live pings on uninvolved people.
+    // allowedMentions.users = [senderId] means only that one ID will actually
+    // ping; all other <@id> tags render as plaintext mentions.
+    const senderAllowlist = replyToMsg ? [replyToMsg.author.id] : [];
     for (const frag of fragments) {
       const text = frag.slice(0, 250);
       try { await channel.sendTyping(); } catch {}
       await sleep(Math.min(300 + text.length * 20, 2800));
       try {
-        const sent = await channel.send({ content: text, allowedMentions: { parse: ['users'] } });
+        const sent = await channel.send({
+          content: text,
+          allowedMentions: { parse: [], users: senderAllowlist },
+        });
         stmPush(channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: text });
       } catch (err) {
         console.error('[sendDecision] fail sending text frag:', err);
         break; // if one fragment fails, stop sending the rest to preserve order/avoid spamming errors
       }
-      isFirst = false;
       // small natural gap between burst fragments, on top of the typing-length delay above
       if (frag !== fragments[fragments.length - 1]) await sleep(400 + Math.random() * 500);
     }
@@ -4775,7 +4581,7 @@ export async function startBot(token: string) {
         channelName: targetChannel.name,
         serverName: guild.name,
         everyonePing: false, endingConvo: false,
-        selfNote: `a new person (${memberName}) just joined the server! greet them naturally, keep it short (1 line), tag them <@${m.id}>. act like a normal person saying wsg/welcome to a new joiner. do NOT sound like a welcome bot.`,
+        selfNote: `a new person (${memberName}) just joined the server! greet them naturally, keep it short (1 line). DO NOT ping anyone else in the chat, only focus on the new joiner. DO NOT repeat your previous welcome messages or emojis — be original.`,
       };
 
       try {
@@ -4783,8 +4589,13 @@ export async function startBot(token: string) {
         if (decision.action === 'speak' && decision.reply?.trim()) {
           const mentionTag = `<@${m.id}>`;
           const replyText = decision.reply.includes(mentionTag) ? decision.reply : `${mentionTag} ${decision.reply}`;
-          decision = { ...decision, reply: replyText };
-          await sendDecision({ channel: targetChannel as any, decision, channelId: chId, guildId: guild.id });
+          try { await targetChannel!.sendTyping(); } catch {}
+          await sleep(400);
+          // Explicitly only allow pinging the new member — nobody else.
+          await (targetChannel as any).send({
+            content: replyText,
+            allowedMentions: { parse: [], users: [m.id] },
+          });
         }
       } catch (err) {
         console.error('[GuildMemberAdd] welcome error:', err);
