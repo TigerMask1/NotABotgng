@@ -2345,10 +2345,16 @@ COMMANDS YOU CAN RUN (include in JSON when needed, "none" otherwise):
 - wiki_lookup: real wikipedia summary. args: { topic: "..." }. settles arguments, or just fair game out of your own curiosity.
 - start_event: args: { type: "hot_take|roast_battle|trivia|npc_check", answer?: "...", topic?: "..." }. put your announcement in "reply", system handles the backend. one event per server at a time. hot_take=3min takes judged by you, roast_battle=4min you pick a winner, trivia=2min first correct answer wins, npc_check=instant call-out of the most mid person in the transcript.
 - get_leaderboard: server XP leaderboard. args: {}
-- youtube_clip: queue the current conversation window for a YouTube video — runs immediately when you call it. YOU decide when to do this. the flow is: spot something clip-worthy → ask casually in your reply ("can i clip this for a vid" or whatever fits) → set intent { what: "clip this if they said yes", triggerType: "next_turn" } → on the next brain call, read what they actually said and make the call yourself: run youtube_clip if they were cool with it, ignore if they said no, and if nobody replied for a while the passive tick will surface your intent and you decide then. you can also use get_history to browse OLD conversations and clip something from hours or days ago. args: {}
-- start_recording: start a live capture of the ongoing conversation — you decide when. use it when something is heating up and you want to catch everything from here forward. announce it naturally in your reply. args: {}
+- youtube_clip: queue the current conversation window for a YouTube video — runs immediately when you call it. YOU decide when to do this. the full flow: spot something clip-worthy → ask casually in your reply ("can i clip this for a vid" or similar, nothing formal) → set intent { what: "clip if they agreed", triggerType: "next_turn" } → on the next brain call you see their actual reply and make the judgment yourself: run youtube_clip if they were good with it, ignore if they said no. nobody replied? passive tick will surface your intent and you decide then. you can also scout OLD conversations: run get_history with a time range, read the summary, then decide if it's worth clipping. args: {}
+- start_recording: start a live capture of the ongoing conversation — your call, no user command needed. use it when something is heating up and you want to catch everything from here forward. announce it naturally in your reply. args: {}
 - stop_recording: stop recording and queue what you captured. use when the moment's done or you have enough. args: {}
-- react_to_message: drop a silent emoji reaction on a specific past message — use SPARINGLY, only when the reaction would genuinely land (not every message). good for watching a convo without interrupting it. args: { msgId: "exact msgId from the transcript e.g. 1234567890", emoji: "single emoji" }
+- react_to_message: drop a silent emoji reaction on a specific past message — use SPARINGLY, only when the reaction genuinely fits (not every message, not a habit). this does NOT trigger a chat reply, it's silent. perfect for watching a funny convo play out without interrupting it. args: { msgId: "exact msgId shown in transcript, e.g. 1302847562718", emoji: "single emoji" }
+
+═══ WHEN SOMEONE PINGS YOU TO CHECK OLD CHATS ═══
+if someone says "@notabot check this convo" or "would this be good for a vid" or similar:
+- reply naturally that you'll check it out
+- run get_history with a relevant time range (or get_stm for recent chat)
+- on the second pass, read what came back and make YOUR own call: is this actually clip-worthy? if yes, ask their permission casually in reply + set a next_turn intent to actually run youtube_clip once they respond. if no, say something like "nah this one's kind of mid" or whatever fits your vibe — don't just always agree.
 system runs the command and hands you the result — then you give your actual reply, command:"none" on that follow-up turn.
 
 in transcripts: [me] = your own past messages.
@@ -2632,6 +2638,15 @@ async function executeBrainDecision(opts: {
   }
 
   if (decision.command !== 'none') {
+    // react_to_message is a terminal fire-and-forget — run it and return the
+    // original decision without a second brain pass. there's nothing to say
+    // after placing a silent emoji reaction, and a second pass would risk the
+    // brain sending a message when it was explicitly watching, not responding.
+    if (decision.command === 'react_to_message') {
+      await executeCommand(decision.command, decision.commandArgs, opts.channelId, opts.guildId);
+      return decision; // done — no re-evaluation
+    }
+
     // race the real command against a short timer. if the timer wins, the
     // command is genuinely slow — drop one casual stall line so the channel
     // doesn't just sit dead, then keep waiting for the real result. if the
