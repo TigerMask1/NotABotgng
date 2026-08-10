@@ -2066,14 +2066,7 @@ async function executeCommand(
     case 'youtube_clip': {
       const messages = stmGet(channelId);
       if (!messages || messages.length === 0) return 'no messages to clip';
-      const selected = pickBestClipWindow(messages.map(m => ({
-        author: m.author,
-        content: m.content,
-        attachmentUrls: m.attachmentUrls || [],
-        embedImageUrls: m.embedImageUrls || [],
-        reactionEmojiUrls: m.reactionEmojiUrls || [],
-        isBot: m.isBot || false,
-      })), 8);
+      const selected = pickBestClipWindow(messages, 8);
       const payload = {
         timestamp: Date.now(),
         guildId,
@@ -2090,11 +2083,12 @@ async function executeCommand(
           reactionEmojiUrls: m.reactionEmojiUrls || [],
           screenshotUrl: m.screenshotUrl || null,
           isBot: m.isBot || false,
-        }))
+        })),
+        clipMode: decision.commandArgs?.mode === 'unhinged' ? 'unhinged' : 'normal'
       };
       await queueConversationForYouTube(payload);
       Telemetry.track('CLIP_QUEUED', { channelId, messageCount: selected.length }, undefined, guildId);
-      return `Queued ${selected.length} messages for YouTube. Channel: ${payload.channelName || channelId}.`;
+      return `Queued ${selected.length} messages for YouTube. Channel: ${payload.channelName || channelId}. Mode: ${payload.clipMode}`;
     }
     case 'start_recording': {
       if (liveRecordings.has(channelId)) return 'already recording in this channel!';
@@ -2345,9 +2339,9 @@ COMMANDS YOU CAN RUN (include in JSON when needed, "none" otherwise):
 - wiki_lookup: real wikipedia summary. args: { topic: "..." }. settles arguments, or just fair game out of your own curiosity.
 - start_event: args: { type: "hot_take|roast_battle|trivia|npc_check", answer?: "...", topic?: "..." }. put your announcement in "reply", system handles the backend. one event per server at a time. hot_take=3min takes judged by you, roast_battle=4min you pick a winner, trivia=2min first correct answer wins, npc_check=instant call-out of the most mid person in the transcript.
 - get_leaderboard: server XP leaderboard. args: {}
-- youtube_clip: queue the current conversation window for a YouTube video — runs immediately when you call it. YOU decide when to do this. the full flow: spot something clip-worthy → ask casually in your reply ("can i clip this for a vid" or similar, nothing formal) → set intent { what: "clip if they agreed", triggerType: "next_turn" } → on the next brain call you see their actual reply and make the judgment yourself: run youtube_clip if they were good with it, ignore if they said no. nobody replied? passive tick will surface your intent and you decide then. you can also scout OLD conversations: run get_history with a time range, read the summary, then decide if it's worth clipping. args: {}
+- youtube_clip: queue the current conversation window for a YouTube video. YOU decide when to do this. args: { mode?: "normal" | "unhinged" }. if you set mode to "unhinged", the resulting clip will rewrite your lines to be chaotic, caps-lock heavy, poor grammar, and extra emojis/gifs (but not spammy). the full flow: spot something clip-worthy → ask casually in your reply ("can i clip this for a vid" or similar, nothing formal) → set intent { what: "clip if they agreed", triggerType: "next_turn" } → on the next brain call you see their actual reply and make the judgment yourself: run youtube_clip if they were good with it, ignore if they said no. nobody replied? passive tick will surface your intent and you decide then. you can also scout OLD conversations: run get_history with a time range, read the summary, then decide if it's worth clipping.
 - start_recording: start a live capture of the ongoing conversation — your call, no user command needed. use it when something is heating up and you want to catch everything from here forward. announce it naturally in your reply. args: {}
-- stop_recording: stop recording and queue what you captured. use when the moment's done or you have enough. args: {}
+- stop_recording: stop recording and queue what you captured. use when the moment's done or you have enough. args: { mode?: "normal" | "unhinged" }
 - react_to_message: drop a silent emoji reaction on a specific past message — use SPARINGLY, only when the reaction genuinely fits (not every message, not a habit). this does NOT trigger a chat reply, it's silent. perfect for watching a funny convo play out without interrupting it. args: { msgId: "exact msgId shown in transcript, e.g. 1302847562718", emoji: "single emoji" }
 
 ═══ WHEN SOMEONE PINGS YOU TO CHECK OLD CHATS ═══
