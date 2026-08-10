@@ -2326,6 +2326,8 @@ interface BrainDecision {
   confidence:      number;
   boredom:         number;
   reason:          string;
+  replyScope?:     'here' | 'dm' | 'channel' | 'server';
+  replyTarget?:    string;
 }
 
 function parseBrainJSON(raw: string): BrainDecision | null {
@@ -2350,7 +2352,9 @@ function parseBrainJSON(raw: string): BrainDecision | null {
       intent:          p.intent && typeof p.intent === 'object' ? p.intent : undefined,
       confidence:      typeof p.confidence === 'number' ? p.confidence : 1.0,
       boredom:         typeof p.boredom === 'number' ? p.boredom : 0.0,
-      reason:          typeof p.reason === 'string' ? p.reason : ''
+      reason:          typeof p.reason === 'string' ? p.reason : '',
+      replyScope:      (['here', 'dm', 'channel', 'server'] as const).includes(p.replyScope) ? p.replyScope : 'here',
+      replyTarget:     typeof p.replyTarget === 'string' ? p.replyTarget.trim().slice(0, 50) : ''
     };
   } catch { return null; }
 }
@@ -2598,62 +2602,117 @@ async function sendDecision(opts: {
   guildId:    string;
   replyToMsg?: Message;
 }) {
-  const { channel, decision, channelId, guildId, replyToMsg } = opts;
-  const state = getChState(channelId);
-  
-  if (replyToMsg && decision.action !== 'ignore') {
-    Telemetry.track('RESPONSE_TIME', { latencyMs: Date.now() - replyToMsg.createdTimestamp }, undefined, guildId);
+  const { decision, replyToMsg } = opts;
+  let targetChannel = opts.channel;
+  let targetChannelId = opts.channelId;
+  let targetGuildId = opts.guildId;
+
+  // Resolve replyScope if requested
+  if (decision.replyScope && decision.replyScope !== 'here') {
+    if (decision.replyScope === 'dm' && replyToMsg && !replyToMsg.author.bot) {
+      try {
+        const dm = await replyToMsg.author.createDM();
+        targetChannel = dm;
+        targetChannelId = dm.id;
+        targetGuildId = 'dm';
+      } catch (err) {
+        console.warn(`[sendDecision] could not open DM with ${replyToMsg.author.username}`);
+      }
+    } else if (decision.replyScope === 'channel' && decision.replyTarget && opts.guildId !== 'dm') {
+      const guild = botClient?.guilds.cache.get(opts.guildId);
+      if (guild) {
+        const tgtName = decision.replyTarget.toLowerCase().replace(/^#/, '');
+        const ch = guild.channels.cache.find(c => (c as any).name?.toLowerCase() === tgtName && c.isTextBased());
+        if (ch) {
+          targetChannel = ch;
+          targetChannelId = ch.id;
+        } else {
+          console.warn(`[sendDecision] could not resolve channel ${decision.replyTarget}`);
+        }
+      }
+    } else if (decision.replyScope === 'server' && decision.replyTarget) {
+      let sName = decision.replyTarget;
+      let cName = '';
+      if (sName.includes(':')) {
+        [sName, cName] = sName.split(':');
+      }
+      sName = sName.trim().toLowerCase();
+      cName = cName.trim().toLowerCase().replace(/^#/, '');
+      
+      const guild = botClient?.guilds.cache.find(g => g.name.toLowerCase() === sName);
+      if (guild) {
+        let ch = guild.systemChannel as any;
+        if (cName) {
+           ch = guild.channels.cache.find(c => (c as any).name?.toLowerCase() === cName && c.isTextBased());
+        }
+        if (!ch) {
+           ch = guild.channels.cache.find(c => c.isTextBased() && (c as TextChannel).permissionsFor(guild.members.me!)?.has(PermissionFlagsBits.SendMessages));
+        }
+        if (ch) {
+          targetChannel = ch;
+          targetChannelId = ch.id;
+          targetGuildId = guild.id;
+        }
+      }
+    }
   }
 
+  // Use the original channel's state for pausing/active tracking, because that's where the conversation happened
+  const state = getChState(opts.channelId);
+  
+  if (replyToMsg && decision.action !== 'ignore') {
+    Telemetry.track('RESPONSE_TIME', { latencyMs: Date.now() - replyToMsg.createdTimestamp }, undefined, opts.guildId);
+  }
+
+  // Reactions always go on the original triggering message
   if (decision.action === 'react' && decision.reaction && replyToMsg) {
     try { await replyToMsg.react(decision.reaction); } catch {}
   }
 
   if (decision.action === 'gif' && decision.gifQuery?.trim()) {
     const gifUrl = await giphySearch(decision.gifQuery);
-    try { await channel.sendTyping(); } catch {}
+    try { await targetChannel.sendTyping(); } catch {}
     await sleep(400);
     // Gifs never contain user pings — suppress all mentions.
     if (gifUrl) {
       try {
-        const sent = await channel.send({ content: gifUrl, allowedMentions: { parse: [] } });
-        stmPush(channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: '[sent a gif]' });
+        const sent = await targetChannel.send({ content: gifUrl, allowedMentions: { parse: [] } });
+        stmPush(targetChannelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: '[sent a gif]' });
       } catch (err) { console.error('[sendDecision] fail sending gif:', err); }
     } else {
       // safe fallback — NEVER let the model guess a link here. giphy not configured,
       // no results, or the request failed: just say so in character, no fake url.
       const fallback = 'couldnt find one lol';
       try {
-        const sent = await channel.send({ content: fallback, allowedMentions: { parse: [] } });
-        stmPush(channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: fallback });
+        const sent = await targetChannel.send({ content: fallback, allowedMentions: { parse: [] } });
+        stmPush(targetChannelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: fallback });
       } catch (err) { console.error('[sendDecision] fail sending fallback gif text:', err); }
     }
     state.lastBotMsgAt = Date.now();
     state.gotResponseSinceLastBotMsg = false;
     if (replyToMsg) state.lastRepliedToSenderId = replyToMsg.author.id;
-    if (guildId !== 'dm' && replyToMsg) updateBond(guildId, replyToMsg.author.id, 1).catch(() => {});
+    if (opts.guildId !== 'dm' && replyToMsg) updateBond(opts.guildId, replyToMsg.author.id, 1).catch(() => {});
   }
 
   if (decision.action === 'speak' || decision.action === 'play') {
     if (!decision.reply?.trim()) return;
     const cleanReply = decision.reply.replace(/<@unknown-user>/gi, '').replace(/@unknown-user/gi, '');
     const fragments = cleanReply.split('|||').map(f => resolveMentionNames(f.trim())).filter(Boolean).slice(0, 3);
-    // Only allow pinging the person who actually triggered this reply.
-    // The AI can see many user IDs in the transcript and may write them in its
-    // reply — we must not let those become live pings on uninvolved people.
-    // allowedMentions.users = [senderId] means only that one ID will actually
-    // ping; all other <@id> tags render as plaintext mentions.
-    const senderAllowlist = replyToMsg ? [replyToMsg.author.id] : [];
+    // Only allow pinging the person who actually triggered this reply, AND only if we are still replying in the same scope.
+    // If we hopped to a DM or another server, pinging logic changes — to be safe, if we changed channels, don't ping the sender.
+    const isSameScope = targetChannelId === opts.channelId;
+    const senderAllowlist = (replyToMsg && isSameScope) ? [replyToMsg.author.id] : [];
+    
     for (const frag of fragments) {
       const text = frag.slice(0, 250);
-      try { await channel.sendTyping(); } catch {}
+      try { await targetChannel.sendTyping(); } catch {}
       await sleep(Math.min(300 + text.length * 20, 2800));
       try {
-        const sent = await channel.send({
+        const sent = await targetChannel.send({
           content: text,
           allowedMentions: { parse: [], users: senderAllowlist },
         });
-        stmPush(channelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: text });
+        stmPush(targetChannelId, { ts: Date.now(), id: sent.id, authorId: BOT_ID, author: '[me]', content: text });
       } catch (err) {
         console.error('[sendDecision] fail sending text frag:', err);
         break; // if one fragment fails, stop sending the rest to preserve order/avoid spamming errors
