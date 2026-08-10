@@ -579,16 +579,6 @@ interface LiveRecording {
 }
 const liveRecordings = new Map<string, LiveRecording>();
 
-// Clip permission: tracks channels where NotABot asked "can I clip this?"
-// Key = channelId. Auto-accepts after CLIP_PERMISSION_TIMEOUT_MS if no response.
-interface ClipPermission {
-  payload: any;
-  askedAt: number;
-  timeoutHandle: ReturnType<typeof setTimeout>;
-  askedMsgId?: string;  // the message NotABot sent asking permission
-}
-const CLIP_PERMISSION_TIMEOUT_MS = 10 * 60_000; // 10 minutes → auto-accept
-const clipPermissionPending = new Map<string, ClipPermission>();
 
 function sessionBufferPush(channelId: string, line: string) {
   if (!sessionBuffers.has(channelId)) sessionBuffers.set(channelId, []);
@@ -2074,10 +2064,6 @@ async function executeCommand(
       return `intent ${args.id} resolved.`;
     }
     case 'youtube_clip': {
-      // Check if a clip permission request is already pending for this channel.
-      if (clipPermissionPending.has(channelId)) {
-        return 'already waiting on a permission reply for this channel — wait for them to respond first.';
-      }
       const messages = stmGet(channelId);
       if (!messages || messages.length === 0) return 'no messages to clip';
       const selected = pickBestClipWindow(messages.map(m => ({
@@ -2106,19 +2092,9 @@ async function executeCommand(
           isBot: m.isBot || false,
         }))
       };
-      // Store the payload and set an auto-accept timeout.
-      // The actual queueing happens when someone replies yes, or the timer fires.
-      const timeoutHandle = setTimeout(async () => {
-        const pending = clipPermissionPending.get(channelId);
-        if (!pending) return;
-        clipPermissionPending.delete(channelId);
-        // Auto-accept — no one objected within the timeout window
-        await queueConversationForYouTube(pending.payload).catch(() => {});
-        console.log(`[ClipPermission] auto-accepted for channel ${channelId} (no response after ${CLIP_PERMISSION_TIMEOUT_MS / 60000}m)`);
-        // Silently queue — don't send another message about it, it's been too long
-      }, CLIP_PERMISSION_TIMEOUT_MS);
-      clipPermissionPending.set(channelId, { payload, askedAt: Date.now(), timeoutHandle });
-      return 'CLIP_PERMISSION_REQUESTED — you must now say something like "can i add this to my video?" in your reply field. wait for their yes/no. if no response comes in 10 minutes it auto-accepts.';
+      await queueConversationForYouTube(payload);
+      Telemetry.track('CLIP_QUEUED', { channelId, messageCount: selected.length }, undefined, guildId);
+      return `Queued ${selected.length} messages for YouTube. Channel: ${payload.channelName || channelId}.`;
     }
     case 'start_recording': {
       if (liveRecordings.has(channelId)) return 'already recording in this channel!';
@@ -2354,7 +2330,7 @@ after 2-3 replies in a row, gauge if it's wound down — if so, pause 5-15 (minu
 told via "mode: new video" with title + link. mention it like you just remembered you should, mid-vibe — not "NEW VIDEO OUT NOW," no hype-copy, no clean caption. "oh yeah i posted this lol [link]" energy, or even just the bare link with zero commentary if that's funnier. fine to skip entirely if it'd interrupt something else going on. only mention a given video once unless someone else brings it up first.
 
 COMMANDS YOU CAN RUN (include in JSON when needed, "none" otherwise):
-- get_history: chat summaries for a range. args: { from: "ISO string", to: "ISO string" }
+- get_history: browse old chat summaries from any time window — use this to scout for clips, remember what happened, or check an old convo someone mentioned. args: { from: "ISO string", to: "ISO string" }
 - get_member: info about someone. args: { name: "display name" }
 - get_stm: full recent transcript.
 - get_video_status: your last upload + real link, anything queued. args: {} — the ONLY source of a real video link; use it before ever sending one. your memorized channel link is NOT a substitute for this — if the conversation is about "a video," run this command, don't just paste the channel link because it's easier.
@@ -2369,10 +2345,10 @@ COMMANDS YOU CAN RUN (include in JSON when needed, "none" otherwise):
 - wiki_lookup: real wikipedia summary. args: { topic: "..." }. settles arguments, or just fair game out of your own curiosity.
 - start_event: args: { type: "hot_take|roast_battle|trivia|npc_check", answer?: "...", topic?: "..." }. put your announcement in "reply", system handles the backend. one event per server at a time. hot_take=3min takes judged by you, roast_battle=4min you pick a winner, trivia=2min first correct answer wins, npc_check=instant call-out of the most mid person in the transcript.
 - get_leaderboard: server XP leaderboard. args: {}
-- youtube_clip: YOU decide when to clip, based on your own creative instinct. If the conversation has been genuinely funny, chaotic, or interesting — clip it for a video. Run this command to begin the permission flow. In your "reply", ask the channel if you can add this to your video (be casual, not formal). REAL clips of people come first — use this often, you have full freedom. Do NOT wait to be asked. args: {}
-- start_recording: Start recording an ongoing conversation you think will be good content. Do this on your own — when something is heating up, when a debate is getting out of hand, or when something genuinely funny is happening. Announce it casually in your reply, don't make a big deal of it. args: {}
-- stop_recording: Stop the active recording and queue it for YouTube. Use when the moment has passed, the conversation died, or you got what you needed. args: {}
-- react_to_message: Silently drop an emoji reaction on a SPECIFIC earlier message — use this SPARINGLY, only when it would genuinely land (the message was funny, absurd, or a perfect moment). This is for watching the chat, NOT for responding to someone. args: { msgId: "the message ID from the transcript", emoji: "single emoji" }
+- youtube_clip: queue the current conversation window for a YouTube video — runs immediately when you call it. YOU decide when to do this. the flow is: spot something clip-worthy → ask casually in your reply ("can i clip this for a vid" or whatever fits) → set intent { what: "clip this if they said yes", triggerType: "next_turn" } → on the next brain call, read what they actually said and make the call yourself: run youtube_clip if they were cool with it, ignore if they said no, and if nobody replied for a while the passive tick will surface your intent and you decide then. you can also use get_history to browse OLD conversations and clip something from hours or days ago. args: {}
+- start_recording: start a live capture of the ongoing conversation — you decide when. use it when something is heating up and you want to catch everything from here forward. announce it naturally in your reply. args: {}
+- stop_recording: stop recording and queue what you captured. use when the moment's done or you have enough. args: {}
+- react_to_message: drop a silent emoji reaction on a specific past message — use SPARINGLY, only when the reaction would genuinely land (not every message). good for watching a convo without interrupting it. args: { msgId: "exact msgId from the transcript e.g. 1234567890", emoji: "single emoji" }
 system runs the command and hands you the result — then you give your actual reply, command:"none" on that follow-up turn.
 
 in transcripts: [me] = your own past messages.
@@ -3053,8 +3029,7 @@ async function runPassiveTick() {
     const serverName   = (ch as any).guild?.name || serverNameCache.get(guildId) || 'unknown';
     const channelName  = (ch as any).name || channelId.slice(-5);
     const isRecording  = liveRecordings.has(channelId);
-    const clipPending  = clipPermissionPending.has(channelId);
-    const statusLine = `mode: passive scan (5-min check-in, huge context, you may start something new) | speak: ${speakState.mode} | server: ${serverName} | channel: #${channelName}${isRecording ? ' | 🔴 RECORDING ACTIVE' : ''}${clipPending ? ' | ⏳ waiting on clip permission' : ''}`;
+    const statusLine = `mode: passive scan (5-min check-in, huge context, you may start something new) | speak: ${speakState.mode} | server: ${serverName} | channel: #${channelName}${isRecording ? ' | 🔴 RECORDING ACTIVE' : ''}`;
 
     const brainOpts: BrainOpts = { guildId,
       model: PASSIVE_MODEL,
@@ -4299,32 +4274,6 @@ async function handleMessage(msg: Message) {
 
   try {
     const channelId   = msg.channelId;
-
-    // ── Clip permission response handler ──────────────────────────
-    // If we're waiting for a yes/no on "can I clip this?", check every
-    // incoming message in that channel for a response. Human only.
-    if (!msg.author.bot && clipPermissionPending.has(channelId)) {
-      const pending = clipPermissionPending.get(channelId)!;
-      const lowered = textContent.toLowerCase().trim();
-      // Detect YES signals
-      const isYes = /\b(yes|yeah|yep|ye|yea|sure|ok|okay|go ahead|go for it|do it|clip it|fine|why not|ofc|of course|absolutely|duh)\b/.test(lowered);
-      // Detect NO signals
-      const isNo  = /\b(no|nah|nope|don't|dont|stop|nope|pls no|please no|skip|drop it)\b/.test(lowered);
-      if (isYes || isNo) {
-        clearTimeout(pending.timeoutHandle);
-        clipPermissionPending.delete(channelId);
-        if (isYes) {
-          await queueConversationForYouTube(pending.payload).catch(() => {});
-          Telemetry.track('CLIP_PERMISSION_GRANTED', { channelId }, msg.author.id, guildId);
-          console.log(`[ClipPermission] granted by ${msg.author.username} in ${channelId}`);
-        } else {
-          Telemetry.track('CLIP_PERMISSION_DENIED', { channelId }, msg.author.id, guildId);
-          console.log(`[ClipPermission] denied by ${msg.author.username} in ${channelId}`);
-          // Don't queue — just drop it. Bot will react naturally through the normal brain pipeline.
-        }
-        // Fall through to normal processing — brain will see the message and reply naturally
-      }
-    }
 
     // ── user commands (no brain needed) ──────────────────────────
     if (cmd === '!rank') {
