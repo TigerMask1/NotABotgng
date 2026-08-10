@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import { Telemetry } from './telemetry.ts';
 
-const ACTIVE_MODEL = 'gemini-3.1-flash-lite';
+const ACTIVE_MODEL = 'gemini-2.5-flash';
 const DEBUG_LOG_REQUESTS = process.env.DEBUG_LOG_REQUESTS === 'true';
 
 interface ImagePart { mimeType: string; data: string; }

@@ -224,6 +224,7 @@ export async function startBusinessBot(token: string) {
   });
 
   botClient.on(Events.MessageCreate, async (msg: Message) => {
+    // Only ignore own messages — other bots (e.g. NotABot) can intentionally trigger BusinessBot
     if (msg.author.id === botClient!.user!.id) return;
 
     // 1. Traditional ! commands
@@ -234,8 +235,9 @@ export async function startBusinessBot(token: string) {
 
       try {
         await handleCommand(msg, commandName, args);
-      } catch (e) {
+      } catch (e: any) {
         console.error('[BusinessBot] Error handling command', e);
+        msg.reply(`❌ Something went wrong: ${e?.message?.slice(0, 80) || 'unknown error'}`).catch(() => {});
       }
       return;
     }
@@ -246,10 +248,13 @@ export async function startBusinessBot(token: string) {
     const usesCustomName = customName && msg.content.toLowerCase().includes(customName.toLowerCase());
     
     if (mentionsBot || usesCustomName) {
+      // Show typing indicator so the user knows we're processing
+      if ('sendTyping' in msg.channel) (msg.channel as any).sendTyping().catch(() => {});
       try {
         await handleNaturalLanguage(msg, usesCustomName ? customName : undefined);
-      } catch (e) {
+      } catch (e: any) {
         console.error('[BusinessBot] Error handling natural language', e);
+        msg.reply('Sir, I encountered an error. Please try again or use `!` commands.').catch(() => {});
       }
     }
   });

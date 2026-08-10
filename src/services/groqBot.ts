@@ -28,7 +28,11 @@ export class GroqManager {
     systemPrompt: string,
     userPrompt: string,
     temp = 0.5,
-    models = ['groq/compound-mini', 'llama-3.1-8b-instant', 'llama-3.3-70b-versatile'],
+    // JSON-mode-compatible models first. groq/compound-mini does NOT support
+    // response_format: json_object (it's a compound system, not a plain LLM)
+    // so it is intentionally excluded from the default model list.
+    // llama-3.1-8b-instant is deprecated as of mid-2026.
+    models = ['llama-3.3-70b-versatile', 'openai/gpt-oss-20b'],
     jsonMode = true
   ): Promise<string> {
     const maxAttempts = Math.min(3, Math.max(this.keys.length, 1) * 2);
@@ -53,45 +57,60 @@ export class GroqManager {
                 { role: 'user', content: userPrompt }
               ],
               temperature: temp,
-              ...(jsonMode ? { response_format: { type: 'json_object' } } : {})
+              ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
+              // Hard cap: prevent runaway calls from sitting for >8s
+              max_tokens: 512,
             })
           });
 
           if (res.status === 429) {
             const body = await res.json().catch(() => ({})) as any;
-            this.cooldowns.set(key, Date.now() + 10000);
-            console.warn(`[Groq:${model}] ...${key.slice(-4)} 429`);
+            // Respect the Retry-After from the header if available
+            const retryAfterSec = parseInt(res.headers.get('retry-after') || '10', 10);
+            this.cooldowns.set(key, Date.now() + retryAfterSec * 1000);
+            console.warn(`[Groq:${model}] ...${key.slice(-4)} 429 — cd ${retryAfterSec}s`);
             lastError = '429 Rate Limit';
             continue;
           }
 
           if (!res.ok) {
             const err = await res.text().catch(() => res.statusText);
-            throw new Error(`Groq ${res.status}: ${err.slice(0, 120)}`);
+            const errShort = err.slice(0, 200);
+            console.warn(`[Groq:${model}] ${res.status}: ${errShort}`);
+            lastError = `${res.status}: ${errShort}`;
+            // Model-level error (400/404): skip remaining attempts for this model
+            if (res.status === 400 || res.status === 404) break;
+            throw new Error(`Groq ${res.status}: ${errShort}`);
           }
 
           const data = await res.json() as any;
           const text = data.choices?.[0]?.message?.content ?? '';
+          if (!text.trim()) {
+            lastError = 'empty response';
+            console.warn(`[Groq:${model}] empty response, retrying`);
+            continue;
+          }
           console.log(`[Groq:${model}] key=...${key.slice(-4)} | ${text.length}ch`);
           return text;
+
         } catch (e: any) {
           lastError = e.message ?? String(e);
           console.warn(`[Groq:${model}] attempt ${attempt + 1}: ${e.message?.slice(0, 80)}`);
-          
-        // If the model itself is not found or invalid (404/400), don't keep retrying this model, break to the next model
-        if (e.message?.includes('404') || e.message?.includes('400')) {
-          break;
+
+          // Model-level error: no point retrying the same model
+          if (e.message?.includes('404') || e.message?.includes('400')) break;
         }
-      }
       }
     }
 
+    // All Groq attempts exhausted — fall back to Gemini
     console.warn(`[Groq] All attempts failed (${lastError}). Falling back to Gemini...`);
     try {
       const { gemini } = await import('./geminiBot.ts');
-      return await gemini.call(systemPrompt, userPrompt, temp, 'gemini-3.1-flash-lite', [], jsonMode ? undefined : 0);
+      // Use the same ACTIVE_MODEL that geminiBot defaults to
+      return await gemini.call(systemPrompt, userPrompt, temp, undefined, [], jsonMode ? undefined : 0);
     } catch (fallbackError: any) {
-      throw new Error(`[Groq] all attempts failed and Gemini fallback also failed. Groq Error: ${lastError}. Gemini Error: ${fallbackError.message}`);
+      throw new Error(`[Groq] all Groq models failed and Gemini fallback also failed. Groq error: ${lastError}. Gemini error: ${fallbackError.message}`);
     }
   }
 }
