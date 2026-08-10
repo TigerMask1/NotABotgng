@@ -4536,70 +4536,122 @@ export async function startBot(token: string) {
   botClient.on(Events.GuildMemberAdd, async (m) => {
     if (m.user.bot) return;
     cacheId(m.id, m.displayName);
+
+    // Check BEFORE upsert so we can accurately detect first-ever join vs rejoin.
+    // If firstSeenAt is already in Firestore, this person has joined before — skip the welcome.
+    const existingRecord = await getMember(m.guild.id, m.id).catch(() => ({} as MemberData));
     await upsertMember(m.guild.id, m.id, { displayName: m.displayName, username: m.user.username });
+
+    if (existingRecord.firstSeenAt) {
+      console.log(`[GuildMemberAdd] ${m.displayName} rejoined ${m.guild.name} — skipping welcome (firstSeenAt=${existingRecord.firstSeenAt})`);
+      return;
+    }
 
     if (serverMuted.get(m.guild.id) || globallyMuted) return;
 
-    // Find target channel to send a welcome ping
     const guild = m.guild;
-    const allowList = serverChannelAllowlist.get(guild.id);
+
+    // ── Pick the best channel for a welcome message ────────────────────
+    // Score channels: prefer general-purpose chat channels,
+    // explicitly downrank read-only/admin/log channels.
+    const CHANNEL_SCORES: Record<string, number> = {
+      general: 10, chat:  9, main:  8, lounge: 8, hangout: 7,
+      talk:    6,  lobby: 6, offtopic: 5, random: 5, bot: -5,
+      bots:   -5,  commands: -5, rules: -20, announcements: -20,
+      info:  -20,  logs: -20, mod: -20, modlog: -20, admin: -20,
+      audit: -20,
+    };
+
+    function scoreChannel(ch: { name?: string }): number {
+      const name = (ch.name ?? '').toLowerCase();
+      for (const [key, score] of Object.entries(CHANNEL_SCORES)) {
+        if (name.includes(key)) return score;
+      }
+      return 1; // neutral unknown channel
+    }
+
     let targetChannel: TextChannel | undefined;
 
+    // First, try channels from the server's bot allowlist (admin-configured scope)
+    const allowList = serverChannelAllowlist.get(guild.id);
     if (allowList?.size) {
-      for (const chId of allowList) {
-        const ch = guild.channels.cache.get(chId) as TextChannel | undefined;
-        if (ch?.isTextBased() && !ch.isDMBased() && ch.permissionsFor(guild.members.me!)?.has(PermissionFlagsBits.SendMessages)) {
-          targetChannel = ch;
-          break;
-        }
-      }
+      const candidates = [...allowList]
+        .map(chId => guild.channels.cache.get(chId) as TextChannel | undefined)
+        .filter((ch): ch is TextChannel =>
+          !!ch && ch.isTextBased() && !ch.isDMBased() &&
+          !!ch.permissionsFor(guild.members.me!)?.has(PermissionFlagsBits.SendMessages)
+        )
+        .sort((a, b) => scoreChannel(b) - scoreChannel(a));
+      targetChannel = candidates[0];
     }
 
-    if (!targetChannel && guild.systemChannel && guild.systemChannel.permissionsFor(guild.members.me!)?.has(PermissionFlagsBits.SendMessages)) {
-      targetChannel = guild.systemChannel;
-    }
-
+    // If no allowlist, pick the best-scoring writable text channel
     if (!targetChannel) {
-      targetChannel = guild.channels.cache.find(
-        (c): c is TextChannel => c.isTextBased() && !c.isDMBased() && !!(c as TextChannel).permissionsFor(guild.members.me!)?.has(PermissionFlagsBits.SendMessages)
-      ) as TextChannel | undefined;
+      const scored = guild.channels.cache
+        .filter((c): c is TextChannel =>
+          c.isTextBased() && !c.isDMBased() &&
+          !!(c as TextChannel).permissionsFor(guild.members.me!)?.has(PermissionFlagsBits.SendMessages)
+        )
+        .sort((a, b) => scoreChannel(b) - scoreChannel(a));
+      // Skip channels with strongly negative scores (rules, announcements, etc.)
+      const best = scored.first();
+      if (best && scoreChannel(best) >= 0) targetChannel = best;
     }
 
-    if (targetChannel && gemini.canCall()) {
-      const chId = targetChannel.id;
-      const memberName = m.displayName || m.user.username;
-      const brainOpts: BrainOpts = {
-        model: ACTIVE_MODEL,
-        sender: '(new-member)',
-        bond: 50,
-        message: `<@${m.id}> (${memberName}) just joined the server!`,
-        transcript: stmFormatWithMarker(stmGet(chId), chId),
-        memCtx: '',
-        mentioned: false, isDM: false,
-        statusLine: `mode: member-welcome | server: ${guild.name} | channel: #${targetChannel.name}`,
-        inExchange: false,
-        channelName: targetChannel.name,
-        serverName: guild.name,
-        everyonePing: false, endingConvo: false,
-        selfNote: `a new person (${memberName}) just joined the server! greet them naturally, keep it short (1 line). DO NOT ping anyone else in the chat, only focus on the new joiner. DO NOT repeat your previous welcome messages or emojis — be original.`,
-      };
+    if (!targetChannel || !gemini.canCall()) return;
 
-      try {
-        let decision = await brain(brainOpts);
-        if (decision.action === 'speak' && decision.reply?.trim()) {
-          const mentionTag = `<@${m.id}>`;
-          const replyText = decision.reply.includes(mentionTag) ? decision.reply : `${mentionTag} ${decision.reply}`;
-          try { await targetChannel!.sendTyping(); } catch {}
-          await sleep(400);
-          // Explicitly only allow pinging the new member — nobody else.
+    const chId = targetChannel.id;
+    const memberName = m.displayName || m.user.username;
+
+    const brainOpts: BrainOpts = {
+      model: ACTIVE_MODEL,
+      sender: '(new-member)',
+      senderId: m.id,
+      bond: 50,
+      message: `<@${m.id}> (${memberName}) just joined the server for the first time!`,
+      transcript: stmFormatWithMarker(stmGet(chId), chId),
+      memCtx: '',
+      mentioned: false, isDM: false,
+      statusLine: `mode: member-welcome | server: ${guild.name} | channel: #${targetChannel.name}`,
+      inExchange: false,
+      channelName: targetChannel.name,
+      serverName: guild.name,
+      everyonePing: false, endingConvo: false,
+      selfNote: `${memberName} just joined the server for the FIRST TIME EVER — they are genuinely new. React naturally like a person who noticed someone walk into a room: a gif reaction, a short wsg, or just a vibe check. Pick action=gif if a funny welcome gif fits the vibe. action=speak for a short casual line. action=react if a single emoji reaction to the join event feels right. Do NOT do a formal "Welcome to the server!" template — just be yourself. Their Discord ID is <@${m.id}> so you can ping them if you speak.`,
+    };
+
+    try {
+      const decision = await brain(brainOpts);
+
+      if (decision.action === 'speak' && decision.reply?.trim()) {
+        const mentionTag = `<@${m.id}>`;
+        const replyText = decision.reply.includes(mentionTag) ? decision.reply : `${mentionTag} ${decision.reply}`;
+        const cleanText = replyText.replace(/<@unknown-user>/gi, '').replace(/@unknown-user/gi, '');
+        try { await targetChannel.sendTyping(); } catch {}
+        await sleep(400 + cleanText.length * 15);
+        await (targetChannel as any).send({
+          content: cleanText,
+          allowedMentions: { parse: [], users: [m.id] },
+        });
+
+      } else if (decision.action === 'gif' && decision.gifQuery?.trim()) {
+        const gifUrl = await giphySearch(decision.gifQuery);
+        if (gifUrl) {
+          try { await targetChannel.sendTyping(); } catch {}
+          await sleep(500);
           await (targetChannel as any).send({
-            content: replyText,
-            allowedMentions: { parse: [], users: [m.id] },
+            content: gifUrl,
+            allowedMentions: { parse: [] },
           });
         }
-      } catch (err) {
-        console.error('[GuildMemberAdd] welcome error:', err);
+        // If giphy returned nothing, just stay quiet — don't fall back to a template.
+
       }
+      // action=react doesn't apply here since we have no message to react to.
+      // action=ignore is also valid — sometimes the right move is no welcome at all.
+
+    } catch (err) {
+      console.error('[GuildMemberAdd] welcome error:', err);
     }
   });
 
