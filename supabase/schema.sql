@@ -15,9 +15,12 @@
 -- ═══════════════════════════════════════════════════════════════════════════
 
 create table if not exists servers (
-  guild_id   text primary key,
-  name       text,
-  updated_at timestamptz default now()
+  guild_id            text primary key,
+  name                text,
+  bot_muted           boolean default false,
+  allowed_bot_ids     text[] default '{}',
+  allowed_channel_ids text[] default '{}',
+  updated_at          timestamptz default now()
 );
 
 create table if not exists server_channels (
