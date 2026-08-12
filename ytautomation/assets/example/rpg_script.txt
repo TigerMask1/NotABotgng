@@ -1,0 +1,18 @@
+# BG: cave
+Noob [smug]: Finally! I found the legendary Mewtwo! #!zoom_target(Noob)
+Rival [idle]: This is it. Don't mess this up. Just use your Master Ball.
+Noob [idle]: Nah, I'm saving that for something harder. Go, Geodude!
+Rival [shocked]: Why are you sending out a pebble against a psychic god?
+Noob [smug]: Trust the process. Geodude, use Self-Destruct to weaken it!
+Rival [shocked]: WAIT, NO! THAT WILL JUST KILL MEWTWO! #!shake
+Noob [shocked]: Oh no! It fainted! Quick, I'll catch this Zubat so I don't leave empty-handed!
+Noob [smug]: Master Ball, go! #!flash
+Rival [idle]: ... #!music_stop
+Rival [angry]: Out of 14,000,605 possibilities... you happen to choose this? #!zoom_target(Rival)
+Rival [angry]: YOU JUST USED THE ULTIMATE BALL ON A BLIND BAT THAT APPEARS EVERY TWO STEPS! #!shake#!flash
+Rival [angry]: MEWTWO IS GONE FOREVER BECAUSE YOU HAVE THE TACTICAL BRAIN OF A SLOWPOKE! #!shake
+Rival [angry]: YOU ARE THE REASON BERRY JUICE HAS INSTRUCTION MANUALS! #!flash
+Rival [angry]: I HAVE SEEN METAPODS WITH MORE STRATEGIC DEPTH THAN YOUR ENTIRE BLOODLINE! #!shake
+Noob [sad]: But... he looked like he wanted a friend...
+Rival [angry]: IT'S A CAVE! EVERYTHING IS IN THE DARK! DELETE YOUR SAVE FILE! #!shake
+Noob [fainted]: At least my Zubat has a nice house now... #!zoom_target(Noob)

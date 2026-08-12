@@ -1,0 +1,74 @@
+{
+    "Billy": {
+        "profile_pic": "perm/billy.jpeg",
+        "role_color": "#ffffff"
+    },
+    "Pizza": {
+        "profile_pic": "perm/pizza.jpeg",
+        "role_color": "#ffcc6e"
+    },
+    "Nerd": {
+        "profile_pic": "perm/nerd.jpg",
+        "role_color": "#9cffa1"
+    },
+    "Cashew": {
+        "profile_pic": "perm/cashew.jpg",
+        "role_color": "#f2b8ff"
+    },
+    "Peanut": {
+        "profile_pic": "perm/peanut.png",
+        "role_color": "#7885ff"
+    },
+    "Cheddar": {
+        "profile_pic": "perm/cheddar.png",
+        "role_color": "#ff7878"
+    },
+    "NOTABOT": {
+        "profile_pic": "perm/notabot.png",
+        "role_color": "#ffffff"
+    },
+    "ducky": {
+        "profile_pic": "perm/ducky.png",
+        "role_color": "#ffffff"
+    },
+    "fatas": {
+        "profile_pic": "perm/fatas.png",
+        "role_color": "#ffffff"
+    },
+    "dumby": {
+        "profile_pic": "perm/dumby.png",
+        "role_color": "#ffffff"
+    },
+    "ChatGPT": {
+        "profile_pic": "perm/chatgpt.png",
+        "role_color": "#70a9ff"
+    },
+    "Groq": {
+        "profile_pic": "perm/groq.png",
+        "role_color": "#ff8a5b"
+    },
+    "Claude": {
+        "profile_pic": "perm/claude.png",
+        "role_color": "#7cf0c2"
+    },
+    "PLEASE DONT OPEN THAT FOLDER$^1.5#!message#!zoom_in_sudden": {
+        "profile_pic": "perm/billy.jpeg",
+        "role_color": "#0d3b69"
+    },
+    "**Anime girls eating dirt?**$^2.0#!vineboom#!zoom_in_gradual": {
+        "profile_pic": "perm/billy.jpeg",
+        "role_color": "#384259"
+    },
+    "and you still forgot a semicolon$^1.8#!message#!zoom_in_sudden": {
+        "profile_pic": "perm/billy.jpeg",
+        "role_color": "#384d48"
+    },
+    "uploading to the server now...$^1.5#!message#!zoom_in_gradual": {
+        "profile_pic": "perm/billy.jpeg",
+        "role_color": "#7c2509"
+    },
+    "I\u2019m deleting @NOTABOT right now!$^1.5#!message#!zoom_in_sudden": {
+        "profile_pic": "perm/billy.jpeg",
+        "role_color": "#d680cc"
+    }
+}

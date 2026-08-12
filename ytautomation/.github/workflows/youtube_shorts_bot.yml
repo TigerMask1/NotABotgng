@@ -1,0 +1,55 @@
+name: Auto YouTube Shorts Bot
+on:
+  schedule:
+    # Runs 5 times a day at 00:00, 05:00, 10:00, 15:00, and 20:00 UTC
+    - cron: '0 0,5,10,15,20 * * *'
+  workflow_dispatch: # Allows manual triggering
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg xvfb
+
+      - name: Install Python Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate Script from Supabase queue or Gemini fallback
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NOTABOT_SUPABASE_URL: ${{ secrets.NOTABOT_SUPABASE_URL }}
+          NOTABOT_SUPABASE_SERVICE_KEY: ${{ secrets.NOTABOT_SUPABASE_SERVICE_KEY }}
+        run: |
+          python scripts/generate_script.py
+
+      - name: Generate Discord Video (Text-2-Beluga)
+        run: |
+          cd scripts
+          xvfb-run python auto_main.py
+          cd ..
+
+      - name: Convert to Vertical Short
+        run: |
+          python scripts/make_vertical.py
+
+      - name: Upload to YouTube Shorts
+        env:
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          DISCORD_SERVER_INVITE: ${{ secrets.DISCORD_SERVER_INVITE }}
+        run: |
+          python scripts/upload_youtube.py

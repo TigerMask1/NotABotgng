@@ -1,0 +1,13 @@
+moviepy==1.0.3
+Pillow
+pilmoji==2.0.5
+playsound==1.2.2
+pyfiglet==1.0.2
+PyQt5
+regex
+google-generativeai
+google-auth-oauthlib
+google-api-python-client
+python-dotenv
+supabase
+requests
