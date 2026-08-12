@@ -1,6 +1,23 @@
 import { initializeApp, cert, getApps } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
-import { notabotDb, businessBotDb } from './supabase.ts';
+import { createClient } from '@supabase/supabase-js';
+
+// Use SERVICE ROLE keys to bypass RLS during migration
+function getMigrationClients() {
+  const notabotUrl = process.env.NOTABOT_SUPABASE_URL || process.env.SUPABASE_URL || '';
+  const notabotServiceKey = process.env.NOTABOT_SUPABASE_SERVICE_KEY || process.env.NOTABOT_SUPABASE_KEY || '';
+  const businessUrl = process.env.BUSINESSBOT_SUPABASE_URL || process.env.SUPABASE_URL || '';
+  const businessServiceKey = process.env.BUSINESSBOT_SUPABASE_SERVICE_KEY || process.env.BUSINESSBOT_SUPABASE_KEY || '';
+
+  const notabotDb = createClient(notabotUrl, notabotServiceKey, {
+    auth: { persistSession: false, autoRefreshToken: false }
+  });
+  const businessBotDb = createClient(businessUrl, businessServiceKey, {
+    auth: { persistSession: false, autoRefreshToken: false }
+  });
+  return { notabotDb, businessBotDb };
+}
+
 
 export async function runFirebaseMigration() {
   console.log("🚀 [Migration] Starting migration from Firebase to Supabase...");
@@ -28,6 +45,8 @@ export async function runFirebaseMigration() {
   const db = getFirestore();
 
   try {
+    const { notabotDb, businessBotDb } = getMigrationClients();
+
     // --- MIGRATE BUSINESS BOT USERS ---
     console.log("📦 [Migration] Migrating BusinessBot users...");
     const bUsersSnap = await db.collection('businessUsers').get();
