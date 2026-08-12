@@ -18,6 +18,7 @@
     "discord.js": "^14.26.3",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
+    "firebase-admin": "^14.2.0",
     "groq-sdk": "^0.33.0",
     "sharp": "^0.33.5",
     "zod": "^4.3.6"

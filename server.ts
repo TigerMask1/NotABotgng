@@ -128,25 +128,32 @@ mountDashboardServer(app);
 app.listen(Number(PORT), "0.0.0.0", () => {
   console.log(`[server] Running on http://localhost:${PORT}`);
 
-  import("./src/services/telemetry.ts").then((mod) => {
-    mod.Telemetry.loadFromDb();
-  });
+  (async () => {
+    if (process.env.RUN_FIREBASE_MIGRATION === 'true') {
+      const { runFirebaseMigration } = await import("./src/services/migration.ts");
+      await runFirebaseMigration();
+    }
 
-  if (process.env.DISCORD_TOKEN) {
-    console.log("[server] Auto-starting Discord bot...");
-    startBot(process.env.DISCORD_TOKEN).catch((err) =>
-      console.error("[server] Bot start failed:", err.message)
-    );
-  } else {
-    console.warn("[server] DISCORD_TOKEN not set — bot not started.");
-  }
+    import("./src/services/telemetry.ts").then((mod) => {
+      mod.Telemetry.loadFromDb();
+    });
 
-  if (process.env.BUSINESS_BOT_TOKEN) {
-    console.log("[server] Auto-starting Business bot...");
-    startBusinessBot(process.env.BUSINESS_BOT_TOKEN).catch((err) =>
-      console.error("[server] BusinessBot start failed:", err.message)
-    );
-  } else {
-    console.warn("[server] BUSINESS_BOT_TOKEN not set — business bot not started.");
-  }
+    if (process.env.DISCORD_TOKEN) {
+      console.log("[server] Auto-starting Discord bot...");
+      startBot(process.env.DISCORD_TOKEN).catch((err) =>
+        console.error("[server] Bot start failed:", err.message)
+      );
+    } else {
+      console.warn("[server] DISCORD_TOKEN not set — bot not started.");
+    }
+
+    if (process.env.BUSINESS_BOT_TOKEN) {
+      console.log("[server] Auto-starting Business bot...");
+      startBusinessBot(process.env.BUSINESS_BOT_TOKEN).catch((err) =>
+        console.error("[server] BusinessBot start failed:", err.message)
+      );
+    } else {
+      console.warn("[server] BUSINESS_BOT_TOKEN not set — business bot not started.");
+    }
+  })();
 });
