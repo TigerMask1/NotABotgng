@@ -2,7 +2,7 @@ import {
   Client, GatewayIntentBits, Message, Partials,
   Events, TextChannel, PermissionFlagsBits,
 } from 'discord.js';
-import { db } from './firebase.ts';
+import { notabotDb } from './supabase.ts';
 import { Telemetry } from './telemetry.ts';
 import { chessManager } from './chessGames.ts';
 import { getBusinessBotId, getBusinessBotName } from './businessBot.ts';
@@ -507,8 +507,8 @@ async function notePlaceSeen(guildId: string, guildName: string | undefined, cha
   cacheChannelName(channelId, channelName);
   const now = new Date().toISOString();
   await Promise.all([
-    db.collection('servers').doc(guildId).set({ name: guildName || guildId, updatedAt: now }, { merge: true }).catch(() => {}),
-    db.collection('servers').doc(guildId).collection('channels').doc(channelId).set({ name: channelName || channelId, updatedAt: now }, { merge: true }).catch(() => {}),
+    notabotDb.from('servers').upsert({ guild_id: guildId, name: guildName || guildId, updated_at: now }, { onConflict: 'guild_id' }).then(),
+    notabotDb.from('server_channels').upsert({ guild_id: guildId, channel_id: channelId, name: channelName || channelId, updated_at: now }, { onConflict: 'guild_id,channel_id' }).then(),
   ]);
 }
 
@@ -824,8 +824,8 @@ async function getSpeakState(channelId: string, guildId: string): Promise<SpeakS
   }
   if (guildId === 'dm') return { mode: 'active', reason: 'dm' };
   try {
-    const snap = await db.collection('servers').doc(guildId).collection('channels').doc(channelId).get();
-    const s: SpeakState = snap.data()?.speakState ?? { mode: 'active', reason: 'default' };
+    const { data } = await notabotDb.from('server_channels').select('speak_state').eq('guild_id', guildId).eq('channel_id', channelId).maybeSingle();
+    const s: SpeakState = (data as any)?.speak_state ?? { mode: 'active', reason: 'default' };
     if (s.mode === 'paused' && s.resumeAt && Date.now() >= s.resumeAt) { s.mode = 'active'; s.reason = 'pause expired'; }
     speakStates.set(channelId, s);
     return s;
@@ -839,8 +839,7 @@ async function setSpeakState(channelId: string, guildId: string, s: SpeakState) 
 
 function saveSpeakState(channelId: string, guildId: string, s: SpeakState) {
   if (guildId === 'dm') return;
-  db.collection('servers').doc(guildId).collection('channels').doc(channelId)
-    .set({ speakState: s }, { merge: true }).catch(() => {});
+  notabotDb.from('server_channels').upsert({ guild_id: guildId, channel_id: channelId, speak_state: s }, { onConflict: 'guild_id,channel_id' }).then();
 }
 
 // ── INTEREST / FOCUS (which channel the passive scan visits) ─────
@@ -934,13 +933,11 @@ async function loadPendingIntents(guildId: string) {
   if (guildId === 'dm') return [];
   if (intentStore.has(guildId)) return intentStore.get(guildId)!;
   try {
-    const snap = await db.collection('intents').doc(guildId).collection('pending').where('status', '==', 'pending').get();
-    const intents = snap.docs.map(d => d.data() as Intent);
-    // silently prune expired ones
     const nowStr = new Date().toISOString();
-    const valid = intents.filter(i => i.expiresAt > nowStr);
-    intentStore.set(guildId, valid);
-    return valid;
+    const { data } = await notabotDb.from('intents').select('*').eq('guild_id', guildId).eq('status', 'pending').gt('expires_at', nowStr);
+    const intents = (data ?? []) as unknown as Intent[];
+    intentStore.set(guildId, intents);
+    return intents;
   } catch (e) {
     console.warn(`[Intent] load failed for ${guildId}:`, e);
     return [];
@@ -970,7 +967,7 @@ async function addIntent(guildId: string, channelId: string, intentData: { what:
 
   list.push(intent);
   intentStore.set(guildId, list);
-  db.collection('intents').doc(guildId).collection('pending').doc(intent.id).set(intent).catch(() => {});
+  notabotDb.from('intents').upsert({ id: intent.id, guild_id: guildId, status: intent.status, what: intent.what, trigger_user_id: intent.triggerUserId ?? null, trigger_type: intent.triggerType, trigger_keyword: intent.triggerKeyword ?? null, channel_id: intent.channelId, created_at: intent.createdAt, expires_at: intent.expiresAt }, { onConflict: 'id' }).then();
   console.log(`[Intent] Added for #${channelId.slice(-5)}: ${intent.what}`);
 }
 
@@ -982,7 +979,7 @@ async function resolveIntent(guildId: string, intentId: string) {
   const [intent] = list.splice(idx, 1);
   intent.status = 'resolved';
   intentStore.set(guildId, list);
-  db.collection('intents').doc(guildId).collection('pending').doc(intentId).set(intent, { merge: true }).catch(() => {});
+  notabotDb.from('intents').update({ status: 'resolved' }).eq('id', intentId).then();
   console.log(`[Intent] Resolved: ${intentId}`);
 }
 
@@ -1021,9 +1018,8 @@ async function getTriggeredIntents(guildId: string, channelId: string, senderId:
   if (changed) {
     intentStore.set(guildId, valid);
     // Cleanup in background
-    list.filter(i => i.expiresAt <= nowStr).forEach(i => {
-      db.collection('intents').doc(guildId).collection('pending').doc(i.id).delete().catch(() => {});
-    });
+    const expiredIds = list.filter(i => i.expiresAt <= nowStr).map(i => i.id);
+    if (expiredIds.length) notabotDb.from('intents').delete().in('id', expiredIds).then();
   }
 
   return triggered.slice(0, 3); // Max 3 surfaced per call
@@ -1090,9 +1086,9 @@ async function loadMemories(scope: 'server' | 'person', scopeId: string): Promis
   const c = memStoreCache.get(key);
   if (c && Date.now() - c.ts < 120_000) return c.d;
   try {
-    const snap = await db.collection('memoryStore').doc(key).get();
+    const { data } = await notabotDb.from('memory_store').select('entries').eq('key', key).maybeSingle();
     const now = Date.now();
-    const all = ((snap.data()?.entries ?? []) as Memory[]).filter(m => !m.expiresAt || new Date(m.expiresAt).getTime() > now);
+    const all = ((data?.entries ?? []) as Memory[]).filter(m => !m.expiresAt || new Date(m.expiresAt).getTime() > now);
     memStoreCache.set(key, { d: all, ts: Date.now() });
     return all;
   } catch { return []; }
@@ -1110,7 +1106,7 @@ async function saveMemories(scope: 'server' | 'person', scopeId: string, entries
   // simplest fix that can't silently miss a nested field later.
   const clean = JSON.parse(JSON.stringify(entries));
   try {
-    await db.collection('memoryStore').doc(key).set({ entries: clean }, { merge: false });
+    await notabotDb.from('memory_store').upsert({ key, entries: clean, updated_at: new Date().toISOString() }, { onConflict: 'key' });
   } catch (e: any) {
     // Firestore's .set() can throw SYNCHRONOUSLY on invalid data (validation
     // runs before the promise exists) — a bare .catch() on the call doesn't
@@ -1258,8 +1254,8 @@ async function getMember(guildId: string, userId: string): Promise<MemberData> {
   const c = memberCache.get(key);
   if (c && Date.now() - c.ts < 5 * 60_000) return c.d;
   try {
-    const snap = await db.collection('servers').doc(guildId).collection('members').doc(userId).get();
-    const d = (snap.data() ?? {}) as MemberData;
+    const { data } = await notabotDb.from('server_members').select('*').eq('guild_id', guildId).eq('user_id', userId).maybeSingle();
+    const d: MemberData = data ? { displayName: data.display_name, username: data.username, bond: data.bond, personality: data.personality, firstSeenAt: data.last_seen_at, lastSeenAt: data.last_seen_at, seenCount: data.seen_count } : {};
     memberCache.set(key, { d, ts: Date.now() });
     return d;
   } catch { return {}; }
@@ -1267,8 +1263,15 @@ async function getMember(guildId: string, userId: string): Promise<MemberData> {
 
 async function upsertMember(guildId: string, userId: string, data: Partial<MemberData>) {
   memberCache.delete(`${guildId}:${userId}`);
-  await db.collection('servers').doc(guildId).collection('members').doc(userId)
-    .set({ ...data, updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+  const row: Record<string, any> = { guild_id: guildId, user_id: userId };
+  if (data.displayName !== undefined) row.display_name = data.displayName;
+  if (data.username !== undefined) row.username = data.username;
+  if (data.bond !== undefined) row.bond = data.bond;
+  if (data.personality !== undefined) row.personality = data.personality;
+  if (data.firstSeenAt !== undefined) row.last_seen_at = data.firstSeenAt;
+  if (data.lastSeenAt !== undefined) row.last_seen_at = data.lastSeenAt;
+  if (data.seenCount !== undefined) row.seen_count = data.seenCount;
+  await notabotDb.from('server_members').upsert(row, { onConflict: 'guild_id,user_id' }).then();
 }
 
 async function noteMemberSeen(guildId: string, userId: string, displayName: string, username: string) {
@@ -1360,7 +1363,7 @@ async function maybeLogHistory(channelId: string, guildId: string) {
       channelId,
       createdAt: new Date().toISOString(),
     };
-    await db.collection('historyLogs').doc(channelId).collection('summaries').add(log);
+    await notabotDb.from('history_logs').insert({ channel_id: log.channelId, guild_id: guildId, summary: log.summary, from_ts: log.from, to_ts: log.to, created_at: log.createdAt });
     console.log(`[HistoryLog] #${channelId.slice(-5)} logged ${log.fromStr} → ${log.toStr}`);
   } catch (e: any) {
     console.warn('[HistoryLog] failed:', e.message?.slice(0, 60));
@@ -1369,16 +1372,18 @@ async function maybeLogHistory(channelId: string, guildId: string) {
 
 async function getHistory(channelId: string, fromTs: number, toTs: number): Promise<string> {
   try {
-    const snap = await db.collection('historyLogs').doc(channelId).collection('summaries')
-      .where('from', '>=', fromTs)
-      .where('to', '<=', toTs)
-      .orderBy('from', 'asc')
-      .limit(5)
-      .get();
-    if (snap.empty) return 'no logged history found for that time range';
-    return snap.docs.map(d => {
-      const log = d.data() as HistoryLog;
-      return `[${log.fromStr} → ${log.toStr}]: ${log.summary}`;
+    const { data } = await notabotDb.from('history_logs')
+      .select('summary,from_ts,to_ts')
+      .eq('channel_id', channelId)
+      .gte('from_ts', fromTs)
+      .lte('to_ts', toTs)
+      .order('from_ts', { ascending: true })
+      .limit(5);
+    if (!data?.length) return 'no logged history found for that time range';
+    return data.map(d => {
+      const fromStr = new Date(d.from_ts).toLocaleString();
+      const toStr   = new Date(d.to_ts).toLocaleString();
+      return `[${fromStr} → ${toStr}]: ${d.summary}`;
     }).join('\n');
   } catch (e: any) {
     return `history fetch error: ${e.message?.slice(0, 60)}`;
@@ -1539,13 +1544,9 @@ async function getServerStats(guildId: string): Promise<string> {
   ];
 
   try {
-    const snap = await db.collection('servers').doc(guildId).collection('members')
-      .orderBy('bond', 'desc').limit(5).get();
-    if (!snap.empty) {
-      const top = snap.docs.map(d => {
-        const m = d.data() as MemberData;
-        return `${m.displayName || d.id} (${m.bond ?? 50})`;
-      }).join(', ');
+    const { data } = await notabotDb.from('server_members').select('display_name,user_id,bond').eq('guild_id', guildId).order('bond', { ascending: false }).limit(5);
+    if (data?.length) {
+      const top = data.map(d => `${d.display_name || d.user_id} (${d.bond ?? 50})`).join(', ');
       lines.push(`closest bonds: ${top}`);
     }
   } catch {}
@@ -1567,11 +1568,8 @@ async function getCrossServerInfo(currentGuildId: string, userId: string, name: 
   for (const guild of botClient.guilds.cache.values()) {
     if (guild.id === currentGuildId) continue;
     try {
-      const snap = await db.collection('servers').doc(guild.id).collection('members').doc(userId).get();
-      if (snap.exists) {
-        const m = snap.data() as MemberData;
-        hits.push(`${guild.name} (bond ${m.bond ?? 50})`);
-      }
+      const { data } = await notabotDb.from('server_members').select('bond').eq('guild_id', guild.id).eq('user_id', userId).maybeSingle();
+      if (data) hits.push(`${guild.name} (bond ${data.bond ?? 50})`);
     } catch {}
   }
   if (!hits.length) return `no record of ${name} in any other server you're in`;
@@ -1691,13 +1689,12 @@ async function addXP(
   guildId: string, userId: string, username: string, amount: number
 ): Promise<{ newXP: number; newLevel: number; oldLevel: number; leveledUp: boolean }> {
   try {
-    const ref  = db.collection('servers').doc(guildId).collection('xp').doc(userId);
-    const snap = await ref.get();
-    const oldXP    = (snap.data()?.xp ?? 0) as number;
+    const { data } = await notabotDb.from('server_xp').select('xp').eq('guild_id', guildId).eq('user_id', userId).maybeSingle();
+    const oldXP    = (data?.xp ?? 0) as number;
     const oldLevel = Math.floor(oldXP / XP_PER_LEVEL);
     const newXP    = oldXP + amount;
     const newLevel = Math.floor(newXP / XP_PER_LEVEL);
-    await ref.set({ xp: newXP, level: newLevel, username, updatedAt: Date.now() }, { merge: true });
+    await notabotDb.from('server_xp').upsert({ guild_id: guildId, user_id: userId, xp: newXP, level: newLevel, username, updated_at: new Date().toISOString() }, { onConflict: 'guild_id,user_id' });
     return { newXP, newLevel, oldLevel, leveledUp: newLevel > oldLevel };
   } catch {
     return { newXP: amount, newLevel: 0, oldLevel: 0, leveledUp: false };
@@ -1706,17 +1703,15 @@ async function addXP(
 
 async function getUserXPData(guildId: string, userId: string) {
   try {
-    const snap = await db.collection('servers').doc(guildId).collection('xp').doc(userId).get();
-    const d = snap.data() ?? {};
-    return { xp: (d.xp ?? 0) as number, level: (d.level ?? 0) as number, username: (d.username ?? 'unknown') as string };
+    const { data } = await notabotDb.from('server_xp').select('xp,level,username').eq('guild_id', guildId).eq('user_id', userId).maybeSingle();
+    return { xp: (data?.xp ?? 0) as number, level: (data?.level ?? 0) as number, username: (data?.username ?? 'unknown') as string };
   } catch { return { xp: 0, level: 0, username: 'unknown' }; }
 }
 
 async function getLeaderboard(guildId: string, limit = 5) {
   try {
-    const snap = await db.collection('servers').doc(guildId).collection('xp')
-      .orderBy('xp', 'desc').limit(limit).get();
-    return snap.docs.map(d => ({ userId: d.id, ...(d.data() as any) })) as
+    const { data } = await notabotDb.from('server_xp').select('user_id,xp,level,username').eq('guild_id', guildId).order('xp', { ascending: false }).limit(limit);
+    return (data ?? []).map(d => ({ userId: d.user_id, xp: d.xp, level: d.level, username: d.username })) as
       Array<{ userId: string; xp: number; level: number; username: string }>;
   } catch { return []; }
 }
@@ -4188,8 +4183,7 @@ async function handleMessage(msg: Message) {
   if ((cmd === '!stop' || cmd === '!resume') && isAdmin) {
     const muting = cmd === '!stop';
     serverMuted.set(guildId, muting);
-    // persist across restarts
-    db.collection('servers').doc(guildId).set({ botMuted: muting }, { merge: true }).catch(() => {});
+    notabotDb.from('servers').upsert({ guild_id: guildId, bot_muted: muting }, { onConflict: 'guild_id' }).then();
     msg.reply(muting
       ? 'going quiet in this server. any server admin can !resume me back (or just tell me to come back)'
       : 'back 🫡'
@@ -4218,7 +4212,7 @@ async function handleMessage(msg: Message) {
     const set = serverBotAllowlist.get(guildId) ?? new Set<string>();
     if (cmd === '!listenbot') set.add(target.id); else set.delete(target.id);
     if (set.size) serverBotAllowlist.set(guildId, set); else serverBotAllowlist.delete(guildId);
-    db.collection('servers').doc(guildId).set({ allowedBotIds: [...set] }, { merge: true }).catch(() => {});
+    notabotDb.from('servers').upsert({ guild_id: guildId, allowed_bot_ids: [...set] }, { onConflict: 'guild_id' }).then();
     msg.reply(cmd === '!listenbot'
       ? `ok, i'll pay attention to ${target.username} now`
       : `done, ignoring ${target.username} again`
@@ -4241,14 +4235,14 @@ async function handleMessage(msg: Message) {
     }
     if (cmd === '!listenall') {
       serverChannelAllowlist.delete(guildId);
-      db.collection('servers').doc(guildId).set({ allowedChannelIds: [] }, { merge: true }).catch(() => {});
+      notabotDb.from('servers').upsert({ guild_id: guildId, allowed_channel_ids: [] }, { onConflict: 'guild_id' }).then();
       msg.reply('back to listening everywhere in this server').catch(() => {});
       return;
     }
     const set = serverChannelAllowlist.get(guildId) ?? new Set<string>();
     if (cmd === '!listenhere') set.add(msg.channelId); else set.delete(msg.channelId);
     serverChannelAllowlist.set(guildId, set);
-    db.collection('servers').doc(guildId).set({ allowedChannelIds: [...set] }, { merge: true }).catch(() => {});
+    notabotDb.from('servers').upsert({ guild_id: guildId, allowed_channel_ids: [...set] }, { onConflict: 'guild_id' }).then();
     msg.reply(cmd === '!listenhere'
       ? `locked in — i'll talk here now${set.size > 1 ? ` (${set.size} channels total)` : ''}`
       : `stopped listening in here${set.size ? ` (${set.size} channel${set.size === 1 ? '' : 's'} left)` : ' (that was the last one — nowhere left, say "listen everywhere" to reset)'}`
@@ -4541,19 +4535,18 @@ export async function startBot(token: string) {
     for (const g of botClient!.guilds.cache.values()) {
       cacheServerName(g.id, g.name);
       await loadPendingIntents(g.id); // warm intents from DB
-      await db.collection('servers').doc(g.id).set({ name: g.name, updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+      await notabotDb.from('servers').upsert({ guild_id: g.id, name: g.name, updated_at: new Date().toISOString() }, { onConflict: 'guild_id' }).then();
       // restore per-server mute state persisted across restarts
       try {
-        const snap = await db.collection('servers').doc(g.id).get();
-        const data = snap.data();
-        if (data?.botMuted) { serverMuted.set(g.id, true); console.log(`[Boot] "${g.name}" — bot was muted, restoring`); }
-        if (Array.isArray(data?.allowedBotIds) && data.allowedBotIds.length) {
-          serverBotAllowlist.set(g.id, new Set(data.allowedBotIds));
-          console.log(`[Boot] "${g.name}" — restoring ${data.allowedBotIds.length} allowed bot(s)`);
+        const { data } = await notabotDb.from('servers').select('*').eq('guild_id', g.id).maybeSingle();
+        if (data?.bot_muted) { serverMuted.set(g.id, true); console.log(`[Boot] "${g.name}" — bot was muted, restoring`); }
+        if (Array.isArray(data?.allowed_bot_ids) && data.allowed_bot_ids.length) {
+          serverBotAllowlist.set(g.id, new Set(data.allowed_bot_ids));
+          console.log(`[Boot] "${g.name}" — restoring ${data.allowed_bot_ids.length} allowed bot(s)`);
         }
-        if (Array.isArray(data?.allowedChannelIds) && data.allowedChannelIds.length) {
-          serverChannelAllowlist.set(g.id, new Set(data.allowedChannelIds));
-          console.log(`[Boot] "${g.name}" — restoring ${data.allowedChannelIds.length} allowed channel(s)`);
+        if (Array.isArray(data?.allowed_channel_ids) && data.allowed_channel_ids.length) {
+          serverChannelAllowlist.set(g.id, new Set(data.allowed_channel_ids));
+          console.log(`[Boot] "${g.name}" — restoring ${data.allowed_channel_ids.length} allowed channel(s)`);
         }
       } catch {}
       for (const ch of g.channels.cache.filter(c => c.isTextBased()).values()) {
@@ -4569,14 +4562,13 @@ export async function startBot(token: string) {
         console.log(`[Boot] synced ${members.size} members — "${g.name}"`);
       }
       try {
-        const snap = await db.collection('servers').doc(g.id).collection('members').get();
+        const { data } = await notabotDb.from('server_members').select('user_id,display_name,username').eq('guild_id', g.id);
         let w = 0;
-        for (const doc of snap.docs) {
-          const d = doc.data() as MemberData;
-          const name = d.displayName || d.username;
-          if (name && !idCache.has(doc.id)) { cacheId(doc.id, name); w++; }
+        for (const d of data || []) {
+          const name = d.display_name || d.username;
+          if (name && !idCache.has(d.user_id)) { cacheId(d.user_id, name); w++; }
         }
-        if (w) console.log(`[Boot] warmed ${w} past members from Firebase — "${g.name}"`);
+        if (w) console.log(`[Boot] warmed ${w} past members from Supabase — "${g.name}"`);
       } catch {}
     }
 
@@ -4608,7 +4600,7 @@ export async function startBot(token: string) {
     console.log(`[Join] added to a new server — "${guild.name}" (${guild.id})`);
     Telemetry.track('GUILD_JOIN', { guildName: guild.name, memberCount: guild.memberCount }, undefined, guild.id);
     cacheServerName(guild.id, guild.name);
-    await db.collection('servers').doc(guild.id).set({ name: guild.name, updatedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+    await notabotDb.from('servers').upsert({ guild_id: guild.id, name: guild.name, updated_at: new Date().toISOString() }, { onConflict: 'guild_id' }).then();
 
     // say hi somewhere reasonable — the system channel if it can talk there,
     // otherwise the first text channel it has send permission in.

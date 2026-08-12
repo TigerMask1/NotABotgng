@@ -2,7 +2,7 @@
 import {
   Client, GatewayIntentBits, Message, Partials, Events, EmbedBuilder
 } from 'discord.js';
-import { db } from './firebase.ts';
+import { businessBotDb } from './supabase.ts';
 import { Telemetry } from './telemetry.ts';
 import { groq } from './groqBot.ts';
 
@@ -75,7 +75,7 @@ async function tickStocks() {
   try {
     const prices: Record<string, number> = {};
     for (const [sym, s] of Object.entries(STOCKS)) prices[sym] = s.price;
-    await db.collection('businessGlobal').doc('state').set({ stockPrices: prices }, { merge: true });
+    await businessBotDb.from('business_global').update({ stock_prices: prices }).eq('id', 'state');
   } catch (e) {
     console.error('[BusinessBot] Error saving stock prices:', e);
   }
@@ -185,25 +185,21 @@ export async function startBusinessBot(token: string) {
 
   // Populate customNameCache
   try {
-    const usersSnap = await db.collection('businessUsers').get();
-    usersSnap.forEach(doc => {
-      const d = doc.data();
-      if (d.customName) customNameCache.set(doc.id, d.customName);
-    });
+    const { data } = await businessBotDb.from('business_users').select('user_id,custom_name').not('custom_name', 'is', null);
+    (data ?? []).forEach(d => { if (d.custom_name) customNameCache.set(d.user_id, d.custom_name); });
     console.log('[BusinessBot] Loaded custom names');
   } catch (e) {
     console.error('[BusinessBot] Error loading custom names:', e);
   }
 
-  // Load stock prices from Firebase
+  // Load stock prices from Supabase
   try {
-    const globalSnap = await db.collection('businessGlobal').doc('state').get();
-    const globalData = globalSnap.data();
-    if (globalData?.stockPrices) {
-      for (const [sym, price] of Object.entries(globalData.stockPrices)) {
-        if (STOCKS[sym]) STOCKS[sym].price = price as number;
+    const { data } = await businessBotDb.from('business_global').select('stock_prices').eq('id', 'state').maybeSingle();
+    if (data?.stock_prices) {
+      for (const [sym, price] of Object.entries(data.stock_prices as Record<string,number>)) {
+        if (STOCKS[sym]) STOCKS[sym].price = price;
       }
-      console.log('[BusinessBot] Loaded stock prices from Firebase');
+      console.log('[BusinessBot] Loaded stock prices from Supabase');
     }
   } catch (e) {
     console.error('[BusinessBot] Error loading stock prices:', e);
@@ -276,12 +272,29 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
   const userId   = msg.author.id;
   const username = msg.member?.displayName || msg.author.username;
 
-  const userRef  = db.collection('businessUsers').doc(userId);
-  const snap     = await userRef.get();
-  let userData   = (snap.data() as UserData | undefined) || defaultUser(username);
+  const { data: snap, error: snapErr } = await businessBotDb.from('business_users').select('*').eq('user_id', userId).maybeSingle();
+  let userData: UserData = snap ? {
+    username: snap.username || username,
+    customName: snap.custom_name,
+    botcoin: snap.botcoin || 0,
+    netWorth: snap.net_worth || 0,
+    granted: snap.granted || false,
+    inventory: (snap.inventory as Record<string,number>) || {},
+    lastDaily: snap.last_daily || 0,
+    dailyStreak: snap.daily_streak || 0,
+    lastRob: snap.last_rob || 0,
+    jailUntil: snap.jail_until || 0,
+    stocks: (snap.stocks as Record<string,number>) || {},
+    totalEarned: snap.total_earned || 0,
+    totalGambled: snap.total_gambled || 0,
+    wins: snap.wins || 0,
+    losses: snap.losses || 0,
+    xp: snap.xp || 0,
+    level: snap.level || 1,
+  } : defaultUser(username);
   userData.username = username;
 
-  // schema migration
+  // schema migration defaults
   userData.inventory    ??= {};
   userData.lastDaily    ??= 0;
   userData.dailyStreak  ??= 0;
@@ -295,9 +308,16 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
   userData.xp           ??= 0;
   userData.level        ??= 1;
 
-  const globalRef  = db.collection('businessGlobal').doc('state');
-  const globalSnap = await globalRef.get();
-  let globalState  = globalSnap.data() || { customItems: {}, bounties: {}, shop: {} };
+  const { data: globalSnap } = await businessBotDb.from('business_global').select('*').eq('id', 'state').maybeSingle();
+  let globalState = globalSnap ? {
+    customItems: (globalSnap.custom_items as Record<string,any>) || {},
+    bounties: (globalSnap.bounties as Record<string,any>) || {},
+    auctions: (globalSnap.auctions as Record<string,any>) || {},
+    trades: (globalSnap.trades as Record<string,any>) || {},
+    shop: (globalSnap.shop as Record<string,any>) || {},
+    stockPrices: (globalSnap.stock_prices as Record<string,number>) || {},
+    activeChallenges: (globalSnap.active_challenges as Record<string,any>) || {},
+  } : { customItems: {}, bounties: {}, auctions: {}, trades: {}, shop: {}, stockPrices: {}, activeChallenges: {} };
   globalState.customItems ??= {};
   globalState.bounties    ??= {};
 
@@ -306,9 +326,35 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
 
   const saveUser = async (uid: string, data: UserData) => {
     data.netWorth = calcNetWorth(data, customItems);
-    await db.collection('businessUsers').doc(uid).set(data as any, { merge: true });
+    await businessBotDb.from('business_users').upsert({
+      user_id: uid,
+      username: data.username,
+      custom_name: data.customName ?? null,
+      botcoin: data.botcoin,
+      net_worth: data.netWorth,
+      granted: data.granted,
+      inventory: data.inventory,
+      last_daily: data.lastDaily,
+      daily_streak: data.dailyStreak,
+      last_rob: data.lastRob,
+      jail_until: data.jailUntil,
+      stocks: data.stocks,
+      total_earned: data.totalEarned,
+      total_gambled: data.totalGambled,
+      wins: data.wins,
+      losses: data.losses,
+      xp: data.xp,
+      level: data.level,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'user_id' });
   };
-  const saveGlobal = () => globalRef.set(globalState as any);
+  const saveGlobal = () => businessBotDb.from('business_global').update({
+    custom_items: globalState.customItems,
+    bounties: globalState.bounties,
+    auctions: globalState.auctions,
+    trades: globalState.trades,
+    shop: globalState.shop,
+  }).eq('id', 'state');
 
   // jail check — most commands blocked while in jail
   const JAIL_FREE = new Set(['profile', 'bal', 'inv', 'inventory', 'lb', 'leaderboard', 'rich', 'help', 'stocks', 'market']);
@@ -559,10 +605,8 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
         return;
       }
 
-      const targetRef  = db.collection('businessUsers').doc(targetId);
-      const targetSnap = await targetRef.get();
-      const targetData = targetSnap.data() as UserData | undefined;
-      if (!targetData || targetData.botcoin < 100) {
+      const { data: targetData } = await businessBotDb.from('business_users').select('*').eq('user_id', targetId).maybeSingle();
+      if (!targetData || (targetData.botcoin || 0) < 100) {
         msg.reply("❌ Target is too broke to rob. Pick someone richer."); return;
       }
 
@@ -637,10 +681,8 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       if (!wager) { msg.reply('❌ No pending wager from that user.'); return; }
       if (userData.botcoin < wager.amount) { msg.reply(`❌ You need 🪙 ${wager.amount.toLocaleString()} to accept.`); return; }
 
-      const challengerRef  = db.collection('businessUsers').doc(challengerId);
-      const challengerSnap = await challengerRef.get();
-      let challengerData   = challengerSnap.data() as UserData;
-      if (!challengerData || challengerData.botcoin < wager.amount) {
+      const { data: challengerData } = await businessBotDb.from('business_users').select('*').eq('user_id', challengerId).maybeSingle();
+      if (!challengerData || (challengerData.botcoin || 0) < wager.amount) {
         msg.reply("❌ Challenger no longer has enough 🪙!");
         pendingWagers.delete(wagerKey);
         return;
@@ -691,10 +733,8 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       if (amount > userData.botcoin)    { msg.reply(`❌ You only have 🪙 ${userData.botcoin.toLocaleString()}.`); return; }
       if (targetId === userId)          { msg.reply("❌ Can't challenge yourself."); return; }
 
-      const targetRef  = db.collection('businessUsers').doc(targetId);
-      const targetSnap = await targetRef.get();
-      const targetData = targetSnap.data();
-      if (!targetData || targetData.botcoin < amount) {
+      const { data: targetData } = await businessBotDb.from('business_users').select('*').eq('user_id', targetId).maybeSingle();
+      if (!targetData || (targetData.botcoin || 0) < amount) {
         msg.reply(`❌ <@${targetId}> doesn't have enough 🪙 to match!`); return;
       }
 
@@ -740,9 +780,8 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
         await saveUser(userId, userData);
       }
 
-      const winnerRef  = db.collection('businessUsers').doc(winnerId);
-      const winnerSnap = await winnerRef.get();
-      let winnerData   = winnerSnap.data() as UserData;
+      const { data: winnerData } = await businessBotDb.from('business_users').select('*').eq('user_id', winnerId).maybeSingle();
+      if (!winnerData) return;
       winnerData.botcoin     += challenge.amount * 2;
       winnerData.wins        = (winnerData.wins || 0) + 1;
       winnerData.totalEarned = (winnerData.totalEarned || 0) + challenge.amount * 2;
@@ -780,11 +819,9 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       }
 
       const loserId = winnerId === challenge.fromId ? challenge.toId : challenge.fromId;
-      const winnerRef  = db.collection('businessUsers').doc(winnerId);
-      const loserRef   = db.collection('businessUsers').doc(loserId);
-      const [winnerSnap, loserSnap] = await Promise.all([winnerRef.get(), loserRef.get()]);
-      let winnerData = winnerSnap.data() as UserData;
-      let loserData  = loserSnap.data() as UserData;
+      const { data: winnerData } = await businessBotDb.from('business_users').select('*').eq('user_id', winnerId).maybeSingle();
+      const { data: loserData } = await businessBotDb.from('business_users').select('*').eq('user_id', loserId).maybeSingle();
+      if (!winnerData || !loserData) return;
 
       // If loser is the challenged party (hasn't paid escrow yet)
       if (loserId === challenge.toId) {
@@ -823,9 +860,8 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       if (targetId === userId)      { msg.reply("❌ Can't pay yourself."); return; }
       if (amount > userData.botcoin) { msg.reply(`❌ Not enough 🪙. Balance: ${userData.botcoin.toLocaleString()}`); return; }
 
-      const targetRef  = db.collection('businessUsers').doc(targetId);
-      const targetSnap = await targetRef.get();
-      let targetData   = (targetSnap.data() as UserData) || defaultUser('Unknown');
+      const { data: targetData } = await businessBotDb.from('business_users').select('*').eq('user_id', targetId).maybeSingle();
+      if (!targetData) return;
 
       userData.botcoin  -= amount;
       targetData.botcoin += amount;
@@ -989,9 +1025,8 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       if (!trade)           { msg.reply('❌ Invalid trade ID.'); return; }
       if (trade.toId !== userId) { msg.reply("❌ This trade isn't for you."); return; }
 
-      const fromRef  = db.collection('businessUsers').doc(trade.fromId);
-      const fromSnap = await fromRef.get();
-      let fromData   = fromSnap.data() as UserData;
+      const { data: fromData } = await businessBotDb.from('business_users').select('*').eq('user_id', trade.fromId).maybeSingle();
+      if (!fromData) return;
       const offerItem = Object.keys(trade.offerItems)[0];
       const wantItem  = Object.keys(trade.wantItems)[0];
 
@@ -1076,33 +1111,31 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
           if (!ch?.isTextBased()) return;
 
           if (!a.highestBidder) {
-            const sellerRef = db.collection('businessUsers').doc(a.sellerId);
-            const sellerSnap = await sellerRef.get();
-            let sellerData = sellerSnap.data() as UserData;
-            sellerData.inventory[a.itemId] = (sellerData.inventory[a.itemId] || 0) + 1;
-            await sellerData && sellerRef.set(sellerData as any, { merge: true });
+            const { data: sellerData } = await businessBotDb.from('business_users').select('*').eq('user_id', a.sellerId).maybeSingle();
+            if (sellerData) {
+              const inv = (sellerData.inventory as Record<string,number>) || {};
+              inv[a.itemId] = (inv[a.itemId] || 0) + 1;
+              await businessBotDb.from('business_users').update({ inventory: inv }).eq('user_id', a.sellerId);
+            }
             (ch as any).send(`🔨 Auction ended with no bids — ${item?.emoji || ''} **${item?.name || itemId}** returned to <@${a.sellerId}>.`);
           } else {
-            const buyerRef  = db.collection('businessUsers').doc(a.highestBidder);
-            const sellerRef = db.collection('businessUsers').doc(a.sellerId);
-            const [buyerSnap, sellerSnap] = await Promise.all([buyerRef.get(), sellerRef.get()]);
+            const { data: buyerData } = await businessBotDb.from('business_users').select('*').eq('user_id', a.highestBidder).maybeSingle();
+            const { data: sellerData } = await businessBotDb.from('business_users').select('*').eq('user_id', a.sellerId).maybeSingle();
+            if (buyerData && sellerData) {
+              // Credit buyer item
+              buyerData.inventory[a.itemId] = (buyerData.inventory[a.itemId] || 0) + 1;
 
-            let buyerData   = buyerSnap.data() as UserData;
-            let sellerData  = sellerSnap.data() as UserData;
+              // Credit seller coins
+              sellerData.botcoin += a.highestBid;
+              sellerData.totalEarned += a.highestBid;
 
-            // Credit buyer item
-            buyerData.inventory[a.itemId] = (buyerData.inventory[a.itemId] || 0) + 1;
+              await Promise.all([
+                businessBotDb.from('business_users').update({ inventory: buyerData.inventory }).eq('user_id', a.highestBidder),
+                businessBotDb.from('business_users').update({ botcoin: sellerData.botcoin, total_earned: sellerData.totalEarned }).eq('user_id', a.sellerId)
+              ]);
 
-            // Credit seller coins
-            sellerData.botcoin += a.highestBid;
-            sellerData.totalEarned += a.highestBid;
-
-            await Promise.all([
-              buyerRef.set(buyerData as any, { merge: true }),
-              sellerRef.set(sellerData as any, { merge: true })
-            ]);
-
-            (ch as any).send(`🔨 **SOLD!** ${item?.emoji || ''} **${item?.name || itemId}** → <@${a.highestBidder}> for 🪙 **${a.highestBid.toLocaleString()}**!`);
+              (ch as any).send(`🔨 **SOLD!** ${item?.emoji || ''} **${item?.name || itemId}** → <@${a.highestBidder}> for 🪙 **${a.highestBid.toLocaleString()}**!`);
+            }
           }
         }, AUCTION_DURATION);
         return;
@@ -1120,11 +1153,10 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
 
         // Refund previous bidder
         if (a.highestBidder) {
-          const prevRef  = db.collection('businessUsers').doc(a.highestBidder);
-          const prevSnap = await prevRef.get();
-          let prevData   = prevSnap.data() as UserData;
-          prevData.botcoin += a.highestBid;
-          await prevRef.set(prevData as any, { merge: true });
+          const { data: prevData } = await businessBotDb.from('business_users').select('*').eq('user_id', a.highestBidder).maybeSingle();
+          if (prevData) {
+            await businessBotDb.from('business_users').update({ botcoin: (prevData.botcoin || 0) + a.highestBid }).eq('user_id', a.highestBidder);
+          }
         }
 
         userData.botcoin -= bidAmt;
@@ -1183,9 +1215,8 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
         if (bty.posterId !== userId)       { msg.reply("❌ Only the poster can award."); return; }
 
         const targetId   = targetMatch[1];
-        const targetRef  = db.collection('businessUsers').doc(targetId);
-        const targetSnap = await targetRef.get();
-        let targetData   = (targetSnap.data() as UserData) || defaultUser('Unknown');
+        const { data: targetData } = await businessBotDb.from('business_users').select('*').eq('user_id', targetId).maybeSingle();
+        if (!targetData) return;
         bty.status        = 'closed';
         targetData.botcoin += bty.amount;
         targetData.totalEarned = (targetData.totalEarned || 0) + bty.amount;
@@ -1250,8 +1281,8 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
     // ── PROFILE ───────────────────────────────────────────────────────────
     case 'profile':
     case 'bal': {
-      const rankSnap = await db.collection('businessUsers').where('netWorth', '>', userData.netWorth).get();
-      const rank     = rankSnap.size + 1;
+      const { count } = await businessBotDb.from('business_users').select('*', { count: 'exact', head: true }).gt('net_worth', userData.netWorth);
+      const rank     = (count ?? 0) + 1;
       const lvl      = userData.level || 1;
       const embed = new EmbedBuilder()
         .setColor(RARITY_COLOR[lvl >= 8 ? 'legendary' : lvl >= 5 ? 'epic' : lvl >= 3 ? 'rare' : 'common'])
@@ -1273,16 +1304,15 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
     case 'leaderboard':
     case 'lb':
     case 'rich': {
-      const topSnap = await db.collection('businessUsers').orderBy('netWorth', 'desc').limit(10).get();
+      const { data: topData } = await businessBotDb.from('business_users').select('*').order('net_worth', { ascending: false }).limit(10);
       const medals  = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟'];
       const embed   = new EmbedBuilder()
         .setColor(0xf1c40f)
         .setTitle('🏆 Global Forbes List — Top Net Worth');
-      topSnap.docs.forEach((doc, i) => {
-        const d = doc.data();
+      (topData ?? []).forEach((d, i) => {
         embed.addFields({
           name: `${medals[i]} ${d.username}  (Lv.${d.level || 1} ${levelLabel(d.level || 1)})`,
-          value: `🪙 **${(d.netWorth || 0).toLocaleString()}** net worth`,
+          value: `🪙 **${(d.net_worth || 0).toLocaleString()}** net worth`,
         });
       });
       msg.reply({ embeds: [embed] });
@@ -1304,7 +1334,7 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       userData.botcoin -= 50000;
       userData.customName = newName;
       customNameCache.set(userId, newName);
-      await userRef.update({ botcoin: userData.botcoin, customName: newName });
+      await businessBotDb.from('business_users').update({ botcoin: userData.botcoin, custom_name: newName }).eq('user_id', userId);
       msg.reply(`Excellent, Sir. I will now respond to the name "${newName}" from you.`);
       break;
     }
@@ -1315,11 +1345,9 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       const target = msg.mentions.users.first();
       const amt = parseInt(args[1], 10);
       if (!target || isNaN(amt)) return;
-      const tRef = db.collection('businessUsers').doc(target.id);
-      const tSnap = await tRef.get();
-      const tData = tSnap.data();
+      const { data: tData } = await businessBotDb.from('business_users').select('*').eq('user_id', target.id).maybeSingle();
       if (tData) {
-        await tRef.update({ botcoin: (tData.botcoin || 0) + amt });
+        await businessBotDb.from('business_users').update({ botcoin: (tData.botcoin || 0) + amt }).eq('user_id', target.id);
         msg.reply(`Added ${amt} to ${target.username}.`);
       }
       break;
@@ -1330,11 +1358,9 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       const target = msg.mentions.users.first();
       const amt = parseInt(args[1], 10);
       if (!target || isNaN(amt)) return;
-      const tRef = db.collection('businessUsers').doc(target.id);
-      const tSnap = await tRef.get();
-      const tData = tSnap.data();
+      const { data: tData } = await businessBotDb.from('business_users').select('*').eq('user_id', target.id).maybeSingle();
       if (tData) {
-        await tRef.update({ botcoin: Math.max(0, (tData.botcoin || 0) - amt) });
+        await businessBotDb.from('business_users').update({ botcoin: Math.max(0, (tData.botcoin || 0) - amt) }).eq('user_id', target.id);
         msg.reply(`Removed ${amt} from ${target.username}.`);
       }
       break;
@@ -1370,9 +1396,14 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
   const userId = msg.author.id;
   const username = msg.member?.displayName || msg.author.username;
 
-  const userRef = db.collection('businessUsers').doc(userId);
-  const snap = await userRef.get();
-  const userData = (snap.data() as UserData | undefined) || defaultUser(username);
+  const { data: snap } = await businessBotDb.from('business_users').select('*').eq('user_id', userId).maybeSingle();
+  const userData = snap ? {
+    username: snap.username, customName: snap.custom_name, botcoin: snap.botcoin || 0, netWorth: snap.net_worth || 0,
+    granted: snap.granted || false, inventory: (snap.inventory as Record<string,number>) || {},
+    lastDaily: snap.last_daily || 0, dailyStreak: snap.daily_streak || 0, lastRob: snap.last_rob || 0, jailUntil: snap.jail_until || 0,
+    stocks: (snap.stocks as Record<string,number>) || {}, totalEarned: snap.total_earned || 0, totalGambled: snap.total_gambled || 0,
+    wins: snap.wins || 0, losses: snap.losses || 0, xp: snap.xp || 0, level: snap.level || 1,
+  } : defaultUser(username);
 
   let promptText = msg.content.replace(new RegExp('<@!?' + botClient!.user!.id + '>', 'g'), '').trim();
   if (triggeredName) {
@@ -1493,17 +1524,28 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
 
       if (parsed.action === 'lookup') {
         let targetId = parsed.target === 'self' || parsed.target === `<@${userId}>` ? userId : parsed.target.replace(/[<@>]/g, '');
-        let snap = await db.collection('businessUsers').doc(targetId).get();
-        let d: UserData | null = snap.exists ? snap.data() as UserData : null;
+        let { data: snap } = await businessBotDb.from('business_users').select('*').eq('user_id', targetId).maybeSingle();
+        let d: UserData | null = snap ? {
+          username: snap.username, customName: snap.custom_name, botcoin: snap.botcoin || 0, netWorth: snap.net_worth || 0,
+          granted: snap.granted || false, inventory: (snap.inventory as Record<string,number>) || {},
+          lastDaily: snap.last_daily || 0, dailyStreak: snap.daily_streak || 0, lastRob: snap.last_rob || 0, jailUntil: snap.jail_until || 0,
+          stocks: (snap.stocks as Record<string,number>) || {}, totalEarned: snap.total_earned || 0, totalGambled: snap.total_gambled || 0,
+          wins: snap.wins || 0, losses: snap.losses || 0, xp: snap.xp || 0, level: snap.level || 1,
+        } : null;
         
         if (!d && !/^\d+$/.test(targetId)) {
-          const usersSnap = await db.collection('businessUsers').get();
-          for (const doc of usersSnap.docs) {
-            const data = doc.data() as UserData;
-            if ((data.username && data.username.toLowerCase() === targetId.toLowerCase()) ||
-                (data.customName && data.customName.toLowerCase() === targetId.toLowerCase())) {
-              targetId = doc.id;
-              d = data;
+          const { data: usersSnap } = await businessBotDb.from('business_users').select('*').limit(200);
+          for (const doc of usersSnap || []) {
+            if ((doc.username && doc.username.toLowerCase() === targetId.toLowerCase()) ||
+                (doc.custom_name && doc.custom_name.toLowerCase() === targetId.toLowerCase())) {
+              targetId = doc.user_id;
+              d = {
+                username: doc.username, customName: doc.custom_name, botcoin: doc.botcoin || 0, netWorth: doc.net_worth || 0,
+                granted: doc.granted || false, inventory: (doc.inventory as Record<string,number>) || {},
+                lastDaily: doc.last_daily || 0, dailyStreak: doc.daily_streak || 0, lastRob: doc.last_rob || 0, jailUntil: doc.jail_until || 0,
+                stocks: (doc.stocks as Record<string,number>) || {}, totalEarned: doc.total_earned || 0, totalGambled: doc.total_gambled || 0,
+                wins: doc.wins || 0, losses: doc.losses || 0, xp: doc.xp || 0, level: doc.level || 1,
+              };
               break;
             }
           }

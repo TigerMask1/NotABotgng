@@ -11,13 +11,13 @@
   "dependencies": {
     "@discordjs/voice": "^0.19.2",
     "@google/genai": "^1.50.1",
+    "@supabase/supabase-js": "^2.112.3",
     "@types/sharp": "^0.31.1",
     "axios": "^1.15.2",
     "chess.js": "^1.4.0",
     "discord.js": "^14.26.3",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
-    "firebase-admin": "^14.1.0",
     "groq-sdk": "^0.33.0",
     "sharp": "^0.33.5",
     "zod": "^4.3.6"

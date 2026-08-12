@@ -9,8 +9,8 @@
  */
 
 import { Client, Message, TextChannel } from 'discord.js';
-import { db } from './firebase.ts';
 import { getBusinessBotId } from './businessBot.ts';
+import { businessBotDb } from './supabase.ts';
 
 // ── CONSTANTS ────────────────────────────────────────────────────────────────
 const SELF_LOOP_TICK_MS = 4 * 60_000;    // every 4 minutes
@@ -138,15 +138,14 @@ async function fetchProfile(): Promise<void> {
   if (now - state.lastProfileUpdate < PROFILE_CACHE_TTL) return;
 
   try {
-    const snap = await db.collection('businessUsers').doc(botClientRef.user!.id).get();
-    if (snap.exists) {
-      const data = snap.data() as any;
-      state.cachedBalance = data?.botcoin ?? 0;
-      state.cachedInventory = data?.inventory ?? {};
-      state.cachedStocks = data?.stocks ?? {};
+    const { data: snap } = await businessBotDb.from('business_users').select('*').eq('user_id', botClientRef.user!.id).maybeSingle();
+    if (snap) {
+      state.cachedBalance = snap.botcoin ?? 0;
+      state.cachedInventory = (snap.inventory as Record<string,number>) ?? {};
+      state.cachedStocks = (snap.stocks as Record<string,number>) ?? {};
 
       // Check daily status
-      const lastDaily = data?.lastDaily ?? 0;
+      const lastDaily = snap.last_daily ?? 0;
       const oneDay = 24 * 60 * 60 * 1000;
       const todayStart = new Date();
       todayStart.setHours(0, 0, 0, 0);
