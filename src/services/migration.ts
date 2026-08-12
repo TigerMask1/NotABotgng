@@ -1,4 +1,5 @@
-import admin from 'firebase-admin';
+import { initializeApp, cert, getApps } from 'firebase-admin/app';
+import { getFirestore } from 'firebase-admin/firestore';
 import { notabotDb, businessBotDb } from './supabase.ts';
 
 export async function runFirebaseMigration() {
@@ -14,9 +15,9 @@ export async function runFirebaseMigration() {
   }
 
   // Prevent multiple initializations if the server hot-reloads
-  if (!admin.apps.length) {
-    admin.initializeApp({
-      credential: admin.credential.cert({
+  if (!getApps().length) {
+    initializeApp({
+      credential: cert({
         projectId,
         clientEmail,
         privateKey,
@@ -24,7 +25,7 @@ export async function runFirebaseMigration() {
     });
   }
   
-  const db = admin.firestore();
+  const db = getFirestore();
 
   try {
     // --- MIGRATE BUSINESS BOT USERS ---
