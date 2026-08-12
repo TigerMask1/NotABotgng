@@ -144,14 +144,15 @@ create table if not exists dm_relationships (
 -- ═══════════════════════════════════════════════════════════════════════════
 
 create table if not exists business_global (
-  id           text primary key default 'state',
-  stock_prices jsonb default '{}'::jsonb,
-  custom_items jsonb default '{}'::jsonb,
-  bounties     jsonb default '{}'::jsonb,
-  auctions     jsonb default '{}'::jsonb,
-  trades       jsonb default '{}'::jsonb,
-  shop         jsonb default '{}'::jsonb,
-  updated_at   timestamptz default now()
+  id               text primary key default 'state',
+  stock_prices     jsonb default '{}'::jsonb,
+  custom_items     jsonb default '{}'::jsonb,
+  bounties         jsonb default '{}'::jsonb,
+  auctions         jsonb default '{}'::jsonb,
+  trades           jsonb default '{}'::jsonb,
+  shop             jsonb default '{}'::jsonb,
+  active_challenges jsonb default '{}'::jsonb,
+  updated_at       timestamptz default now()
 );
 -- Seed the global state row so it always exists
 insert into business_global (id) values ('state') on conflict do nothing;

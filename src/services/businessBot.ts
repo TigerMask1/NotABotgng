@@ -354,6 +354,8 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
     auctions: globalState.auctions,
     trades: globalState.trades,
     shop: globalState.shop,
+    stock_prices: globalState.stockPrices,
+    active_challenges: globalState.activeChallenges,
   }).eq('id', 'state');
 
   // jail check — most commands blocked while in jail
