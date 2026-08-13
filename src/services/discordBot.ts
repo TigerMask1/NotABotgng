@@ -4554,22 +4554,35 @@ export async function startBot(token: string) {
       }
       const members = await g.members.fetch().catch(() => null);
       if (members) {
+        const batch = [];
+        const nowIso = new Date().toISOString();
         for (const [uid, m] of members) {
           if (m.user.bot) continue;
           cacheId(uid, m.displayName);
-          await upsertMember(g.id, uid, { displayName: m.displayName, username: m.user.username });
+          batch.push({
+            guild_id: g.id,
+            user_id: uid,
+            display_name: m.displayName,
+            username: m.user.username,
+            updated_at: nowIso
+          });
         }
-        console.log(`[Boot] synced ${members.size} members — "${g.name}"`);
+        
+        if (batch.length > 0) {
+          try {
+            // Batch upsert in chunks of 1000
+            for (let i = 0; i < batch.length; i += 1000) {
+              await notabotDb.from('server_members').upsert(
+                batch.slice(i, i + 1000), 
+                { onConflict: 'guild_id,user_id', ignoreDuplicates: false }
+              );
+            }
+            console.log(`[Boot] batched upsert of ${batch.length} members — "${g.name}"`);
+          } catch (err) {
+            console.error(`[Boot] failed to batch upsert members for "${g.name}":`, err);
+          }
+        }
       }
-      try {
-        const { data } = await notabotDb.from('server_members').select('user_id,display_name,username').eq('guild_id', g.id);
-        let w = 0;
-        for (const d of data || []) {
-          const name = d.display_name || d.username;
-          if (name && !idCache.has(d.user_id)) { cacheId(d.user_id, name); w++; }
-        }
-        if (w) console.log(`[Boot] warmed ${w} past members from Supabase — "${g.name}"`);
-      } catch {}
     }
 
     setTimeout(() => {

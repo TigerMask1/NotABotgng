@@ -422,8 +422,11 @@ class TelemetryEngine {
     if (this.isLoaded) {
       try {
         const statsToSave = { ...this.stats } as any;
-        statsToSave.uniqueUsers = Array.from(this.stats.uniqueUsers);
-        statsToSave.uniqueGuilds = Array.from(this.stats.uniqueGuilds);
+        // WARNING: We do NOT upload the raw array of uniqueUsers/uniqueGuilds
+        // because it burns gigabytes of bandwidth every 15 seconds.
+        // We only care about the count, which is already serialized via the snapshot.
+        delete statsToSave.uniqueUsers;
+        delete statsToSave.uniqueGuilds;
         delete statsToSave.recentEvents;
         await notabotDb.from('telemetry_global').upsert({ id: 'rollingStats', data: statsToSave }, { onConflict: 'id' });
       } catch (e) {
