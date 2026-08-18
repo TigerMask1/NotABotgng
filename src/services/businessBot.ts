@@ -71,7 +71,7 @@ const ITEMS: Record<string, ItemDef> = {
   golden_ticket:  { name: 'Golden Ticket',   emoji: '🎟️', value: 500,    rarity: 'common' },
   crystal_ball:   { name: 'Crystal Ball',    emoji: '🔮', value: 4_000,  rarity: 'epic',   shopPrice: 6_000, description: 'Reveal stock trends before investing' },
   private_island: { name: 'Private Island',  emoji: '🏝️', value: 100_000_000_000, rarity: 'legendary', shopPrice: 100_000_000_000, description: 'The ultimate flex. (Trillionaire Tier)' },
-  space_station:  { name: 'Space Station',   emoji: '🛰️', value: 1_000_000_000_000, rarity: 'legendary', shopPrice: 1_000_000_000_000, description: 'You own orbit. (Trillionaire Tier)' },
+  space_station:  { name: 'Space Station',   emoji: '🛰️', value: 1_000_000_000, rarity: 'legendary', shopPrice: 1_000_000_000, description: 'You own orbit. (Billionaire Tier)' },
 };
 
 // ── STOCK MARKET ─────────────────────────────────────────────────────────────
