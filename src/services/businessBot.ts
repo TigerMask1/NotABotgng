@@ -1626,11 +1626,16 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
     .map(([sym, s]) => `${sym}: 🪙 ${Math.floor(s.botcoinPool / s.sharesPool)}`)
     .join(' | ');
 
+  const itemsCatalogStr = Object.entries(ITEMS)
+    .map(([id, item]) => `${item.name} (id: ${id})`)
+    .join(', ');
+
   const systemPrompt = [
     'You are BusinessBot — a highly arrogant, hilariously sarcastic, but sharply dressed personal wealth manager. Address the user as "Sir" or "Boss". You hate poverty but love making money. Be witty and slightly passive-aggressive. Keep all replies SHORT (1-2 sentences max).',
     '',
     'USER: ' + username + ' | Coins: ' + userData.botcoin + ' | Inv: ' + inventorySummary + ' | Stocks: ' + stocksSummary,
     'CURRENT MARKET PRICES: ' + stockPricesStr,
+    'AVAILABLE ITEMS TO BUY: ' + itemsCatalogStr,
     'MENTIONED USERS (use exact strings for @user args): ' + mentionCtx,
     '',
     'COMMANDS TO EXECUTE:',
