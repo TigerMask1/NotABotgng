@@ -995,7 +995,8 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       const stock = STOCKS[sym];
       if (!stock) { msg.reply(`❌ Unknown stock symbol. Use \`!buy item <id>\` for shop items.`); return; }
       
-      if (shares >= stock.sharesPool) { msg.reply(`❌ Not enough shares in the liquidity pool (Only ${stock.sharesPool} available).`); return; }
+      const maxBuyable = Math.floor(stock.sharesPool * 0.99);
+      if (shares > maxBuyable) { msg.reply(`❌ Max buyable is **${maxBuyable.toLocaleString()}** shares (can't drain the liquidity pool below 1%).`); return; }
       const K = stock.botcoinPool * stock.sharesPool;
       const newSharesPool = stock.sharesPool - shares;
       const newBotcoinPool = K / newSharesPool;
