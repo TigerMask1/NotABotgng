@@ -127,6 +127,7 @@ interface UserData {
   dailyStreak: number;
   lastRob:     number;
   jailUntil:   number;
+  lastOrbitalStrike?: number;
   stocks:      Record<string, number>; // sym -> shares owned
   totalEarned: number;
   totalGambled: number;
@@ -136,23 +137,11 @@ interface UserData {
   level:       number;
 }
 
-function getTopStockPrice(u: any): number {
-  let highest = 0;
-  for (const [sym, shares] of Object.entries(u.stocks || {})) {
-    if (STOCKS[sym]) {
-      const price = Math.floor(STOCKS[sym].botcoinPool / STOCKS[sym].sharesPool);
-      const val = price * (shares as number);
-      if (val > highest) highest = val;
-    }
-  }
-  return highest;
-}
-
 function defaultUser(username: string): UserData {
   return {
     username, botcoin: 0, netWorth: 0, granted: false,
     inventory: {}, lastDaily: 0, dailyStreak: 0,
-    lastRob: 0, jailUntil: 0,
+    lastRob: 0, jailUntil: 0, lastOrbitalStrike: 0,
     stocks: {}, totalEarned: 0, totalGambled: 0,
     wins: 0, losses: 0, xp: 0, level: 1,
   };
@@ -212,6 +201,46 @@ function rarityBadge(r: string): string {
   return { common: '⬜ Common', rare: '🔵 Rare', epic: '🟣 Epic', legendary: '🟡 Legendary' }[r] || r;
 }
 
+async function resolveAuction(auctionKey: string) {
+  const a = activeAuctions.get(auctionKey);
+  if (!a) return;
+  activeAuctions.delete(auctionKey);
+  // Also remove from DB
+  const { data: globalSnap } = await businessBotDb.from('business_global').select('auctions').eq('id', 'state').maybeSingle();
+  if (globalSnap && globalSnap.auctions) {
+    const aucs = globalSnap.auctions as Record<string, any>;
+    delete aucs[auctionKey];
+    await businessBotDb.from('business_global').update({ auctions: aucs }).eq('id', 'state');
+  }
+
+  const ch = botClient?.channels.cache.get(a.channelId);
+  if (!ch?.isTextBased()) return;
+  const item = ITEMS[a.itemId] || { emoji: '🎁', name: a.itemId };
+
+  if (!a.highestBidder) {
+    const { data: sellerData } = await businessBotDb.from('business_users').select('*').eq('user_id', a.sellerId).maybeSingle();
+    if (sellerData) {
+      const inv = (sellerData.inventory as Record<string,number>) || {};
+      inv[a.itemId] = (inv[a.itemId] || 0) + 1;
+      await businessBotDb.from('business_users').update({ inventory: inv }).eq('user_id', a.sellerId);
+    }
+    (ch as any).send(`🔨 Auction ended with no bids — ${item.emoji} **${item.name}** returned to <@${a.sellerId}>.`);
+  } else {
+    const { data: buyerData } = await businessBotDb.from('business_users').select('*').eq('user_id', a.highestBidder).maybeSingle();
+    const { data: sellerData } = await businessBotDb.from('business_users').select('*').eq('user_id', a.sellerId).maybeSingle();
+    if (buyerData && sellerData) {
+      buyerData.inventory[a.itemId] = (buyerData.inventory[a.itemId] || 0) + 1;
+      sellerData.botcoin = (sellerData.botcoin || 0) + a.highestBid;
+      sellerData.total_earned = (sellerData.total_earned || 0) + a.highestBid;
+      await Promise.all([
+        businessBotDb.from('business_users').update({ inventory: buyerData.inventory }).eq('user_id', a.highestBidder),
+        businessBotDb.from('business_users').update({ botcoin: sellerData.botcoin, total_earned: sellerData.total_earned }).eq('user_id', a.sellerId)
+      ]);
+      (ch as any).send(`🔨 **SOLD!** ${item.emoji} **${item.name}** → <@${a.highestBidder}> for 🪙 **${a.highestBid.toLocaleString()}**!`);
+    }
+  }
+}
+
 // ── BOT LIFECYCLE ─────────────────────────────────────────────────────────────
 export async function startBusinessBot(token: string) {
   if (botClient) return;
@@ -225,20 +254,36 @@ export async function startBusinessBot(token: string) {
     console.error('[BusinessBot] Error loading custom names:', e);
   }
 
-  // Load stock pools from Supabase
+  // Load global state from Supabase
   try {
-    const { data } = await businessBotDb.from('business_global').select('stock_pools').eq('id', 'state').maybeSingle();
-    if (data?.stock_pools) {
-      for (const [sym, pool] of Object.entries(data.stock_pools as Record<string,any>)) {
-        if (STOCKS[sym]) {
-          STOCKS[sym].botcoinPool = pool.botcoinPool;
-          STOCKS[sym].sharesPool  = pool.sharesPool;
+    const { data } = await businessBotDb.from('business_global').select('stock_pools, auctions, active_challenges').eq('id', 'state').maybeSingle();
+    if (data) {
+      if (data.stock_pools) {
+        for (const [sym, pool] of Object.entries(data.stock_pools as Record<string,any>)) {
+          if (STOCKS[sym]) {
+            STOCKS[sym].botcoinPool = pool.botcoinPool;
+            STOCKS[sym].sharesPool  = pool.sharesPool;
+          }
         }
       }
-      console.log('[BusinessBot] Loaded stock pools from Supabase');
+      if (data.auctions) {
+        const now = Date.now();
+        for (const [id, auc] of Object.entries(data.auctions as Record<string,any>)) {
+          const a = auc as Auction;
+          activeAuctions.set(id, a);
+          const delay = Math.max(0, a.endTime - now);
+          setTimeout(() => resolveAuction(id), delay);
+        }
+      }
+      if (data.active_challenges) {
+        for (const [id, chall] of Object.entries(data.active_challenges as Record<string,any>)) {
+          activeChallenges.set(id, chall as Challenge);
+        }
+      }
+      console.log('[BusinessBot] Loaded global state from Supabase');
     }
   } catch (e) {
-    console.error('[BusinessBot] Error loading stock pools:', e);
+    console.error('[BusinessBot] Error loading global state:', e);
   }
 
   botClient = new Client({
@@ -320,6 +365,7 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
     dailyStreak: snap.daily_streak || 0,
     lastRob: snap.last_rob || 0,
     jailUntil: snap.jail_until || 0,
+    lastOrbitalStrike: snap.last_orbital_strike || 0,
     stocks: (snap.stocks as Record<string,number>) || {},
     totalEarned: snap.total_earned || 0,
     totalGambled: snap.total_gambled || 0,
@@ -329,6 +375,7 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
     level: snap.level || 1,
   } : defaultUser(username);
   userData.username = username;
+  const startLevel = userData.level;
 
   // schema migration defaults
   userData.inventory    ??= {};
@@ -374,6 +421,7 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       daily_streak: data.dailyStreak,
       last_rob: data.lastRob,
       jail_until: data.jailUntil,
+      last_orbital_strike: data.lastOrbitalStrike || 0,
       stocks: data.stocks,
       total_earned: data.totalEarned,
       total_gambled: data.totalGambled,
@@ -384,15 +432,20 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       updated_at: new Date().toISOString(),
     }, { onConflict: 'user_id' });
   };
-  const saveGlobal = () => businessBotDb.from('business_global').update({
-    custom_items: globalState.customItems,
-    bounties: globalState.bounties,
-    auctions: globalState.auctions,
-    trades: globalState.trades,
-    shop: globalState.shop,
-    stock_pools: globalState.stockPools,
-    active_challenges: globalState.activeChallenges,
-  }).eq('id', 'state');
+  const saveGlobal = () => {
+    const pools: Record<string, { botcoinPool: number; sharesPool: number }> = {};
+    for (const [sym, s] of Object.entries(STOCKS)) pools[sym] = { botcoinPool: s.botcoinPool, sharesPool: s.sharesPool };
+    globalState.stockPools = pools;
+    return businessBotDb.from('business_global').update({
+      custom_items: globalState.customItems,
+      bounties: globalState.bounties,
+      auctions: globalState.auctions,
+      trades: globalState.trades,
+      shop: globalState.shop,
+      stock_pools: globalState.stockPools,
+      active_challenges: globalState.activeChallenges,
+    }).eq('id', 'state');
+  };
 
   // jail check — most commands blocked while in jail
   const JAIL_FREE = new Set(['profile', 'bal', 'inv', 'inventory', 'lb', 'leaderboard', 'rich', 'help', 'stocks', 'market']);
@@ -454,7 +507,7 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       const dailyAmt  = DAILY_BASE + streakBonus;
 
       // interest on idle Botcoin (0.1%/h, applied here)
-      const hoursIdle = Math.floor((now - userData.lastDaily) / 3_600_000);
+      const hoursIdle = userData.lastDaily === 0 ? 0 : Math.floor((now - userData.lastDaily) / 3_600_000);
       const hasPiggy  = (userData.inventory['piggy_bank'] || 0) > 0;
       const rate      = hasPiggy ? INTEREST_RATE * 1.5 : INTEREST_RATE;
       const interest  = Math.floor(userData.botcoin * rate * hoursIdle);
@@ -706,8 +759,7 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
     }
 
     // ── WAGER (COINFLIP) ──────────────────────────────────────────────────
-    case 'wager':
-    case 'flip': {
+    case 'wager': {
       if (args.length < 2) { msg.reply('Usage: `!wager @user <amount>`'); return; }
       const targetMatch = args[0].match(/<@!?(\d+)>/);
       if (!targetMatch) { msg.reply('Please mention a user.'); return; }
@@ -786,7 +838,25 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
 
     // ── CHALLENGE (1v1) ───────────────────────────────────────────────────
     case 'challenge': {
-      if (args.length < 3) { msg.reply('Usage: `!challenge @user <amount> <terms>`'); return; }
+      if (args[0]?.toLowerCase() === 'cancel') {
+        const challengeId = args[1]?.toUpperCase();
+        if (!challengeId) { msg.reply('Usage: `!challenge cancel <Challenge_ID>`'); return; }
+        const challenge = activeChallenges.get(challengeId);
+        if (!challenge) { msg.reply('❌ Invalid or finished challenge.'); return; }
+        if (userId !== challenge.fromId) { msg.reply('❌ Only the challenger can cancel it.'); return; }
+
+        userData.botcoin += challenge.amount;
+        await saveUser(userId, userData);
+        activeChallenges.delete(challengeId);
+        try {
+          delete globalState.activeChallenges[challengeId];
+          await saveGlobal();
+        } catch (e) {}
+        msg.reply(`✅ Challenge canceled. 🪙 **${challenge.amount.toLocaleString()}** refunded.`);
+        return;
+      }
+
+      if (args.length < 3) { msg.reply('Usage: `!challenge @user <amount> <terms>` or `!challenge cancel <id>`'); return; }
       const targetMatch = args[0].match(/<@!?(\d+)>/);
       if (!targetMatch) { msg.reply('Please mention a user.'); return; }
       const targetId = targetMatch[1];
@@ -1231,41 +1301,15 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
           .setFooter({ text: `Ends in ${AUCTION_DURATION / 60_000} minutes` });
         msg.reply({ embeds: [embed] });
 
-        setTimeout(async () => {
-          const a = activeAuctions.get(auctionKey);
-          if (!a) return;
-          activeAuctions.delete(auctionKey);
-          const ch = botClient?.channels.cache.get(a.channelId);
-          if (!ch?.isTextBased()) return;
+        try {
+          globalState.auctions ??= {};
+          globalState.auctions[auctionKey] = activeAuctions.get(auctionKey);
+          await saveGlobal();
+        } catch (e) {
+          console.error('[BusinessBot] Error saving auction:', e);
+        }
 
-          if (!a.highestBidder) {
-            const { data: sellerData } = await businessBotDb.from('business_users').select('*').eq('user_id', a.sellerId).maybeSingle();
-            if (sellerData) {
-              const inv = (sellerData.inventory as Record<string,number>) || {};
-              inv[a.itemId] = (inv[a.itemId] || 0) + 1;
-              await businessBotDb.from('business_users').update({ inventory: inv }).eq('user_id', a.sellerId);
-            }
-            (ch as any).send(`🔨 Auction ended with no bids — ${item?.emoji || ''} **${item?.name || itemId}** returned to <@${a.sellerId}>.`);
-          } else {
-            const { data: buyerData } = await businessBotDb.from('business_users').select('*').eq('user_id', a.highestBidder).maybeSingle();
-            const { data: sellerData } = await businessBotDb.from('business_users').select('*').eq('user_id', a.sellerId).maybeSingle();
-            if (buyerData && sellerData) {
-              // Credit buyer item
-              buyerData.inventory[a.itemId] = (buyerData.inventory[a.itemId] || 0) + 1;
-
-              // Credit seller coins
-              sellerData.botcoin += a.highestBid;
-              sellerData.totalEarned += a.highestBid;
-
-              await Promise.all([
-                businessBotDb.from('business_users').update({ inventory: buyerData.inventory }).eq('user_id', a.highestBidder),
-                businessBotDb.from('business_users').update({ botcoin: sellerData.botcoin, total_earned: sellerData.totalEarned }).eq('user_id', a.sellerId)
-              ]);
-
-              (ch as any).send(`🔨 **SOLD!** ${item?.emoji || ''} **${item?.name || itemId}** → <@${a.highestBidder}> for 🪙 **${a.highestBid.toLocaleString()}**!`);
-            }
-          }
-        }, AUCTION_DURATION);
+        setTimeout(() => resolveAuction(auctionKey), AUCTION_DURATION);
         return;
       }
 
@@ -1292,6 +1336,12 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
         a.highestBidder   = userId;
         a.highestBidderName = username;
         await saveUser(userId, userData);
+        try {
+          globalState.auctions[auctionKey] = a;
+          await saveGlobal();
+        } catch (e) {
+          console.error('[BusinessBot] Error saving auction bid:', e);
+        }
 
         const item = allItems[a.itemId];
         const secsLeft = Math.max(0, Math.ceil((a.endTime - Date.now()) / 1000));
@@ -1604,6 +1654,28 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       break;
     }
 
+    case 'crystal': {
+      if ((userData.inventory['crystal_ball'] || 0) <= 0) {
+        msg.reply('❌ You do not own a Crystal Ball. Use `!buy item crystal_ball` first.');
+        return;
+      }
+      userData.inventory['crystal_ball']--;
+      await saveUser(userId, userData);
+
+      const symbols = Object.keys(STOCKS);
+      const randomSym = symbols[Math.floor(Math.random() * symbols.length)];
+      const stock = STOCKS[randomSym];
+      const currentPrice = Math.floor(stock.botcoinPool / stock.sharesPool);
+      
+      const hints = [
+        `🔮 The mist clears... I see **${randomSym}** is currently sitting at 🪙 **${currentPrice}**. Is a whale about to buy?`,
+        `🔮 The crystal vibrates! **${randomSym}**'s liquidity pool has **${stock.botcoinPool.toLocaleString()}** Botcoins in it.`,
+        `🔮 A voice echoes: "Watch **${randomSym}**... only ${stock.sharesPool.toLocaleString()} shares remain in the pool."`,
+      ];
+      msg.reply(hints[Math.floor(Math.random() * hints.length)]);
+      break;
+    }
+
     case 'bhelp':
     case 'help': {
       if (command === 'help' && args[0]?.toLowerCase() !== 'businessbot') {
@@ -1628,6 +1700,10 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       msg.reply({ embeds: [embed] });
       break;
     }
+  }
+
+  if (userData.level > startLevel) {
+    (msg.channel as any).send(`🎉 Congratulations <@${userId}>! You leveled up to **Level ${userData.level}** — *${levelLabel(userData.level)}*!`);
   }
 }
 
