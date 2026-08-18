@@ -78,40 +78,26 @@ const ITEMS: Record<string, ItemDef> = {
 interface Stock {
   name: string;
   emoji: string;
-  price: number;
-  trend: number;    // -1 to +1, positive = bull
-  volatility: number;
+  botcoinPool: number;
+  sharesPool: number;
 }
 
 const STOCKS: Record<string, Stock> = {
-  BOTC: { name: 'BotCoin Industries', emoji: '🪙', price: 100, trend: 0.3,  volatility: 0.15 },
-  CLOD: { name: 'Cloud Corp',         emoji: '☁️', price: 250, trend: -0.1, volatility: 0.22 },
-  GRLX: { name: 'Golden Rolex Ltd',   emoji: '⌚', price: 500, trend: 0.2,  volatility: 0.18 },
-  MBOX: { name: 'Mystery Box Corp',   emoji: '🎁', price: 75,  trend: 0.0,  volatility: 0.30 },
-  NUKE: { name: 'Nuke Holdings',      emoji: '💣', price: 175, trend: 0.1,  volatility: 0.28 },
+  BOTC: { name: 'BotCoin Industries', emoji: '🪙', botcoinPool: 1_000_000, sharesPool: 10_000 },
+  CLOD: { name: 'Cloud Corp',         emoji: '☁️', botcoinPool: 2_500_000, sharesPool: 10_000 },
+  GRLX: { name: 'Golden Rolex Ltd',   emoji: '⌚', botcoinPool: 5_000_000, sharesPool: 10_000 },
+  MBOX: { name: 'Mystery Box Corp',   emoji: '🎁', botcoinPool: 750_000,   sharesPool: 10_000 },
+  NUKE: { name: 'Nuke Holdings',      emoji: '💣', botcoinPool: 1_750_000, sharesPool: 10_000 },
 };
 
-// Tick stock prices every 10 minutes
+// Tick just persists AMM pools every 10 mins
 async function tickStocks() {
-  for (const [sym, s] of Object.entries(STOCKS)) {
-    const baseDrift = s.trend * 0.02;
-    // Market gravity: The higher the price, the stronger the downward pull.
-    // Base log10(1,000) = 3. Anything above 1,000 starts feeling gravity.
-    // At 1,000,000 (log10=6), gravity is 0.015 (1.5% decay per tick), which will crush any positive trend.
-    const gravity = s.price > 1000 ? Math.max(0, (Math.log10(s.price) - 3) * 0.005) : 0;
-    const netDrift = baseDrift - gravity;
-    
-    const shock  = (Math.random() - 0.5) * 2 * s.volatility;
-    const change = netDrift + shock;
-    s.price = Math.max(10, Math.round(s.price * (1 + change)));
-  }
-  // Persist updated prices to Firebase
   try {
-    const prices: Record<string, number> = {};
-    for (const [sym, s] of Object.entries(STOCKS)) prices[sym] = s.price;
-    await businessBotDb.from('business_global').update({ stock_prices: prices }).eq('id', 'state');
+    const pools: Record<string, { botcoinPool: number; sharesPool: number }> = {};
+    for (const [sym, s] of Object.entries(STOCKS)) pools[sym] = { botcoinPool: s.botcoinPool, sharesPool: s.sharesPool };
+    await businessBotDb.from('business_global').update({ stock_pools: pools }).eq('id', 'state');
   } catch (e) {
-    console.error('[BusinessBot] Error saving stock prices:', e);
+    console.error('[BusinessBot] Error saving stock pools:', e);
   }
 }
 setInterval(tickStocks, 10 * 60 * 1000);
@@ -149,6 +135,18 @@ interface UserData {
   level:       number;
 }
 
+function getTopStockPrice(u: any): number {
+  let highest = 0;
+  for (const [sym, shares] of Object.entries(u.stocks || {})) {
+    if (STOCKS[sym]) {
+      const price = Math.floor(STOCKS[sym].botcoinPool / STOCKS[sym].sharesPool);
+      const val = price * (shares as number);
+      if (val > highest) highest = val;
+    }
+  }
+  return highest;
+}
+
 function defaultUser(username: string): UserData {
   return {
     username, botcoin: 0, netWorth: 0, granted: false,
@@ -167,7 +165,7 @@ function calcNetWorth(u: UserData, customItems: Record<string, any>): number {
     if (item) w += (item.value || 0) * (count as number);
   }
   for (const [sym, shares] of Object.entries(u.stocks || {})) {
-    if (STOCKS[sym]) w += STOCKS[sym].price * (shares as number);
+    if (STOCKS[sym]) w += Math.floor(STOCKS[sym].botcoinPool / STOCKS[sym].sharesPool) * (shares as number);
   }
   return w;
 }
@@ -226,17 +224,20 @@ export async function startBusinessBot(token: string) {
     console.error('[BusinessBot] Error loading custom names:', e);
   }
 
-  // Load stock prices from Supabase
+  // Load stock pools from Supabase
   try {
-    const { data } = await businessBotDb.from('business_global').select('stock_prices').eq('id', 'state').maybeSingle();
-    if (data?.stock_prices) {
-      for (const [sym, price] of Object.entries(data.stock_prices as Record<string,number>)) {
-        if (STOCKS[sym]) STOCKS[sym].price = price;
+    const { data } = await businessBotDb.from('business_global').select('stock_pools').eq('id', 'state').maybeSingle();
+    if (data?.stock_pools) {
+      for (const [sym, pool] of Object.entries(data.stock_pools as Record<string,any>)) {
+        if (STOCKS[sym]) {
+          STOCKS[sym].botcoinPool = pool.botcoinPool;
+          STOCKS[sym].sharesPool  = pool.sharesPool;
+        }
       }
-      console.log('[BusinessBot] Loaded stock prices from Supabase');
+      console.log('[BusinessBot] Loaded stock pools from Supabase');
     }
   } catch (e) {
-    console.error('[BusinessBot] Error loading stock prices:', e);
+    console.error('[BusinessBot] Error loading stock pools:', e);
   }
 
   botClient = new Client({
@@ -349,7 +350,7 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
     auctions: (globalSnap.auctions as Record<string,any>) || {},
     trades: (globalSnap.trades as Record<string,any>) || {},
     shop: (globalSnap.shop as Record<string,any>) || {},
-    stockPrices: (globalSnap.stock_prices as Record<string,number>) || {},
+    stockPools: (globalSnap.stock_pools as Record<string,any>) || {},
     activeChallenges: (globalSnap.active_challenges as Record<string,any>) || {},
   } : { customItems: {}, bounties: {}, auctions: {}, trades: {}, shop: {}, stockPrices: {}, activeChallenges: {} };
   globalState.customItems ??= {};
@@ -388,7 +389,7 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
     auctions: globalState.auctions,
     trades: globalState.trades,
     shop: globalState.shop,
-    stock_prices: globalState.stockPrices,
+    stock_pools: globalState.stockPools,
     active_challenges: globalState.activeChallenges,
   }).eq('id', 'state');
 
@@ -442,6 +443,7 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
 
       // streak
       const twoDays = 2 * 24 * 60 * 60 * 1000;
+      if (now - userData.lastDaily < twoDays) {
         userData.dailyStreak = Math.min((userData.dailyStreak || 0) + 1, MAX_STREAK);
       } else {
         userData.dailyStreak = 1;
@@ -941,11 +943,11 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
         .setDescription('Buy: `!buy <SYMBOL> <shares>` | Sell: `!sell <SYMBOL> <shares>`')
         .setFooter({ text: 'Prices update every 10 minutes. Past performance ≠ future results.' });
       for (const [sym, s] of Object.entries(STOCKS)) {
-        const trendArrow = s.trend > 0.1 ? '📈' : s.trend < -0.1 ? '📉' : '➡️';
+        const price = Math.floor(s.botcoinPool / s.sharesPool);
         const owned = userData.stocks?.[sym] || 0;
         embed.addFields({
           name: `${s.emoji} ${s.name} [${sym}]`,
-          value: `🪙 **${s.price.toLocaleString()}**/share   ${trendArrow}${owned > 0 ? `   You own: **${owned}**` : ''}`,
+          value: `🪙 **${price.toLocaleString()}**/share   Pool: **${s.sharesPool.toLocaleString()}** shares${owned > 0 ? `\nYou own: **${owned}**` : ''}`,
         });
       }
       msg.reply({ embeds: [embed] });
@@ -968,7 +970,7 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
             .setColor(0xff0000)
             .setTitle('🚨 GLOBAL WEALTH ALERT 🚨')
             .setDescription(`**${username}** just dropped 🪙 **${item.shopPrice.toLocaleString()}** to buy a ${item.emoji} **${item.name}**!\n\n*What an absolute flex. They officially have too much money.*`);
-          msg.channel.send({ embeds: [flexEmbed] });
+          (msg.channel as any).send({ embeds: [flexEmbed] });
         } else {
           msg.reply(`🛒 Bought ${item.emoji} **${item.name}** for 🪙 ${item.shopPrice.toLocaleString()}!`);
         }
@@ -981,15 +983,27 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       if (!sym || isNaN(shares) || shares <= 0) { msg.reply('Usage: `!buy <SYMBOL> <shares>` OR `!buy item <id>`'); return; }
       const stock = STOCKS[sym];
       if (!stock) { msg.reply(`❌ Unknown stock symbol. Use \`!buy item <id>\` for shop items.`); return; }
-      const cost = stock.price * shares;
+      
+      if (shares >= stock.sharesPool) { msg.reply(`❌ Not enough shares in the liquidity pool (Only ${stock.sharesPool} available).`); return; }
+      const K = stock.botcoinPool * stock.sharesPool;
+      const newSharesPool = stock.sharesPool - shares;
+      const newBotcoinPool = K / newSharesPool;
+      const cost = Math.ceil(newBotcoinPool - stock.botcoinPool);
+      
       if (cost > userData.botcoin) { msg.reply(`❌ Costs 🪙 ${cost.toLocaleString()}. You have 🪙 ${userData.botcoin.toLocaleString()}.`); return; }
+      
       userData.botcoin    -= cost;
+      stock.botcoinPool   += cost;
+      stock.sharesPool    -= shares;
+      
       userData.stocks     ??= {};
       userData.stocks[sym] = (userData.stocks[sym] || 0) + shares;
       addXP(userData, 20);
       await saveUser(userId, userData);
+      
+      const newPrice = Math.floor(stock.botcoinPool / stock.sharesPool);
       Telemetry.track('ECONOMY_STOCK_BUY', { symbol: sym, shares, cost }, userId, msg.guild?.id || 'DM');
-      msg.reply(`📈 Bought **${shares}x ${stock.name}** [${sym}] for 🪙 **${cost.toLocaleString()}**. Avg: ${stock.price}/share.`);
+      msg.reply(`📈 Bought **${shares}x ${stock.name}** [${sym}] from the AMM for 🪙 **${cost.toLocaleString()}**.\nNew Price: 🪙 **${newPrice.toLocaleString()}**/share.`);
       break;
     }
 
@@ -1015,14 +1029,24 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       if (!stock) { msg.reply(`❌ Unknown symbol.`); return; }
       const owned = userData.stocks?.[sym] || 0;
       if (owned < shares) { msg.reply(`❌ You only own **${owned}** shares of ${sym}.`); return; }
-      const revenue = stock.price * shares;
+      
+      const K = stock.botcoinPool * stock.sharesPool;
+      const newSharesPool = stock.sharesPool + shares;
+      const newBotcoinPool = K / newSharesPool;
+      const revenue = Math.floor(stock.botcoinPool - newBotcoinPool);
+      
       userData.botcoin       += revenue;
+      stock.botcoinPool      -= revenue;
+      stock.sharesPool       += shares;
+      
       userData.stocks[sym]    = owned - shares;
       userData.totalEarned   += revenue;
       addXP(userData, 15);
       await saveUser(userId, userData);
+      
+      const newPrice = Math.floor(stock.botcoinPool / stock.sharesPool);
       Telemetry.track('ECONOMY_STOCK_SELL', { symbol: sym, shares, revenue }, userId, msg.guild?.id || 'DM');
-      msg.reply(`📉 Sold **${shares}x ${sym}** for 🪙 **${revenue.toLocaleString()}**.`);
+      msg.reply(`📉 Sold **${shares}x ${sym}** into the AMM for 🪙 **${revenue.toLocaleString()}**.\nNew Price: 🪙 **${newPrice.toLocaleString()}**/share.`);
       break;
     }
 
@@ -1033,13 +1057,19 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       let total = 0;
       let hasStocks = false;
       for (const [sym, shares] of Object.entries(userData.stocks || {})) {
-        if ((shares as number) <= 0) continue;
-        const s = STOCKS[sym];
-        if (!s) continue;
-        const val = s.price * (shares as number);
-        total += val;
+        if (!STOCKS[sym]) continue;
         hasStocks = true;
-        embed.addFields({ name: `${s.emoji} ${sym}`, value: `${shares} shares @ 🪙${s.price} = 🪙 **${val.toLocaleString()}**`, inline: true });
+        const sh = shares as number;
+        if (sh > 0) {
+          const price = Math.floor(STOCKS[sym].botcoinPool / STOCKS[sym].sharesPool);
+          const val = price * sh;
+          total += val;
+          embed.addFields({
+            name: `${STOCKS[sym].emoji} ${STOCKS[sym].name} [${sym}]`,
+            value: `**${sh}** shares | 🪙 **${price.toLocaleString()}**/share | Value: 🪙 **${val.toLocaleString()}**`,
+            inline: true
+          });
+        }
       }
       if (!hasStocks) embed.setDescription('No stocks owned. Use `!buy <SYMBOL> <shares>` to invest.');
       else embed.setDescription(`Total stock value: 🪙 **${total.toLocaleString()}**`);
@@ -1473,7 +1503,7 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
         .setColor(0xff0000)
         .setTitle('🛰️ ORBITAL STRIKE INITIATED')
         .setDescription(`**${username}** has fired the orbital laser from their Space Station!\n\nTarget: <@${targetUser.id}>\nDamage: **🪙 ${damage.toLocaleString()}** destroyed.\n*May god have mercy.*`);
-      msg.channel.send({ embeds: [embed] });
+      (msg.channel as any).send({ embeds: [embed] });
       break;
     }
 
@@ -1593,7 +1623,7 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
     .filter(([, v]) => (v as number) > 0).map(([k, v]) => k + 'x' + v).join(', ') || 'none';
 
   const stockPricesStr = Object.entries(STOCKS)
-    .map(([sym, s]) => `${sym}: 🪙 ${s.price}`)
+    .map(([sym, s]) => `${sym}: 🪙 ${Math.floor(s.botcoinPool / s.sharesPool)}`)
     .join(' | ');
 
   const systemPrompt = [
