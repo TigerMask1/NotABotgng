@@ -100,6 +100,7 @@ async function tickStocks() {
     console.error('[BusinessBot] Error saving stock pools:', e);
   }
 }
+async function saveStockPools() { await tickStocks(); }
 setInterval(tickStocks, 10 * 60 * 1000);
 
 // ── IN-MEMORY STATE ───────────────────────────────────────────────────────────
@@ -1010,6 +1011,7 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       userData.stocks[sym] = (userData.stocks[sym] || 0) + shares;
       addXP(userData, 20);
       await saveUser(userId, userData);
+      await saveStockPools();
       
       const newPrice = Math.floor(stock.botcoinPool / stock.sharesPool);
       Telemetry.track('ECONOMY_STOCK_BUY', { symbol: sym, shares, cost }, userId, msg.guild?.id || 'DM');
@@ -1053,6 +1055,7 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       userData.totalEarned   += revenue;
       addXP(userData, 15);
       await saveUser(userId, userData);
+      await saveStockPools();
       
       const newPrice = Math.floor(stock.botcoinPool / stock.sharesPool);
       Telemetry.track('ECONOMY_STOCK_SELL', { symbol: sym, shares, revenue }, userId, msg.guild?.id || 'DM');
@@ -1458,7 +1461,8 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       userData.botcoin -= 100000000;
       userData.customName = newName;
       customNameCache.set(userId, newName);
-      await businessBotDb.from('business_users').update({ botcoin: userData.botcoin, custom_name: newName }).eq('user_id', userId);
+      await saveUser(userId, userData);
+      await businessBotDb.from('business_users').update({ custom_name: newName }).eq('user_id', userId);
       msg.reply(`Excellent, Sir. I will now respond to the name "${newName}" from you.`);
       break;
     }
@@ -1471,8 +1475,9 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       if (!target || isNaN(amt)) return;
       const { data: tData } = await businessBotDb.from('business_users').select('*').eq('user_id', target.id).maybeSingle();
       if (tData) {
-        await businessBotDb.from('business_users').update({ botcoin: (tData.botcoin || 0) + amt }).eq('user_id', target.id);
-        msg.reply(`Added ${amt} to ${target.username}.`);
+        const newBotcoin = (tData.botcoin || 0) + amt;
+        await businessBotDb.from('business_users').update({ botcoin: newBotcoin, net_worth: newBotcoin }).eq('user_id', target.id);
+        msg.reply(`Added 🪙 ${amt.toLocaleString()} to ${target.username}.`);
       }
       break;
     }
@@ -1484,8 +1489,9 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       if (!target || isNaN(amt)) return;
       const { data: tData } = await businessBotDb.from('business_users').select('*').eq('user_id', target.id).maybeSingle();
       if (tData) {
-        await businessBotDb.from('business_users').update({ botcoin: Math.max(0, (tData.botcoin || 0) - amt) }).eq('user_id', target.id);
-        msg.reply(`Removed ${amt} from ${target.username}.`);
+        const newBotcoin = Math.max(0, (tData.botcoin || 0) - amt);
+        await businessBotDb.from('business_users').update({ botcoin: newBotcoin, net_worth: newBotcoin }).eq('user_id', target.id);
+        msg.reply(`Removed 🪙 ${amt.toLocaleString()} from ${target.username}.`);
       }
       break;
     }
@@ -1530,18 +1536,33 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       const targetUser = msg.mentions.users.first();
       if (!targetUser) { msg.reply('❌ Specify a target: `!orbitalstrike <@user>`'); return; }
       if (targetUser.bot) { msg.reply('❌ You cannot strike a bot.'); return; }
-      
+
+      // 3-day cooldown using a dedicated field
+      const lastStrike = (userData as any).lastOrbitalStrike || 0;
+      const THREE_DAYS = 3 * 24 * 60 * 60 * 1000;
+      if (Date.now() - lastStrike < THREE_DAYS) {
+        const hoursLeft = Math.ceil((THREE_DAYS - (Date.now() - lastStrike)) / 3_600_000);
+        msg.reply(`❌ Orbital Strike on cooldown. **${hoursLeft}h** remaining until recharge.`); return;
+      }
+
       const { data: tSnap } = await businessBotDb.from('business_users').select('*').eq('user_id', targetUser.id).maybeSingle();
       if (!tSnap) { msg.reply('❌ Target is not in the system.'); return; }
-      
+
       let targetBotcoin = tSnap.botcoin || 0;
       if (targetBotcoin < 1000) { msg.reply('❌ Target is too poor for an orbital strike. Spare them.'); return; }
-      
+
       // Calculate damage
       const damage = Math.floor(targetBotcoin * 0.5);
       targetBotcoin -= damage;
-      await businessBotDb.from('business_users').update({ botcoin: targetBotcoin }).eq('user_id', targetUser.id);
       
+      // Save target (update botcoin + net_worth)
+      await businessBotDb.from('business_users').update({ botcoin: targetBotcoin, net_worth: targetBotcoin }).eq('user_id', targetUser.id);
+      
+      // Save attacker cooldown
+      (userData as any).lastOrbitalStrike = Date.now();
+      await saveUser(userId, userData);
+      await businessBotDb.from('business_users').update({ last_orbital_strike: (userData as any).lastOrbitalStrike }).eq('user_id', userId);
+
       const embed = new EmbedBuilder()
         .setColor(0xff0000)
         .setTitle('🛰️ ORBITAL STRIKE INITIATED')
