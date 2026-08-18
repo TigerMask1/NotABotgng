@@ -1490,6 +1490,39 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       break;
     }
 
+    case 'admin_migrate_stocks': {
+      msg.reply('⏳ Starting stock liquidation migration...');
+      try {
+        const { data: users } = await businessBotDb.from('business_users').select('user_id, username, botcoin, stocks');
+        let count = 0;
+        let totalRefunded = 0;
+        for (const user of users || []) {
+          const stocks = user.stocks as Record<string, number> | null;
+          if (!stocks || Object.keys(stocks).length === 0) continue;
+
+          let refund = 0;
+          for (const [sym, shares] of Object.entries(stocks)) {
+            if (shares <= 0) continue;
+            // Use current AMM price for the refund
+            const pool = STOCKS[sym];
+            const price = pool ? Math.floor(pool.botcoinPool / pool.sharesPool) : 100;
+            refund += price * shares;
+          }
+
+          if (refund > 0) {
+            const newBotcoin = (user.botcoin || 0) + refund;
+            await businessBotDb.from('business_users').update({ botcoin: newBotcoin, stocks: {} }).eq('user_id', user.user_id);
+            count++;
+            totalRefunded += refund;
+          }
+        }
+        msg.reply(`✅ Successfully liquidated stocks for **${count}** users. Refunded **🪙 ${totalRefunded.toLocaleString()}** in total.`);
+      } catch (e) {
+        msg.reply(`❌ Error during migration: ${e}`);
+      }
+      break;
+    }
+
     case 'orbitalstrike': {
       if ((userData.inventory['space_station'] || 0) <= 0) {
         msg.reply('❌ You do not own a Space Station. You are grounded.'); return;
