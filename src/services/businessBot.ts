@@ -38,7 +38,7 @@ const COMMAND_DOCS = [
   'tradea  -> args: ["<trade_id>"] (accept trade) | traded -> args: ["<trade_id>"] (decline)',
   'auction -> args: ["list"] OR ["start", "<item_id>"] OR ["bid", "<auction_key>", "<amt>"]',
   'forge   -> args: ["<emoji>", "<name>"] (Costs 2000 coins to forge a custom item)',
-  'setname -> args: ["<name>"] (Costs 50,000 Botcoins. Sets a custom activation name.)',
+  'setname -> args: ["<name>"] (Costs 100,000,000 Botcoins. Sets a custom activation name.)',
   'orbitalstrike -> args: ["<@id>"]         (Requires Space Station. Wipes 50% target net worth, 3d cooldown)',
   'flip    -> args: ["coin"]                (Requires Rusty Coin. 50% chance for Diamond, 50% shatter)',
   'use     -> args: ["ticket", "<SYM>"]     (Requires Golden Ticket. Instantly doubles your shares in a stock)',
@@ -1447,15 +1447,15 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
     // ── CUSTOM NAME ───────────────────────────────────────────────────────
     case 'setname': {
       if (!args[0]) {
-        msg.reply('Sir, please provide a name. `!setname <name>` (Costs 50,000)');
+        msg.reply('Sir, please provide a name. `!setname <name>` (Costs 100,000,000)');
         break;
       }
-      if (userData.botcoin < 50000) {
-        msg.reply('Sir, you are too poor for this premium feature. It costs 50,000 Botcoins.');
+      if (userData.botcoin < 100000000) {
+        msg.reply('Sir, you are too poor for this premium feature. It costs 100,000,000 Botcoins.');
         break;
       }
       const newName = args.join(' ');
-      userData.botcoin -= 50000;
+      userData.botcoin -= 100000000;
       userData.customName = newName;
       customNameCache.set(userId, newName);
       await businessBotDb.from('business_users').update({ botcoin: userData.botcoin, custom_name: newName }).eq('user_id', userId);
