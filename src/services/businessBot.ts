@@ -20,6 +20,32 @@ const JAIL_DURATION  = 30 * 60 * 1000;      // 30min
 const INTEREST_RATE  = 0.001;               // 0.1% per hour, applied on !daily
 const AUCTION_DURATION = 5 * 60 * 1000;     // 5 minutes
 
+const COMMAND_DOCS = [
+  'start | daily | profile | lb | portfolio | shop | inventory | vault',
+  'open    -> args: ["box"]',
+  'slots   -> args: ["<amount>"]',
+  'pay     -> args: ["<@id>", "<amount>"]    (needs @mention in message)',
+  'rob     -> args: ["<@id>"]               (needs @mention in message)',
+  'wager   -> args: ["<@id>", "<amount>"]   (needs @mention in message)',
+  'accept  -> args: ["<@id>"]               (accept a wager)',
+  'challenge -> args: ["<@id>", "<amount>", "<terms>"]',
+  'yield   -> args: ["<challenge_id>"]      (surrender a challenge)',
+  'award   -> args: ["<challenge_id>", "<@winner_id>"] (declare winner of a challenge)',
+  'buy     -> args: ["<SYMBOL>", "<shares>"] OR args: ["item", "<item_id>"]',
+  'sell    -> args: ["<SYMBOL>", "<shares>"] OR args: ["diamond"]',
+  'bounty  -> args: ["list"] OR ["post", "<amount>", "<task>"] OR ["award", "<bounty_id>", "<@user>"]',
+  'trade   -> args: ["<@id>", "<my_item_id>", "for", "<their_item_id>"]',
+  'tradea  -> args: ["<trade_id>"] (accept trade) | traded -> args: ["<trade_id>"] (decline)',
+  'auction -> args: ["list"] OR ["start", "<item_id>"] OR ["bid", "<auction_key>", "<amt>"]',
+  'forge   -> args: ["<emoji>", "<name>"] (Costs 2000 coins to forge a custom item)',
+  'setname -> args: ["<name>"] (Costs 50,000 Botcoins. Sets a custom activation name.)',
+  'orbitalstrike -> args: ["<@id>"]         (Requires Space Station. Wipes 50% target net worth, 3d cooldown)',
+  'flip    -> args: ["coin"]                (Requires Rusty Coin. 50% chance for Diamond, 50% shatter)',
+  'use     -> args: ["ticket", "<SYM>"]     (Requires Golden Ticket. Instantly doubles your shares in a stock)',
+  'addmoney -> args: ["<@id>", "<amount>"] (Admin ONLY - Jaguar)',
+  'removemoney -> args: ["<@id>", "<amount>"] (Admin ONLY - Jaguar)',
+];
+
 // ── ITEM CATALOGUE ───────────────────────────────────────────────────────────
 interface ItemDef {
   name: string;
@@ -403,16 +429,19 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
     // ── DAILY ─────────────────────────────────────────────────────────────
     case 'daily': {
       const now    = Date.now();
-      const oneDay = 24 * 60 * 60 * 1000;
-      const twoDays = 2 * oneDay;
-      if (now - userData.lastDaily < oneDay) {
-        const hoursLeft = Math.ceil((oneDay - (now - userData.lastDaily)) / 3_600_000);
+      
+      let cooldownDays = 1;
+      if ((userData.inventory['golden_rolex'] || 0) > 0) cooldownDays = 0.5; // Rolex owners get daily twice as fast
+      const cooldownMs = cooldownDays * 24 * 60 * 60 * 1000;
+      
+      if (now - userData.lastDaily < cooldownMs) {
+        const hoursLeft = Math.ceil((cooldownMs - (now - userData.lastDaily)) / 3_600_000);
         msg.reply(`❌ Already claimed! Come back in **${hoursLeft}h**.`);
         return;
       }
 
       // streak
-      if (now - userData.lastDaily < twoDays) {
+      const twoDays = 2 * 24 * 60 * 60 * 1000;
         userData.dailyStreak = Math.min((userData.dailyStreak || 0) + 1, MAX_STREAK);
       } else {
         userData.dailyStreak = 1;
@@ -584,20 +613,22 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
         return symbols[0];
       };
 
-      const reels = [spin(), spin(), spin()];
+      const [r1, r2, r3] = [spin(), spin(), spin()];
       userData.botcoin    -= bet;
       userData.totalGambled += bet;
 
       let winAmt = 0;
       let winMsg = '';
-      if (reels[0] === reels[1] && reels[1] === reels[2]) {
+      if (r1 === r2 && r2 === r3) {
         const multipliers: Record<string, number> = { '7️⃣': 20, '🎰': 15, '⭐': 10, '🔔': 8, '💎': 7, '🍊': 4, '🍋': 3, '🍒': 2 };
-        const mult = multipliers[reels[0]] || 2;
+        const mult = multipliers[r1] || 2;
         winAmt = bet * mult;
-        winMsg = mult >= 10 ? `🎉 **JACKPOT!** ${mult}x = 🪙 **${winAmt.toLocaleString()}**!` : `✨ **Triple ${reels[0]}!** ${mult}x = 🪙 **${winAmt.toLocaleString()}**`;
+        if ((userData.inventory['ceo_title'] || 0) > 0) winAmt = Math.floor(winAmt * 1.15);
+        winMsg = mult >= 10 ? `🎉 **JACKPOT!** ${mult}x = 🪙 **${winAmt.toLocaleString()}**!` : `✨ **Triple ${r1}!** ${mult}x = 🪙 **${winAmt.toLocaleString()}**`;
         userData.wins++;
-      } else if (reels[0] === reels[1] || reels[1] === reels[2] || reels[0] === reels[2]) {
+      } else if (r1 === r2 || r2 === r3 || r1 === r3) {
         winAmt = Math.floor(bet * 0.5);
+        if ((userData.inventory['ceo_title'] || 0) > 0) winAmt = Math.floor(winAmt * 1.15);
         winMsg = `Pair! You get back 🪙 **${winAmt.toLocaleString()}**`;
       } else {
         winMsg = `No match. You lost 🪙 **${bet.toLocaleString()}**.`;
@@ -608,12 +639,12 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       userData.totalEarned += winAmt;
       addXP(userData, 10);
       await saveUser(userId, userData);
-      Telemetry.track('ECONOMY_GAMBLE', { game: 'slots', amount: bet, payout: winAmt, won: winAmt > 0, reels }, userId, msg.guild?.id || 'DM');
+      Telemetry.track('ECONOMY_GAMBLE', { game: 'slots', amount: bet, payout: winAmt, won: winAmt > 0, reels: [r1, r2, r3] }, userId, msg.guild?.id || 'DM');
 
       const embed = new EmbedBuilder()
         .setColor(winAmt > 0 ? 0xf1c40f : 0xff0000)
         .setTitle('🎰 Slot Machine')
-        .setDescription(`**${reels.join('  |  ')}**\n\n${winMsg}`)
+        .setDescription(`**${[r1, r2, r3].join('  |  ')}**\n\n${winMsg}`)
         .setFooter({ text: `Balance: 🪙 ${userData.botcoin.toLocaleString()}` });
       msg.reply({ embeds: [embed] });
       break;
@@ -645,9 +676,11 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       const nukeBonus  = hasNuke ? 0.20 : 0;
       if (hasNuke) userData.inventory['nuke']--;
 
-      const success = Math.random() < (baseChance + nukeBonus);
-      if (success) {
-        const stolen = Math.floor(targetData.botcoin * (0.10 + Math.random() * 0.15));
+      const isSuccess = Math.random() < (baseChance + nukeBonus);
+      if (isSuccess) {
+        let stolen = Math.floor(targetData.botcoin * (0.10 + Math.random() * 0.15));
+        if ((userData.inventory['ceo_title'] || 0) > 0) stolen = Math.floor(stolen * 1.15);
+        
         userData.botcoin    += stolen;
         userData.totalEarned += stolen;
         targetData.botcoin  -= stolen;
@@ -961,9 +994,23 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
     }
 
     case 'sell': {
+      if (args[0]?.toLowerCase() === 'diamond') {
+        if ((userData.inventory['diamond'] || 0) <= 0) {
+          msg.reply('❌ You do not own a Diamond.'); return;
+        }
+        userData.inventory['diamond']--;
+        const payout = Math.floor(10000 + Math.random() * 40000); // 10k to 50k
+        userData.botcoin += payout;
+        userData.totalEarned += payout;
+        addXP(userData, 50);
+        await saveUser(userId, userData);
+        msg.reply(`💎 You sold your Diamond to a wealthy collector for 🪙 **${payout.toLocaleString()}**!`);
+        break;
+      }
+
       const sym    = args[0]?.toUpperCase();
       const shares = parseInt(args[1], 10);
-      if (!sym || isNaN(shares) || shares <= 0) { msg.reply('Usage: `!sell <SYMBOL> <shares>`'); return; }
+      if (!sym || isNaN(shares) || shares <= 0) { msg.reply('Usage: `!sell <SYMBOL> <shares>` OR `!sell diamond`'); return; }
       const stock = STOCKS[sym];
       if (!stock) { msg.reply(`❌ Unknown symbol.`); return; }
       const owned = userData.stocks?.[sym] || 0;
@@ -1403,6 +1450,65 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
       break;
     }
 
+    case 'orbitalstrike': {
+      if ((userData.inventory['space_station'] || 0) <= 0) {
+        msg.reply('❌ You do not own a Space Station. You are grounded.'); return;
+      }
+      const targetUser = msg.mentions.users.first();
+      if (!targetUser) { msg.reply('❌ Specify a target: `!orbitalstrike <@user>`'); return; }
+      if (targetUser.bot) { msg.reply('❌ You cannot strike a bot.'); return; }
+      
+      const { data: tSnap } = await businessBotDb.from('business_users').select('*').eq('user_id', targetUser.id).maybeSingle();
+      if (!tSnap) { msg.reply('❌ Target is not in the system.'); return; }
+      
+      let targetBotcoin = tSnap.botcoin || 0;
+      if (targetBotcoin < 1000) { msg.reply('❌ Target is too poor for an orbital strike. Spare them.'); return; }
+      
+      // Calculate damage
+      const damage = Math.floor(targetBotcoin * 0.5);
+      targetBotcoin -= damage;
+      await businessBotDb.from('business_users').update({ botcoin: targetBotcoin }).eq('user_id', targetUser.id);
+      
+      const embed = new EmbedBuilder()
+        .setColor(0xff0000)
+        .setTitle('🛰️ ORBITAL STRIKE INITIATED')
+        .setDescription(`**${username}** has fired the orbital laser from their Space Station!\n\nTarget: <@${targetUser.id}>\nDamage: **🪙 ${damage.toLocaleString()}** destroyed.\n*May god have mercy.*`);
+      msg.channel.send({ embeds: [embed] });
+      break;
+    }
+
+    case 'flip': {
+      if (args[0]?.toLowerCase() !== 'coin') { msg.reply('Usage: `!flip coin`'); return; }
+      if ((userData.inventory['rusty_coin'] || 0) <= 0) { msg.reply('❌ You do not own a Rusty Coin.'); return; }
+      
+      userData.inventory['rusty_coin']--;
+      if (Math.random() > 0.5) {
+        userData.inventory['diamond'] = (userData.inventory['diamond'] || 0) + 1;
+        msg.reply('🪙 You flipped the Rusty Coin... it cracked open and revealed a **Diamond**! 💎');
+      } else {
+        msg.reply('🪙 You flipped the Rusty Coin... it shattered into worthless dust. 💨');
+      }
+      await saveUser(userId, userData);
+      break;
+    }
+
+    case 'use': {
+      if (args[0]?.toLowerCase() === 'ticket') {
+        if ((userData.inventory['golden_ticket'] || 0) <= 0) { msg.reply('❌ You do not own a Golden Ticket.'); return; }
+        const sym = args[1]?.toUpperCase();
+        if (!sym || !STOCKS[sym]) { msg.reply('❌ Invalid stock symbol. `!use ticket <SYM>`'); return; }
+        
+        const owned = userData.stocks?.[sym] || 0;
+        if (owned <= 0) { msg.reply(`❌ You don't own any shares of ${sym} to double.`); return; }
+        
+        userData.inventory['golden_ticket']--;
+        userData.stocks[sym] = owned * 2;
+        await saveUser(userId, userData);
+        msg.reply(`🎟️ You used your **Golden Ticket**! Your ${sym} shares have magically doubled from ${owned} to **${owned * 2}**!`);
+      }
+      break;
+    }
+
     case 'bhelp':
     case 'help': {
       if (command === 'help' && args[0]?.toLowerCase() !== 'businessbot') {
@@ -1420,7 +1526,8 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
           { name: '🤝 Trading',         value: '`!trade @user <item> for <item>` — Propose trade\n`!tradea <id>` — Accept trade\n`!traded <id>` — Decline trade' },
           { name: '🔨 Auctions',        value: '`!auction start <item_id>` — List item\n`!auction bid <key> <amt>` — Place bid\n`!auction list` — View active' },
           { name: '📜 Bounties',        value: '`!bounty post <amt> <task>` — Post task\n`!bounty list` — View open bounties\n`!bounty award <id> @user` — Pay out' },
-          { name: '🔧 Utility & Admin', value: '`!setname <name>` — Set profile name\n`!addmoney @user <amt>` — Admin spawn money\n`!removemoney @user <amt>` — Admin remove money' }
+          { name: '🔧 Utility & Admin', value: '`!setname <name>` — Set profile name\n`!addmoney @user <amt>` — Admin spawn money\n`!removemoney @user <amt>` — Admin remove money' },
+          { name: '⚡ Special Actions', value: '`!orbitalstrike <@user>` — Wipes 50% net worth (Needs Space Station)\n`!flip coin` — Gamble Rusty Coin\n`!sell diamond` — Cash out\n`!use ticket <SYM>` — Double your shares' }
         )
         .setFooter({ text: 'Tip: Lucky Charm boosts coinflip odds. Piggy Bank earns more interest. Nuke helps rob.' });
       msg.reply({ embeds: [embed] });
@@ -1497,26 +1604,7 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
     'MENTIONED USERS (use exact strings for @user args): ' + mentionCtx,
     '',
     'COMMANDS TO EXECUTE:',
-    'start | daily | profile | lb | portfolio | shop | inventory | vault',
-    'open    -> args: ["box"]',
-    'slots   -> args: ["<amount>"]',
-    'pay     -> args: ["<@id>", "<amount>"]    (needs @mention in message)',
-    'rob     -> args: ["<@id>"]               (needs @mention in message)',
-    'wager   -> args: ["<@id>", "<amount>"]   (needs @mention in message)',
-    'accept  -> args: ["<@id>"]               (accept a wager)',
-    'challenge -> args: ["<@id>", "<amount>", "<terms>"]',
-    'yield   -> args: ["<challenge_id>"]      (surrender a challenge)',
-    'award   -> args: ["<challenge_id>", "<@winner_id>"] (declare winner of a challenge)',
-    'buy     -> args: ["<SYMBOL>", "<shares>"] OR args: ["item", "<item_id>"]',
-    'sell    -> args: ["<SYMBOL>", "<shares>"]',
-    'bounty  -> args: ["list"] OR ["post", "<amount>", "<task>"] OR ["award", "<bounty_id>", "<@user>"]',
-    'trade   -> args: ["<@id>", "<my_item_id>", "for", "<their_item_id>"]',
-    'tradea  -> args: ["<trade_id>"] (accept trade) | traded -> args: ["<trade_id>"] (decline)',
-    'auction -> args: ["list"] OR ["start", "<item_id>"] OR ["bid", "<auction_key>", "<amt>"]',
-    'forge   -> args: ["<emoji>", "<name>"] (Costs 2000 coins to forge a custom item)',
-    'setname -> args: ["<name>"] (Costs 50,000 Botcoins. Sets a custom activation name.)',
-    'addmoney -> args: ["<@id>", "<amount>"] (Admin ONLY - Jaguar)',
-    'removemoney -> args: ["<@id>", "<amount>"] (Admin ONLY - Jaguar)',
+    ...COMMAND_DOCS,
     '',
     'RULES:',
     '- wager/pay/rob/trade REQUIRE a real <@id> from MENTIONED USERS. If none -> action="ask" for clarification.',
