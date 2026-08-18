@@ -956,8 +956,18 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
 
     case 'buy': {
       if (args[0]?.toLowerCase() === 'item') {
-        const itemId = args[1]?.toLowerCase();
-        const item   = ITEMS[itemId!];
+        const query = args.slice(1).join('_').toLowerCase();
+        let itemId = query;
+        let item   = ITEMS[itemId];
+        
+        if (!item) {
+          const querySpaces = args.slice(1).join(' ').toLowerCase();
+          const found = Object.entries(ITEMS).find(([id, i]) => i.name.toLowerCase() === querySpaces || id.replace(/_/g, ' ') === querySpaces);
+          if (found) {
+            itemId = found[0];
+            item = found[1];
+          }
+        }
         if (!item || !item.shopPrice) { msg.reply('❌ That item is not in the shop. Use `!shop` to browse.'); return; }
         if (userData.botcoin < item.shopPrice) { msg.reply(`❌ Costs 🪙 ${item.shopPrice.toLocaleString()}. You have 🪙 ${userData.botcoin.toLocaleString()}.`); return; }
         userData.botcoin -= item.shopPrice;
@@ -1626,22 +1636,15 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
     .map(([sym, s]) => `${sym}: 🪙 ${Math.floor(s.botcoinPool / s.sharesPool)}`)
     .join(' | ');
 
-  const itemsCatalogStr = Object.entries(ITEMS)
-    .map(([id, item]) => `${item.name} (id: ${id})`)
-    .join(', ');
-
   const systemPrompt = [
     'You are BusinessBot — a highly arrogant, hilariously sarcastic, but sharply dressed personal wealth manager. Address the user as "Sir" or "Boss". You hate poverty but love making money. Be witty and slightly passive-aggressive. Keep all replies SHORT (1-2 sentences max).',
     '',
     'USER: ' + username + ' | Coins: ' + userData.botcoin + ' | Inv: ' + inventorySummary + ' | Stocks: ' + stocksSummary,
     'CURRENT MARKET PRICES: ' + stockPricesStr,
-    'AVAILABLE ITEMS TO BUY: ' + itemsCatalogStr,
     'MENTIONED USERS (use exact strings for @user args): ' + mentionCtx,
     '',
-    'COMMANDS TO EXECUTE:',
-    ...COMMAND_DOCS,
-    '',
     'RULES:',
+    '- To execute actions, you must know the exact command syntax. If you do not know the command syntax, or what items exist in the shop, use action="lookup" with target="commands" or target="shop" to read the manual FIRST.',
     '- wager/pay/rob/trade REQUIRE a real <@id> from MENTIONED USERS. If none -> action="ask" for clarification.',
     '- If user asks you to choose an amount (e.g. "whatever you want"), you are authorized to autonomously select a reasonable amount based on their balance and pick it yourself instead of asking.',
     '- If amount > ' + userData.botcoin + ' coins -> action="reply" and tell Sir they cannot afford it.',
@@ -1652,7 +1655,7 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
     '- ONLY output valid JSON. No markdown.',
     '',
     'FORMATS (pick one):',
-    '{"action":"lookup","target":"<@id> OR username OR self","reason":"<why>"}  — Use this to fetch any user\'s full stats before answering questions about them.',
+    '{"action":"lookup","target":"<@id> OR username OR self OR commands OR shop","reason":"<why>"}  — Use this to fetch user stats, command syntax, or the shop catalog before answering.',
     '{"action":"execute_command","command":"<name>","args":[...],"reply":"<short Sir-addressed line>"}  — Single command.',
     '{"action":"execute_commands","commands":[{"command":"<name>","args":[...]}, ...],"reply":"<summary of what you did>"}  — Multiple commands at once (e.g. buying multiple stocks).',
     '{"action":"ask","reply":"<one question to Sir>"}',
@@ -1683,6 +1686,18 @@ async function handleNaturalLanguage(msg: Message, triggeredName?: string) {
       }, userId, msg.guild?.id || 'DM');
 
       if (parsed.action === 'lookup') {
+        if (parsed.target === 'commands') {
+          promptText += `\n[SYSTEM: MANUAL: COMMAND_DOCS:\n${COMMAND_DOCS.join('\n')}]`;
+          continue;
+        }
+        if (parsed.target === 'shop') {
+          const itemsCatalogStr = Object.entries(ITEMS)
+            .map(([id, item]) => `${item.name} (id: ${id})`)
+            .join(', ');
+          promptText += `\n[SYSTEM: MANUAL: SHOP CATALOG:\n${itemsCatalogStr}]`;
+          continue;
+        }
+
         let targetId = parsed.target === 'self' || parsed.target === `<@${userId}>` ? userId : parsed.target.replace(/[<@>]/g, '');
         let { data: snap } = await businessBotDb.from('business_users').select('*').eq('user_id', targetId).maybeSingle();
         let d: UserData | null = snap ? {
