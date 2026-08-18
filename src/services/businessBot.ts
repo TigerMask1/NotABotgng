@@ -44,6 +44,8 @@ const ITEMS: Record<string, ItemDef> = {
   hacker_kit:     { name: 'Hacker Kit',      emoji: '💻', value: 1_200,  rarity: 'rare',   shopPrice: 2_000, description: 'Double !daily once' },
   golden_ticket:  { name: 'Golden Ticket',   emoji: '🎟️', value: 500,    rarity: 'common' },
   crystal_ball:   { name: 'Crystal Ball',    emoji: '🔮', value: 4_000,  rarity: 'epic',   shopPrice: 6_000, description: 'Reveal stock trends before investing' },
+  private_island: { name: 'Private Island',  emoji: '🏝️', value: 100_000_000_000, rarity: 'legendary', shopPrice: 100_000_000_000, description: 'The ultimate flex. (Trillionaire Tier)' },
+  space_station:  { name: 'Space Station',   emoji: '🛰️', value: 1_000_000_000_000, rarity: 'legendary', shopPrice: 1_000_000_000_000, description: 'You own orbit. (Trillionaire Tier)' },
 };
 
 // ── STOCK MARKET ─────────────────────────────────────────────────────────────
@@ -66,9 +68,15 @@ const STOCKS: Record<string, Stock> = {
 // Tick stock prices every 10 minutes
 async function tickStocks() {
   for (const [sym, s] of Object.entries(STOCKS)) {
-    const drift  = s.trend * 0.02;
+    const baseDrift = s.trend * 0.02;
+    // Market gravity: The higher the price, the stronger the downward pull.
+    // Base log10(1,000) = 3. Anything above 1,000 starts feeling gravity.
+    // At 1,000,000 (log10=6), gravity is 0.015 (1.5% decay per tick), which will crush any positive trend.
+    const gravity = s.price > 1000 ? Math.max(0, (Math.log10(s.price) - 3) * 0.005) : 0;
+    const netDrift = baseDrift - gravity;
+    
     const shock  = (Math.random() - 0.5) * 2 * s.volatility;
-    const change = drift + shock;
+    const change = netDrift + shock;
     s.price = Math.max(10, Math.round(s.price * (1 + change)));
   }
   // Persist updated prices to Firebase
@@ -428,6 +436,24 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
 
       userData.inventory['mystery_box'] = (userData.inventory['mystery_box'] || 0) + 1;
       userData.botcoin   += dailyAmt + interest + bonus;
+      
+      // Progressive Wealth Tax
+      let taxAmt = 0;
+      let taxBracket = '';
+      if (userData.netWorth > 1_000_000_000_000) {
+        taxAmt = Math.floor(userData.botcoin * 0.02); // 2% of liquid botcoin
+        taxBracket = 'Trillionaire (2%)';
+      } else if (userData.netWorth > 1_000_000_000) {
+        taxAmt = Math.floor(userData.botcoin * 0.01); // 1%
+        taxBracket = 'Billionaire (1%)';
+      } else if (userData.netWorth > 10_000_000) {
+        taxAmt = Math.floor(userData.botcoin * 0.005); // 0.5%
+        taxBracket = 'Millionaire (0.5%)';
+      }
+      if (taxAmt > 0) {
+        userData.botcoin -= taxAmt;
+      }
+
       userData.lastDaily  = now;
       userData.totalEarned += dailyAmt + interest + bonus;
       addXP(userData, 30 + streak * 5);
@@ -442,8 +468,8 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
           { name: '📈 Interest', value: `🪙 ${interest.toLocaleString()}`,  inline: true },
           { name: streak >= 7 ? '🔥 Streak Bonus' : '⚡ Streak', value: `🪙 ${streakBonus.toLocaleString()} (day ${streak})`, inline: true },
         )
-        .setDescription(`You also got a **Mystery Box 🎁**! Use \`!open box\` to see what's inside.\n${bonus > 0 ? '🖥️ **Hacker Kit** doubled your daily!' : ''}`)
-        .setFooter({ text: `Balance: 🪙 ${userData.botcoin.toLocaleString()} | New worth: 🪙 ${userData.netWorth.toLocaleString()}` });
+        .setDescription(`You also got a **Mystery Box 🎁**! Use \`!open box\` to see what's inside.\n${bonus > 0 ? '🖥️ **Hacker Kit** doubled your daily!\n' : ''}${taxAmt > 0 ? `📉 **Wealth Tax Paid:** 🪙 ${taxAmt.toLocaleString()} (${taxBracket})` : ''}`)
+        .setFooter({ text: `Balance: 🪙 ${userData.botcoin.toLocaleString()} | Net worth: 🪙 ${userData.netWorth.toLocaleString()}` });
       msg.reply({ embeds: [embed] });
       break;
     }
@@ -903,7 +929,16 @@ async function handleCommand(msg: Message, command: string, args: string[], isNl
         userData.inventory[itemId!] = (userData.inventory[itemId!] || 0) + 1;
         addXP(userData, 30);
         await saveUser(userId, userData);
-        msg.reply(`🛒 Bought ${item.emoji} **${item.name}** for 🪙 ${item.shopPrice.toLocaleString()}!`);
+        
+        if (itemId === 'private_island' || itemId === 'space_station') {
+          const flexEmbed = new EmbedBuilder()
+            .setColor(0xff0000)
+            .setTitle('🚨 GLOBAL WEALTH ALERT 🚨')
+            .setDescription(`**${username}** just dropped 🪙 **${item.shopPrice.toLocaleString()}** to buy a ${item.emoji} **${item.name}**!\n\n*What an absolute flex. They officially have too much money.*`);
+          msg.channel.send({ embeds: [flexEmbed] });
+        } else {
+          msg.reply(`🛒 Bought ${item.emoji} **${item.name}** for 🪙 ${item.shopPrice.toLocaleString()}!`);
+        }
         break;
       }
 
