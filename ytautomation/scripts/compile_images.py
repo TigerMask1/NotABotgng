@@ -118,7 +118,7 @@ def gen_vid(filename, output_path="../vertical_short.mp4"):
             if os.path.exists(clip_path):
                 try:
                     vid_clip = VideoFileClip(clip_path)
-                    vid_duration = min(vid_clip.duration, 2.5)  # cap clips at 2.5s for fast pace
+                    vid_duration = min(vid_clip.duration, 6.0)  # cap clips at 6s as a safety fallback
                     vid_clip = vid_clip.subclip(0, vid_duration).set_start(current_time)
                     vid_clip = vid_clip.resize(width=VIDEO_W).set_position('center')
                     if vid_clip.audio is not None:
