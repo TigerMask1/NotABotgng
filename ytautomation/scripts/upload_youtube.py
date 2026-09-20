@@ -14,14 +14,14 @@ def get_discord_invite():
     return invite if invite else "https://discord.gg/example"
 
 
-def upload_video():
-    client_id = os.environ.get("YOUTUBE_CLIENT_ID")
-    client_secret = os.environ.get("YOUTUBE_CLIENT_SECRET")
-    refresh_token = os.environ.get("YOUTUBE_REFRESH_TOKEN")
+def upload_video(video_path=None, title=None, script_path=None):
+    client_id = os.environ.get("YT_CLIENT_ID") or os.environ.get("YOUTUBE_CLIENT_ID")
+    client_secret = os.environ.get("YT_CLIENT_SECRET") or os.environ.get("YOUTUBE_CLIENT_SECRET")
+    refresh_token = os.environ.get("YT_REFRESH_TOKEN") or os.environ.get("YOUTUBE_REFRESH_TOKEN")
 
     if not all([client_id, client_secret, refresh_token]):
-        print("Missing YOUTUBE credentials in environment variables.")
-        exit(1)
+        print("Missing YOUTUBE credentials in environment variables. Skipping upload.")
+        return False
 
     # Reconstruct credentials using refresh token
     creds = Credentials(
@@ -34,22 +34,23 @@ def upload_video():
 
     youtube = build('youtube', 'v3', credentials=creds)
 
-    video_path = os.path.join(os.path.dirname(__file__), "..", "vertical_short.mp4")
+    if video_path is None:
+        video_path = os.path.join(os.path.dirname(__file__), "..", "vertical_short.mp4")
     if not os.path.exists(video_path):
         print(f"File not found: {video_path}")
-        exit(1)
+        return False
 
-    print("Uploading to YouTube Shorts...")
+    print(f"Uploading to YouTube Shorts: {os.path.basename(video_path)}...")
     
     # Dynamic title extraction from the generated script
-    title = "OMG IS THIS EVEN A BOT?! 🤖🔥 #shorts" # fallback
-    script_path = os.path.join(os.path.dirname(__file__), "..", "assets", "example", "generated_script.txt")
-    if os.path.exists(script_path):
-        with open(script_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("# TITLE:"):
-                    title = line.replace("# TITLE:", "").strip()
-                    break
+    if title is None:
+        title = "OMG IS THIS EVEN A BOT?! 🤖🔥 #shorts" # fallback
+        if script_path and os.path.exists(script_path):
+            with open(script_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("# TITLE:"):
+                        title = line.replace("# TITLE:", "").strip()
+                        break
     discord_invite = get_discord_invite()
     description = f"NOTABOT roasts another victim! 💀🔥 Join the chaos on Discord: {discord_invite}\n\n#discord #memes #beluga #notabot #roast #shorts"
 

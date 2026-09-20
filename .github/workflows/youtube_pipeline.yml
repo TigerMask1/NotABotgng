@@ -2,8 +2,8 @@ name: YouTube Automation Pipeline
 
 on:
   schedule:
-    # Run 5 times a day: 00:00, 04:00, 10:00, 16:00, 20:00 (UTC)
-    - cron: '0 0,4,10,16,20 * * *'
+    # Run once a day at 10:00 UTC (3:30pm IST)
+    - cron: '0 10 * * *'
   workflow_dispatch: # Allow manual triggers
 
 jobs:
@@ -20,31 +20,60 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
           
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
+          
+      - name: Install Python dependencies
+        run: |
           python -m pip install --upgrade pip
           pip install -r ytautomation/requirements.txt
           
       - name: Create .env file from secrets
         run: |
-          cd ytautomation
-          echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> .env
-          echo "NOTABOT_SUPABASE_URL=${{ secrets.NOTABOT_SUPABASE_URL }}" >> .env
-          echo "NOTABOT_SUPABASE_SERVICE_KEY=${{ secrets.NOTABOT_SUPABASE_SERVICE_KEY }}" >> .env
-          echo "YT_CLIENT_ID=${{ secrets.YT_CLIENT_ID }}" >> .env
-          echo "YT_CLIENT_SECRET=${{ secrets.YT_CLIENT_SECRET }}" >> .env
-          echo "YT_REFRESH_TOKEN=${{ secrets.YT_REFRESH_TOKEN }}" >> .env
+          cat > ytautomation/.env <<EOF
+          GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
+          NOTABOT_SUPABASE_URL=${{ secrets.NOTABOT_SUPABASE_URL }}
+          NOTABOT_SUPABASE_SERVICE_KEY=${{ secrets.NOTABOT_SUPABASE_SERVICE_KEY }}
+          YT_CLIENT_ID=${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET=${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN=${{ secrets.YT_REFRESH_TOKEN }}
+          DISCORD_SERVER_INVITE=${{ secrets.DISCORD_SERVER_INVITE }}
+          EOF
           
-      - name: Run Pipeline (Shorts only)
+      - name: Run Pipeline & Upload to YouTube
         run: |
           cd ytautomation/scripts
           python daily_pipeline.py --shorts-only
           
-      - name: Upload Output Artifacts
+          # Upload each generated short to YouTube
+          OUTPUT_DIR="../output/$(date +%Y-%m-%d)"
+          echo "Looking for shorts in $OUTPUT_DIR"
+          
+          for i in 01 02 03 04 05; do
+            VIDEO="$OUTPUT_DIR/short_${i}.mp4"
+            SCRIPT="$OUTPUT_DIR/short_${i}_script.txt"
+            if [ -f "$VIDEO" ]; then
+              echo "Uploading short_${i}..."
+              python -c "
+          import sys, os
+          sys.path.insert(0, '.')
+          from upload_youtube import upload_video
+          upload_video(
+              video_path='$VIDEO',
+              script_path='$SCRIPT' if os.path.exists('$SCRIPT') else None
+          )
+          "
+            else
+              echo "short_${i}.mp4 not found, skipping."
+            fi
+          done
+          
+      - name: Upload Output as Artifact (backup)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: youtube-shorts
+          name: youtube-shorts-${{ github.run_id }}
           path: ytautomation/output/
-          retention-days: 7
+          retention-days: 3
