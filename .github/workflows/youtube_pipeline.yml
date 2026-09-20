@@ -36,9 +36,9 @@ jobs:
           GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
           NOTABOT_SUPABASE_URL=${{ secrets.NOTABOT_SUPABASE_URL }}
           NOTABOT_SUPABASE_SERVICE_KEY=${{ secrets.NOTABOT_SUPABASE_SERVICE_KEY }}
-          YT_CLIENT_ID=${{ secrets.YT_CLIENT_ID }}
-          YT_CLIENT_SECRET=${{ secrets.YT_CLIENT_SECRET }}
-          YT_REFRESH_TOKEN=${{ secrets.YT_REFRESH_TOKEN }}
+          YOUTUBE_CLIENT_ID=${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET=${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN=${{ secrets.YOUTUBE_REFRESH_TOKEN }}
           DISCORD_SERVER_INVITE=${{ secrets.DISCORD_SERVER_INVITE }}
           EOF
           
