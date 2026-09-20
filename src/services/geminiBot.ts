@@ -1,7 +1,9 @@
 import * as fs from 'node:fs';
 import { Telemetry } from './telemetry.ts';
 
-const ACTIVE_MODEL = 'gemini-2.5-flash';
+// Model names — override via env vars without redeploying
+// e.g. GEMINI_ACTIVE_MODEL=gemini-2.5-flash in your .env
+const ACTIVE_MODEL = process.env.GEMINI_ACTIVE_MODEL || 'gemini-2.5-flash';
 const DEBUG_LOG_REQUESTS = process.env.DEBUG_LOG_REQUESTS === 'true';
 
 interface ImagePart { mimeType: string; data: string; }

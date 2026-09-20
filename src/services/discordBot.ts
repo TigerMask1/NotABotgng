@@ -22,9 +22,13 @@ const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 const DEBUG_LOG_REQUESTS = process.env.DEBUG_LOG_REQUESTS === 'true';
 
 // ── MODELS ───────────────────────────────────────────────────────
-const ACTIVE_MODEL  = 'gemini-3.1-flash-lite'; // every msg while engaged + ping triage — fast, cheap, decides like a human would
-const PASSIVE_MODEL = 'gemma-4-26b-a4b-it';    // 5-min huge-context scan of the channel it's interested in — slower, thinks it through
-const BG_MODEL      = 'gemma-4-31b-it';        // profiler / compress / history-log utility jobs (unrelated to the convo loop)
+// Override via env vars without redeploying:
+//   NOTABOT_ACTIVE_MODEL  — used for every message while engaged (fast + cheap)
+//   NOTABOT_PASSIVE_MODEL — used for 5-min background channel scans (smarter)
+//   NOTABOT_BG_MODEL      — used for utility jobs: profiler, compress, history
+const ACTIVE_MODEL  = process.env.NOTABOT_ACTIVE_MODEL  || 'gemini-2.5-flash-lite';
+const PASSIVE_MODEL = process.env.NOTABOT_PASSIVE_MODEL || 'gemini-2.5-flash';
+const BG_MODEL      = process.env.NOTABOT_BG_MODEL      || 'gemini-2.5-flash-lite';
 
 // ── VISION ───────────────────────────────────────────────────────
 // inline image data for a single Gemini multimodal call. base64 + mime type,
