@@ -284,9 +284,14 @@ CRITICAL REQUIREMENTS:
 3. VARIETY & VIBE: Make the premise unhinged. E.g. NOTABOT deleting the server because someone said he has zero rizz. ducky getting doxxed. fatas eating the RAM.
 4. HOOK: The first 3 messages must instantly drop the viewer into absolute chaos. No "hello guys". Just straight into screaming or a crazy claim.
 5. RAPID-FIRE MESSAGES: If a character is ranting, spam 5 short messages in a row rather than one paragraph! DO NOT re-write their name for every single line. Group consecutive messages under one name header.
-6. DURATION SPACINGS & SOUNDS: Append a duration and a SOUND NAME to EVERY SINGLE LINE using format: `$^<duration>#!<sound_name>`. Example: `IM COOKED$^1.5#!vine_boom` or `bro what rn$^2.0#!message`.
+6. TTS OPTIMIZATION (CRITICAL): These messages will be read out loud by highly expressive AI voices! Use strategic punctuation to manipulate the voice!
+   - Use ALL CAPS to make them scream/yell.
+   - Use ellipses (`...`) to make them hesitate or sound confused.
+   - Use phonetic spelling for funny sounds (`bruuuuh`, `naaaah`, `wait whattt`).
+   - KEEP MESSAGES SHORT. Long paragraphs ruin the pacing.
+7. DURATION SPACINGS & SOUNDS: Append a duration and a SOUND NAME to EVERY SINGLE LINE using format: `$^<duration>#!<sound_name>`. Example: `IM COOKED$^1.5#!vine_boom` or `bro what rn$^2.0#!message`.
    Available sounds: `message`, {sound_names}. Pick the sound that perfectly matches the emotion of the message!
-7. VIDEO CLIP INSERTS: Use MAX 1-2 CLIPs per script to show a reaction or b-roll. Format EXACTLY `# CLIP: <clip_name>`. 
+8. VIDEO CLIP INSERTS: Use MAX 1-2 CLIPs per script to show a reaction or b-roll. Format EXACTLY `# CLIP: <clip_name>`. 
    Available clips: {clip_names}. Pick the clip that perfectly matches the emotion!
 
 FORMAT EXAMPLE:

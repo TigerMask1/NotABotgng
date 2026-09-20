@@ -93,6 +93,11 @@ def make_shorts():
         if not ok:
             print(f"  ✗ Skipping short {i} due to script gen failure.")
             continue
+            
+        print("  Generating AI voices...")
+        script_src = os.path.join(ASSETS_DIR, 'example', 'generated_script.txt')
+        tts_dir = os.path.join(ASSETS_DIR, 'example', 'tts')
+        _run_py('generate_tts.py', ['--script_path', script_src, '--tts_dir', tts_dir])
 
         # 2. Compile (auto_main will also generate thumbnail — skip for shorts)
         ok = _run_py('auto_main.py', ['--no-thumbnail'])
@@ -106,7 +111,6 @@ def make_shorts():
         _save_output(src, f'short_{i:02d}.mp4')
 
         # Also save the script so you can reference what's in each short
-        script_src = os.path.join(ASSETS_DIR, 'example', 'generated_script.txt')
         _save_output(script_src, f'short_{i:02d}_script.txt')
 
     print(f"\n[daily] ✓ All {NUM_SHORTS} shorts complete.")
@@ -122,6 +126,11 @@ def make_long_video():
     if not ok:
         print("  ✗ Long video script generation failed. Aborting long video.")
         return
+        
+    print("  Generating AI voices...")
+    script_src = os.path.join(ASSETS_DIR, 'example', 'generated_long_script.txt')
+    tts_dir = os.path.join(ASSETS_DIR, 'example', 'tts')
+    _run_py('generate_tts.py', ['--script_path', script_src, '--tts_dir', tts_dir])
 
     # 2. Compile (auto_main will also generate thumbnail automatically)
     ok = _run_py('auto_main.py', ['--long'])

@@ -190,9 +190,16 @@ def gen_vid(filename, output_path="../vertical_short.mp4"):
         if len(parts) < 2:
             continue
             
-        duration_part = parts[1].split('#!')[0]
+        rest = parts[1]
+        
+        tts_file = None
+        if '#@' in rest:
+            rest, tts_file = rest.split('#@', 1)
+            tts_file = tts_file.strip()
+            
+        duration_part = rest.split('#!')[0]
         duration = float(duration_part)
-        tags = line.split('#!')[1:] if '#!' in line else []
+        tags = rest.split('#!')[1:] if '#!' in rest else []
         
         img_path = f"{input_folder}{image_idx:03d}.png"
         if os.path.exists(img_path):
@@ -236,10 +243,21 @@ def gen_vid(filename, output_path="../vertical_short.mp4"):
         image_idx += 1
         
         # Audio
+        # 1. Background pop sound for message
         default_snd = '../assets/sounds/mp3/message.mp3'
         if os.path.exists(default_snd):
             audio_clips.append(AudioFileClip(default_snd).set_start(current_time))
             
+        # 2. Add the generated TTS Voice
+        if tts_file:
+            tts_path = os.path.join(os.path.dirname(filename), "tts", tts_file)
+            if os.path.exists(tts_path):
+                try:
+                    audio_clips.append(AudioFileClip(tts_path).set_start(current_time))
+                except Exception as e:
+                    print(f"  [TTS ERR] Failed to load {tts_file}: {e}")
+                    
+        # 3. Add custom meme tags/sounds
         for tag in tags:
             tag = tag.strip()
             if not tag.startswith("zoom_") and tag != "tilt" and tag != "message":
