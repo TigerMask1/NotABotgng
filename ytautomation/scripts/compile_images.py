@@ -109,24 +109,26 @@ def gen_vid(filename, output_path="../vertical_short.mp4"):
             continue
             
         if line.startswith("# CLIP:"):
-            # Strip quotes, backticks, and whitespace Gemini sometimes wraps around the name
+            # Supports both flat names (old) and category/name paths (new dynamic system)
             clip_name = line.split(":", 1)[1].strip().strip("'`\"").strip()
+            # Try category/name.mp4 first, then flat clips/name.mp4
             clip_path = f"../assets/clips/{clip_name}.mp4"
+            if not os.path.exists(clip_path):
+                clip_path = f"../assets/clips/{clip_name}.webm"
             if os.path.exists(clip_path):
-                vid_clip = VideoFileClip(clip_path)
-                # Play fully (full time clip)
-                vid_duration = vid_clip.duration
-                vid_clip = vid_clip.subclip(0, vid_duration).set_start(current_time)
-                # Resize to fit width
-                vid_clip = vid_clip.resize(width=VIDEO_W).set_position('center')
-                # Extract audio from clip so it isn't overwritten by the final composite audio
-                if vid_clip.audio is not None:
-                    audio_clips.append(vid_clip.audio.set_start(current_time))
-                
-                clips.append(vid_clip)
-                current_time += vid_duration
+                try:
+                    vid_clip = VideoFileClip(clip_path)
+                    vid_duration = min(vid_clip.duration, 6.0)  # cap clips at 6s to keep pace
+                    vid_clip = vid_clip.subclip(0, vid_duration).set_start(current_time)
+                    vid_clip = vid_clip.resize(width=VIDEO_W).set_position('center')
+                    if vid_clip.audio is not None:
+                        audio_clips.append(vid_clip.audio.set_start(current_time))
+                    clips.append(vid_clip)
+                    current_time += vid_duration
+                except Exception as e:
+                    print(f"  [CLIP ERR] '{clip_name}' failed to load: {e}")
             else:
-                print(f"  [CLIP SKIP] '{clip_name}.mp4' not found — skipping this CLIP insert.")
+                print(f"  [CLIP SKIP] '{clip_name}' not found — skipping.")
             continue
             
         if line.startswith("#"):
@@ -171,6 +173,8 @@ def gen_vid(filename, output_path="../vertical_short.mp4"):
                 for tag in tags:
                     tag = tag.strip()
                     snd_path = f"../assets/sounds/mp3/{tag}.mp3"
+                    if not os.path.exists(snd_path):
+                        snd_path = f"../assets/sounds/mp3/{tag}.wav"
                     if os.path.exists(snd_path):
                         audio_clips.append(AudioFileClip(snd_path).set_start(current_time))
             
@@ -239,7 +243,10 @@ def gen_vid(filename, output_path="../vertical_short.mp4"):
         for tag in tags:
             tag = tag.strip()
             if not tag.startswith("zoom_") and tag != "tilt" and tag != "message":
+                # Supports both flat "sound" and category-relative "category/sound"
                 snd_path = f"../assets/sounds/mp3/{tag}.mp3"
+                if not os.path.exists(snd_path):
+                    snd_path = f"../assets/sounds/mp3/{tag}.wav"
                 if os.path.exists(snd_path):
                     audio_clips.append(AudioFileClip(snd_path).set_start(current_time))
         

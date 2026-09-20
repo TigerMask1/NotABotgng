@@ -220,6 +220,30 @@ def load_queue_payload():
     return payload
 
 
+def scan_assets():
+    categories = {'sounds': set(), 'clips': set()}
+    base_dir = os.path.join(os.path.dirname(__file__), '..', 'assets')
+    
+    sounds_dir = os.path.join(base_dir, 'sounds', 'mp3')
+    if os.path.exists(sounds_dir):
+        for item in os.listdir(sounds_dir):
+            if os.path.isdir(os.path.join(sounds_dir, item)):
+                categories['sounds'].add(item)
+    if not categories['sounds']: categories['sounds'].add('funny')
+
+    clips_dir = os.path.join(base_dir, 'clips')
+    if os.path.exists(clips_dir):
+        for item in os.listdir(clips_dir):
+            if os.path.isdir(os.path.join(clips_dir, item)):
+                categories['clips'].add(item)
+    if not categories['clips']: categories['clips'].add('funny')
+
+    return categories
+
+assets_meta = scan_assets()
+sound_categories = ", ".join(f"`{c}`" for c in assets_meta['sounds'])
+clip_categories = ", ".join(f"`{c}`" for c in assets_meta['clips'])
+
 prompt = f"""
 You are a scriptwriter for a viral, brainrot TikTok/YouTube {'channel' if IS_LONG else 'Shorts channel'}.
 Create fake Discord chat videos that feel like REAL, UNHINGED, chaotic group-chat drama.
@@ -251,10 +275,10 @@ CRITICAL REQUIREMENTS:
 3. VARIETY & VIBE: Make the premise unhinged. E.g. NOTABOT deleting the server because someone said he has zero rizz. ducky getting doxxed. fatas eating the RAM.
 4. HOOK: The first 3 messages must instantly drop the viewer into absolute chaos. No "hello guys". Just straight into screaming or a crazy claim.
 5. RAPID-FIRE MESSAGES: If a character is ranting, spam 5 short messages in a row rather than one paragraph! DO NOT re-write their name for every single line. Group consecutive messages under one name header.
-6. DURATION SPACINGS & SOUNDS: Append a duration and sound to the end of EVERY SINGLE LINE using format: `$^<duration>#!<sound>`. Example: `IM COOKED$^1.5#!vineboom` or `bro what rn$^2.0#!message`.
-   Valid sounds: `message`, `vineboom`, `error`, `explosion`, `scary`, `confusion`, `zap`, `pop`, `hehascome`, `hamburger`, `knock`, `typing`, `i_got_this`, `yeah_yeah_boy`, `fahh`, `among_us_sus`.
-7. VIDEO CLIP INSERTS: Use MAX 1-2 CLIPs per script. Format EXACTLY `# CLIP: name` (e.g. `# CLIP: aesthetic_living_room`). 
-   Valid clips: `aesthetic_birthday_decor`, `aesthetic_party_ideas`, `aesthetic_quotes`, `aesthetic_family_dinner`, `aesthetic_living_room`.
+6. DURATION SPACINGS & SOUNDS: Append a duration and a SOUND CATEGORY to EVERY SINGLE LINE using format: `$^<duration>#!<category>`. Example: `IM COOKED$^1.5#!funny` or `bro what rn$^2.0#!message`.
+   Valid sound categories: `message`, {sound_categories}. The script will automatically pick a random sound from that folder!
+7. VIDEO CLIP INSERTS: Use MAX 1-2 CLIPs per script to show a reaction or b-roll. Format EXACTLY `# CLIP: <category>`. 
+   Valid clip categories: {clip_categories}.
 
 FORMAT EXAMPLE:
 # TITLE: MY DISCORD BOT HAS ZERO RIZZ 💀😭 #shorts
@@ -262,17 +286,19 @@ FORMAT EXAMPLE:
 
 ducky:
 bro you cant just say that$^1.5#!message
-you are literally cooked rn$^1.5#!vineboom
-she blocked you instantly$^2.0#!scary
+you are literally cooked rn$^1.5#!funny
+she blocked you instantly$^2.0#!dramatic
 
 NOTABOT:
-SKILL ISSUE$^1.5#!hehascome
-I WAS MEWING$^2.0#!explosion
+SKILL ISSUE$^1.5#!funny
+I WAS MEWING$^2.0#!funny
 L MANS$^1.5#!message
-UR JUST MAD I HAVE MORE RIZZ$^2.0#!yeah_yeah_boy
+UR JUST MAD I HAVE MORE RIZZ$^2.0#!funny
 
 dumby:
-what is a rizz$^2.0#!confusion
+what is a rizz$^2.0#!funny
+
+# CLIP: funny
 
 # LORE_UPDATE: NOTABOT thinks he has rizz but actually just got blocked.
 
@@ -380,34 +406,38 @@ def main(argv=None):
                 if '#!' not in line:
                     line = f"{line}#!message"
                     
-            # Sanitize sound effects (Gemini often hallucinates these despite prompt instructions)
+            import random
+            # Resolve clip categories
+            if line.startswith('# CLIP:'):
+                category = line.split(':', 1)[1].strip().strip("'`\"")
+                clip_folder = os.path.join(os.path.dirname(__file__), "..", "assets", "clips", category)
+                if os.path.exists(clip_folder) and os.path.isdir(clip_folder):
+                    files = [f for f in os.listdir(clip_folder) if f.endswith('.mp4') or f.endswith('.webm')]
+                    if files:
+                        chosen = random.choice(files)
+                        # write the relative path inside the clips folder, e.g. funny/my_clip
+                        # strip extension because compile_images.py adds .mp4 (or handles it)
+                        name_no_ext = os.path.splitext(chosen)[0]
+                        line = f"# CLIP: {category}/{name_no_ext}"
+
+            # Sanitize sound effects (resolve category to random sound)
             if '#!' in line:
                 parts = line.split('#!')
                 sound = parts[1].strip()
                 
-                # Map common hallucinations to real sounds
-                sound_map = {
-                    'discord_join': 'join',
-                    'discord_leave': 'leave',
-                    'discord_message': 'message',
-                    'discord_ping': 'message',
-                    'vine_boom': 'vineboom',
-                    'bruh': 'confusion',
-                    'punch': 'zap'
-                }
-                if sound in sound_map:
-                    sound = sound_map[sound]
-                    
-                # If it's still not a valid sound, default to message or remove it
-                valid_sounds = [
-                    'click', 'confusion', 'error', 'explosion', 'hamburger', 'hehascome',
-                    'join', 'knock', 'leave', 'message', 'modeugene', 'modpablo', 'pop',
-                    'scary', 'softmessage', 'typing', 'vineboom', 'zap',
-                    'i_got_this', 'yeah_yeah_boy', 'fahh', 'among_us_sus'
-                ]
-                if sound not in valid_sounds:
-                    sound = 'message'  # fallback
-                    
+                if sound != 'message':
+                    sound_folder = os.path.join(os.path.dirname(__file__), "..", "assets", "sounds", "mp3", sound)
+                    if os.path.exists(sound_folder) and os.path.isdir(sound_folder):
+                        files = [f for f in os.listdir(sound_folder) if f.endswith('.mp3')]
+                        if files:
+                            chosen = random.choice(files)
+                            name_no_ext = os.path.splitext(chosen)[0]
+                            sound = f"{sound}/{name_no_ext}"
+                        else:
+                            sound = 'message'
+                    else:
+                        sound = 'message'
+                        
                 line = f"{parts[0]}#!{sound}"
                     
             # Ensure proper blank line before new character (if missing)
