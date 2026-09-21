@@ -275,7 +275,7 @@ function getProactiveState(channelId: string): ProactiveState {
 // window — handleDirectMessage clears this the moment a reply actually
 // lands, which is what lets the bot "stay" on someone who responds instead
 // of hopping away from a person who's actually engaging.
-interface ColdOpenState { lastPingAt: number; pending: boolean; hopTimer: NodeJS.Timeout | null; }
+interface ColdOpenState { lastPingAt: number; pending: boolean; hopTimer: NodeJS.Timeout | null; strikes: number; }
 const coldOpenStates = new Map<string, ColdOpenState>();
 let coldOpenTargetUserId: string | null = null; // who it's currently "on" — null when nobody's pending
 
@@ -286,7 +286,10 @@ function clearColdOpenHop(userId: string) {
     s.hopTimer = null;
     Telemetry.track('COLD_OPEN_SUCCESS', { targetId: userId }, userId);
   }
-  if (s) s.pending = false;
+  if (s) {
+    s.pending = false;
+    s.strikes = 0; // they replied, reset ghosting strikes
+  }
   if (coldOpenTargetUserId === userId) { coldOpenTargetUserId = null; updatePresence(); }
 }
 
@@ -376,7 +379,11 @@ async function getColdOpenCandidates(): Promise<ColdOpenCandidate[]> {
       if (newSeenIds.has(m.authorId)) continue;
       if (coldOpenTargetUserId === m.authorId) continue;
       const hopState = coldOpenStates.get(m.authorId);
-      if (hopState && now - hopState.lastPingAt < COLD_OPEN_USER_COOLDOWN_MS) continue;
+      if (hopState) {
+        // if they've ghosted 3+ times, back off for 14 days instead of 1 day
+        const cooldown = (hopState.strikes >= 3) ? 14 * 24 * 60 * 60_000 : COLD_OPEN_USER_COOLDOWN_MS;
+        if (now - hopState.lastPingAt < cooldown) continue;
+      }
       const recencyMs = now - m.ts;
       if (recencyMs > NEW_RECENT_WINDOW_MS) continue; // too stale, skip
 
@@ -414,7 +421,10 @@ async function getColdOpenCandidates(): Promise<ColdOpenCandidate[]> {
       if (newSeenIds.has(member.id)) continue;
       if (coldOpenTargetUserId === member.id) continue;
       const hopState = coldOpenStates.get(member.id);
-      if (hopState && now - hopState.lastPingAt < COLD_OPEN_USER_COOLDOWN_MS) continue;
+      if (hopState) {
+        const cooldown = (hopState.strikes >= 3) ? 14 * 24 * 60 * 60_000 : COLD_OPEN_USER_COOLDOWN_MS;
+        if (now - hopState.lastPingAt < cooldown) continue;
+      }
 
       const status = member.presence?.status;
       const online = status === 'online' || status === 'idle' || status === 'dnd';
@@ -458,7 +468,10 @@ async function getColdOpenCandidates(): Promise<ColdOpenCandidate[]> {
       if (recencyMs > COLD_OPEN_CANDIDATE_MAX_AGE_MS) continue;
       if (existing && existing.recencyMs <= recencyMs) continue;
       const hopState = coldOpenStates.get(m.authorId);
-      if (hopState && now - hopState.lastPingAt < COLD_OPEN_USER_COOLDOWN_MS) continue;
+      if (hopState) {
+        const cooldown = (hopState.strikes >= 3) ? 14 * 24 * 60 * 60_000 : COLD_OPEN_USER_COOLDOWN_MS;
+        if (now - hopState.lastPingAt < cooldown) continue;
+      }
       if (coldOpenTargetUserId === m.authorId) continue;
 
       const guild = botClient.guilds.cache.get(guildId);
@@ -3685,7 +3698,8 @@ async function runColdOpen() {
       let decision = await brain(brainOpts);
       decision = await executeBrainDecision({ decision, brainOpts, channel: targetChannel as any, channelId: chId, guildId: pick.guildId });
 
-      coldOpenStates.set(pick.userId, { lastPingAt: Date.now(), pending: false, hopTimer: null });
+      const existingStrikes = coldOpenStates.get(pick.userId)?.strikes || 0;
+      coldOpenStates.set(pick.userId, { lastPingAt: Date.now(), pending: false, hopTimer: null, strikes: existingStrikes });
 
       if (decision.action !== 'speak' || !decision.reply?.trim()) {
         console.log(`[ColdOpen] considered pinging ${pick.name} in #${targetChannel.name} — chose not to`);
@@ -3738,7 +3752,8 @@ async function runColdOpen() {
     let decision = await brain(brainOpts);
     decision = await executeBrainDecision({ decision, brainOpts, channel: dmChannel as any, channelId: dmChannelId, guildId: 'dm' });
 
-    coldOpenStates.set(pick.userId, { lastPingAt: Date.now(), pending: false, hopTimer: null });
+    const existingStrikes = coldOpenStates.get(pick.userId)?.strikes || 0;
+    coldOpenStates.set(pick.userId, { lastPingAt: Date.now(), pending: false, hopTimer: null, strikes: existingStrikes });
 
     if (decision.action !== 'speak' || !decision.reply?.trim()) {
       console.log(`[ColdOpen] considered ${pick.name} — chose not to open`);
@@ -3750,16 +3765,20 @@ async function runColdOpen() {
     coldOpenTargetUserId = pick.userId;
     updatePresence();
     const hopTimer = setTimeout(() => {
+      const s = coldOpenStates.get(pick.userId);
       if (coldOpenTargetUserId === pick.userId) {
-        console.log(`[ColdOpen] ${pick.name} didn't bite — hopping away`);
+        if (s) {
+          s.strikes = (s.strikes || 0) + 1;
+          console.log(`[ColdOpen] ${pick.name} didn't bite — hopping away (strike ${s.strikes})`);
+        }
         coldOpenTargetUserId = null;
         updatePresence();
       }
-      const s = coldOpenStates.get(pick.userId);
       if (s) s.hopTimer = null;
     }, COLD_OPEN_WAIT_FOR_REPLY_MS);
 
-    coldOpenStates.set(pick.userId, { lastPingAt: Date.now(), pending: true, hopTimer });
+    const existingStrikes = coldOpenStates.get(pick.userId)?.strikes || 0;
+    coldOpenStates.set(pick.userId, { lastPingAt: Date.now(), pending: true, hopTimer, strikes: existingStrikes });
     Telemetry.track('COLD_OPEN_START', { targetId: pick.userId }, pick.userId, 'dm');
     console.log(`[ColdOpen] opened DM with ${pick.name} (${pick.online ? 'online' : 'offline'}, from ${guildName}, isNew:${isNewPerson})`);
   } catch (e) {
