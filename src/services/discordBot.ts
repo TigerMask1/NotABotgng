@@ -11,6 +11,7 @@ import { queueConversationForYouTube } from './youtubeClipper.ts';
 import { pickBestClipWindow } from './clipSelection.ts';
 import * as selfLoop from './notabotSelfLoop.ts';
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 import * as vm from 'node:vm';
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
@@ -1232,8 +1233,9 @@ async function searchMemories(scope: 'server' | 'person', scopeId: string, query
 // compact prompt-ready dump of what's worth knowing right now for a server.
 async function buildMemCtx(guildId: string): Promise<string> {
   if (guildId === 'dm') return '';
+  const sticky = stickyNotes['server:' + guildId] ? 'STICKY NOTE (PERMANENT): ' + stickyNotes['server:' + guildId] + '\n' : '';
   const top = await getTopMemories('server', guildId, { limit: 20 });
-  if (!top.length) return '';
+  if (!top.length) return sticky;
   const byKind = new Map<string, string[]>();
   for (const m of top) {
     if (!byKind.has(m.kind)) byKind.set(m.kind, []);
@@ -3821,7 +3823,6 @@ async function runColdOpen() {
       if (s) s.hopTimer = null;
     }, COLD_OPEN_WAIT_FOR_REPLY_MS);
 
-    const existingStrikes = coldOpenStates.get(pick.userId)?.strikes || 0;
     coldOpenStates.set(pick.userId, { lastPingAt: Date.now(), pending: true, hopTimer, strikes: existingStrikes });
     Telemetry.track('COLD_OPEN_START', { targetId: pick.userId }, pick.userId, 'dm');
     console.log(`[ColdOpen] opened DM with ${pick.name} (${pick.online ? 'online' : 'offline'}, from ${guildName}, isNew:${isNewPerson})`);
@@ -3845,7 +3846,7 @@ async function handleDirectMessage(msg: Message) {
   if (coldOpenTargetUserId === msg.author.id) clearColdOpenHop(msg.author.id);
 
   // place a 24-hour cold open cooldown on anyone we have a natural DM conversation with
-  coldOpenStates.set(msg.author.id, { lastPingAt: Date.now(), pending: false, hopTimer: null });
+  coldOpenStates.set(msg.author.id, { lastPingAt: Date.now(), pending: false, hopTimer: null, strikes: 0 });
 
   // Update relationship on incoming message
   const rel = await getDMRelationship(msg.author.id);
