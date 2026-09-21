@@ -245,6 +245,10 @@ const ADMIN_ID = '1296109674361520146';
 // per-server mute: server admins (anyone with Administrator perm) can !stop / !resume the bot
 // in their own server without affecting other servers. stored in-memory + persisted to Firebase.
 const serverMuted = new Map<string, boolean>();
+const globalBoundariesFile = path.join(process.cwd(), 'global_boundaries.json');
+const globalBoundaries = new Set<string>();
+try { if (fs.existsSync(globalBoundariesFile)) { JSON.parse(fs.readFileSync(globalBoundariesFile, 'utf-8')).forEach((id: string) => globalBoundaries.add(id)); } } catch (e) {}
+function saveBoundaries() { fs.writeFileSync(globalBoundariesFile, JSON.stringify([...globalBoundaries])); }
 const serverFamilyFriendly = new Map<string, boolean>();
 
 // per-server "which other bots am i allowed to see" — empty/missing set = ignore
@@ -377,6 +381,7 @@ async function getColdOpenCandidates(): Promise<ColdOpenCandidate[]> {
     for (const m of [...msgs].reverse()) {
       if (m.authorId === BOT_ID || !m.authorId) continue;
       if (newSeenIds.has(m.authorId)) continue;
+      if (globalBoundaries.has(m.authorId)) continue;
       if (coldOpenTargetUserId === m.authorId) continue;
       const hopState = coldOpenStates.get(m.authorId);
       if (hopState) {
@@ -419,6 +424,7 @@ async function getColdOpenCandidates(): Promise<ColdOpenCandidate[]> {
     for (const member of guild.members.cache.values()) {
       if (member.user.bot || member.id === BOT_ID) continue;
       if (newSeenIds.has(member.id)) continue;
+      if (globalBoundaries.has(member.id)) continue;
       if (coldOpenTargetUserId === member.id) continue;
       const hopState = coldOpenStates.get(member.id);
       if (hopState) {
@@ -463,6 +469,7 @@ async function getColdOpenCandidates(): Promise<ColdOpenCandidate[]> {
     for (const m of [...msgs].reverse()) {
       if (m.authorId === BOT_ID || !m.authorId) continue;
       if (newSeenIds.has(m.authorId)) continue; // already in Layer 1, don't duplicate
+      if (globalBoundaries.has(m.authorId)) continue;
       const existing = seen.get(m.authorId);
       const recencyMs = now - m.ts;
       if (recencyMs > COLD_OPEN_CANDIDATE_MAX_AGE_MS) continue;
@@ -1331,12 +1338,14 @@ async function notePersonState(userId: string, note: string, guildName: string) 
 // regardless of which server or DM it's happening in.
 async function getPersonalCtx(userId: string): Promise<string> {
   if (!userId) return '';
+  const boundaryCtx = globalBoundaries.has(userId) ? 'CRITICAL: This user told you they NEVER want you to talk to them again (you have them globally opted out). If they just messaged you, call them out on it (e.g. "i thought you hated me", "why are you talking to me"). Do not cold-open them.' : '';
   const top = await getTopMemories('person', userId, { limit: 15 });
-  if (!top.length) return '';
+  if (!top.length) return boundaryCtx;
   const about = top.filter(m => m.kind === 'about');
   const state = top.filter(m => m.kind === 'state');
   const other = top.filter(m => m.kind !== 'about' && m.kind !== 'state');
   const lines: string[] = [];
+  if (boundaryCtx) lines.push(boundaryCtx);
   if (about.length) lines.push(`about them: ${about.map(m => m.text).join('; ')}`);
   if (state.length) lines.push(`going on with them lately: ${state.map(m => `${m.text}${m.sourceLabel ? ` (from ${m.sourceLabel})` : ''}`).join('; ')}`);
   if (other.length) lines.push(other.map(m => `${m.kind}: ${m.text}`).join('; '));
@@ -1902,7 +1911,7 @@ async function runWeeklyNPC() {
 }
 
 // ── COMMAND EXECUTION ─────────────────────────────────────────────
-type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'get_channel_info' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'get_cross_server' | 'set_reminder' | 'create_poll' | 'wiki_lookup' | 'start_event' | 'get_leaderboard' | 'start_game' | 'play_chess_move' | 'djs_script' | 'resolve_intent' | 'youtube_clip' | 'start_recording' | 'stop_recording' | 'react_to_message' | 'none';
+type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'get_channel_info' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'get_cross_server' | 'set_reminder' | 'create_poll' | 'wiki_lookup' | 'start_event' | 'get_leaderboard' | 'start_game' | 'play_chess_move' | 'djs_script' | 'resolve_intent' | 'youtube_clip' | 'start_recording' | 'stop_recording' | 'react_to_message' | 'set_boundary' | 'none';
 
 async function executeCommand(
   command: BotCommand,
@@ -2134,6 +2143,20 @@ async function executeCommand(
       };
       await queueConversationForYouTube(payload);
       return `Captured ${rec.messages.length} messages from the live recording. Queued for YouTube. Mode: ${payload.clipMode}`;
+    }
+    case 'set_boundary': {
+      const target = args.targetUserId;
+      const state = args.state;
+      if (!target) return 'missing targetUserId';
+      if (state === 'opt_out') {
+        globalBoundaries.add(target);
+        saveBoundaries();
+        return 'User opted out successfully.';
+      } else {
+        globalBoundaries.delete(target);
+        saveBoundaries();
+        return 'User opt-out removed.';
+      }
     }
     case 'react_to_message': {
       // Passive emoji reaction to a specific message — for watching mode.
@@ -2367,6 +2390,7 @@ COMMANDS YOU CAN RUN (include in JSON when needed, "none" otherwise):
 - youtube_clip: queue the current conversation window for a YouTube video. YOU decide when to do this. args: { mode?: "normal" | "unhinged" }. if you set mode to "unhinged", the resulting clip will rewrite your lines to be chaotic, caps-lock heavy, poor grammar, and extra emojis/gifs (but not spammy). the full flow: spot something clip-worthy → ask casually in your reply ("can i clip this for a vid" or similar, nothing formal) → set intent { what: "clip if they agreed", triggerType: "next_turn" } → on the next brain call you see their actual reply and make the judgment yourself: run youtube_clip if they were good with it, ignore if they said no. nobody replied? passive tick will surface your intent and you decide then. you can also scout OLD conversations: run get_history with a time range, read the summary, then decide if it's worth clipping.
 - start_recording: start a live capture of the ongoing conversation — your call, no user command needed. use it when something is heating up and you want to catch everything from here forward. announce it naturally in your reply. args: {}
 - stop_recording: stop recording and queue what you captured. use when the moment's done or you have enough. args: { mode?: "normal" | "unhinged" }
+- set_boundary: if a user explicitly tells you to NEVER talk to them again ("leave me alone", "i hate you don't talk to me"), use this to globally opt them out of unprompted engagement. args: { targetUserId: "their exact id", state: "opt_out" | "normal" }
 - react_to_message: drop a silent emoji reaction on a specific past message — use SPARINGLY, only when the reaction genuinely fits (not every message, not a habit). this does NOT trigger a chat reply, it's silent. perfect for watching a funny convo play out without interrupting it. args: { msgId: "exact msgId shown in transcript, e.g. 1302847562718", emoji: "single emoji" }
 
 ═══ WHEN SOMEONE PINGS YOU TO CHECK OLD CHATS ═══
@@ -2442,7 +2466,7 @@ function parseBrainJSON(raw: string): BrainDecision | null {
       goal:            typeof p.goal     === 'string' ? p.goal.trim().slice(0, 120) : '',
       stayActive:      typeof p.stayActive === 'boolean' ? p.stayActive : true,
       think:           typeof p.think    === 'string' ? p.think.trim() : '',
-      command:         (['get_history','get_member','get_stm','get_video_status','get_channel_info','recall_memory','set_reminder','get_server_stats','get_time','web_search','get_cross_server','create_poll','wiki_lookup','start_event','get_leaderboard','start_game','play_chess_move','djs_script','resolve_intent','youtube_clip','start_recording','stop_recording','react_to_message','none'] as const).includes(p.command) ? p.command : 'none',
+      command:         (['get_history','get_member','get_stm','get_video_status','get_channel_info','recall_memory','set_reminder','get_server_stats','get_time','web_search','get_cross_server','create_poll','wiki_lookup','start_event','get_leaderboard','start_game','play_chess_move','djs_script','resolve_intent','youtube_clip','start_recording','stop_recording','react_to_message','set_boundary','none'] as const).includes(p.command) ? p.command : 'none',
       commandArgs:     p.commandArgs && typeof p.commandArgs === 'object' ? p.commandArgs : {},
       intent:          p.intent && typeof p.intent === 'object' ? p.intent : undefined,
       confidence:      typeof p.confidence === 'number' ? p.confidence : 1.0,
