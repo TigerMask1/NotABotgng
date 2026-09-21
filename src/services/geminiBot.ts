@@ -110,6 +110,7 @@ export class GeminiManager {
       }
     }
 
+    let currentModel = model;
     let lastError = '';
     const startTime = Date.now();
     const maxAttempts = Math.min(4, Math.max(this.keys.length, 1) * 2);
@@ -118,13 +119,19 @@ export class GeminiManager {
       if (!key) { lastError = 'no keys available'; throw new Error('[Gemini] no keys available'); }
       try {
         const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
+          `https://generativelanguage.googleapis.com/v1beta/models/${currentModel}:generateContent?key=${key}`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(requestBody),
           }
         );
+        if (res.status === 503 && currentModel !== 'gemini-3.1-flash-lite') {
+          console.warn(`[Gemini] 503 Service Unavailable on ${currentModel} — falling back to gemini-3.1-flash-lite immediately`);
+          currentModel = 'gemini-3.1-flash-lite';
+          attempt--; // don't burn an attempt on a fast fallback
+          continue;
+        }
         if (res.status === 429) {
           const body = await res.json().catch(() => ({})) as any;
           const retryMs = ((body?.error?.details?.[0]?.retryDelay?.seconds ?? 10) as number) * 1000;

@@ -245,6 +245,10 @@ const ADMIN_ID = '1296109674361520146';
 // per-server mute: server admins (anyone with Administrator perm) can !stop / !resume the bot
 // in their own server without affecting other servers. stored in-memory + persisted to Firebase.
 const serverMuted = new Map<string, boolean>();
+const stickyNotesFile = path.join(process.cwd(), 'sticky_notes.json');
+let stickyNotes: Record<string, string> = {};
+try { if (fs.existsSync(stickyNotesFile)) { stickyNotes = JSON.parse(fs.readFileSync(stickyNotesFile, 'utf-8')); } } catch (e) {}
+function saveStickyNotes() { fs.writeFileSync(stickyNotesFile, JSON.stringify(stickyNotes, null, 2)); }
 const globalBoundariesFile = path.join(process.cwd(), 'global_boundaries.json');
 const globalBoundaries = new Set<string>();
 try { if (fs.existsSync(globalBoundariesFile)) { JSON.parse(fs.readFileSync(globalBoundariesFile, 'utf-8')).forEach((id: string) => globalBoundaries.add(id)); } } catch (e) {}
@@ -685,7 +689,8 @@ function setMarker(channelId: string, markerId: string | null, pendingQuestionId
 // divider at the marker position, so the model can see exactly what's new
 // since it last actually acted, versus what it already addressed.
 function stmFormatWithMarker(msgs: STMsg[], channelId: string): string {
-  if (!msgs.length) return '(no messages yet)';
+  const sticky = stickyNotes['channel:' + channelId] ? 'STICKY NOTE (PERMANENT) FOR THIS ROOM: ' + stickyNotes['channel:' + channelId] + '\n\n' : '';
+  if (!msgs.length) return sticky + '(no messages yet)';
   const { markerId, pendingQuestionId } = getMarker(channelId);
   const now = Date.now();
   const lines: string[] = [];
@@ -709,7 +714,7 @@ function stmFormatWithMarker(msgs: STMsg[], channelId: string): string {
       lines.push(`>>> ── you've handled everything up to here — everything below is new since then ── <<<`);
     }
   }
-  return lines.join('\n');
+  return sticky + lines.join('\n');
 }
 
 function seedSTM(channelId: string, msgs: Message[]) {
@@ -1234,7 +1239,7 @@ async function buildMemCtx(guildId: string): Promise<string> {
     if (!byKind.has(m.kind)) byKind.set(m.kind, []);
     byKind.get(m.kind)!.push(m.text);
   }
-  return [...byKind.entries()].map(([kind, texts]) => `${kind}: ${texts.join(' | ')}`).join('\n');
+  return sticky + [...byKind.entries()].map(([kind, texts]) => `${kind}: ${texts.join(' | ')}`).join('\n');
 }
 
 // same idea, server-scoped semantic search — what recall_memory calls.
@@ -1911,7 +1916,7 @@ async function runWeeklyNPC() {
 }
 
 // ── COMMAND EXECUTION ─────────────────────────────────────────────
-type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'get_channel_info' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'get_cross_server' | 'set_reminder' | 'create_poll' | 'wiki_lookup' | 'start_event' | 'get_leaderboard' | 'start_game' | 'play_chess_move' | 'djs_script' | 'resolve_intent' | 'youtube_clip' | 'start_recording' | 'stop_recording' | 'react_to_message' | 'set_boundary' | 'none';
+type BotCommand = 'get_history' | 'get_member' | 'get_stm' | 'get_video_status' | 'get_channel_info' | 'recall_memory' | 'get_server_stats' | 'get_time' | 'web_search' | 'get_cross_server' | 'set_reminder' | 'create_poll' | 'wiki_lookup' | 'start_event' | 'get_leaderboard' | 'start_game' | 'play_chess_move' | 'djs_script' | 'resolve_intent' | 'youtube_clip' | 'start_recording' | 'stop_recording' | 'react_to_message' | 'set_boundary' | 'set_note' | 'none';
 
 async function executeCommand(
   command: BotCommand,
@@ -2143,6 +2148,19 @@ async function executeCommand(
       };
       await queueConversationForYouTube(payload);
       return `Captured ${rec.messages.length} messages from the live recording. Queued for YouTube. Mode: ${payload.clipMode}`;
+    }
+    case 'set_note': {
+      const { targetType, targetId, note } = args;
+      if (!targetType || !targetId || typeof note !== 'string') return 'missing args';
+      const key = targetType + ':' + targetId;
+      if (!note.trim()) {
+        delete stickyNotes[key];
+        saveStickyNotes();
+        return 'Sticky note cleared.';
+      }
+      stickyNotes[key] = note.trim();
+      saveStickyNotes();
+      return 'Sticky note saved permanently.';
     }
     case 'set_boundary': {
       const target = args.targetUserId;
@@ -2390,6 +2408,7 @@ COMMANDS YOU CAN RUN (include in JSON when needed, "none" otherwise):
 - youtube_clip: queue the current conversation window for a YouTube video. YOU decide when to do this. args: { mode?: "normal" | "unhinged" }. if you set mode to "unhinged", the resulting clip will rewrite your lines to be chaotic, caps-lock heavy, poor grammar, and extra emojis/gifs (but not spammy). the full flow: spot something clip-worthy → ask casually in your reply ("can i clip this for a vid" or similar, nothing formal) → set intent { what: "clip if they agreed", triggerType: "next_turn" } → on the next brain call you see their actual reply and make the judgment yourself: run youtube_clip if they were good with it, ignore if they said no. nobody replied? passive tick will surface your intent and you decide then. you can also scout OLD conversations: run get_history with a time range, read the summary, then decide if it's worth clipping.
 - start_recording: start a live capture of the ongoing conversation — your call, no user command needed. use it when something is heating up and you want to catch everything from here forward. announce it naturally in your reply. args: {}
 - stop_recording: stop recording and queue what you captured. use when the moment's done or you have enough. args: { mode?: "normal" | "unhinged" }
+- set_note: save a PERMANENT, sticky note about a person, server, or channel. it will ALWAYS be attached to them in the future. use this for critical preferences, rules, or core facts. if a note already exists, this overwrites it - so improve/append rather than creating a blind copy. args: { targetType: "person" | "channel" | "server", targetId: "exact id", note: "short, perfect note" }
 - set_boundary: if a user explicitly tells you to NEVER talk to them again ("leave me alone", "i hate you don't talk to me"), use this to globally opt them out of unprompted engagement. args: { targetUserId: "their exact id", state: "opt_out" | "normal" }
 - react_to_message: drop a silent emoji reaction on a specific past message — use SPARINGLY, only when the reaction genuinely fits (not every message, not a habit). this does NOT trigger a chat reply, it's silent. perfect for watching a funny convo play out without interrupting it. args: { msgId: "exact msgId shown in transcript, e.g. 1302847562718", emoji: "single emoji" }
 
@@ -2466,7 +2485,7 @@ function parseBrainJSON(raw: string): BrainDecision | null {
       goal:            typeof p.goal     === 'string' ? p.goal.trim().slice(0, 120) : '',
       stayActive:      typeof p.stayActive === 'boolean' ? p.stayActive : true,
       think:           typeof p.think    === 'string' ? p.think.trim() : '',
-      command:         (['get_history','get_member','get_stm','get_video_status','get_channel_info','recall_memory','set_reminder','get_server_stats','get_time','web_search','get_cross_server','create_poll','wiki_lookup','start_event','get_leaderboard','start_game','play_chess_move','djs_script','resolve_intent','youtube_clip','start_recording','stop_recording','react_to_message','set_boundary','none'] as const).includes(p.command) ? p.command : 'none',
+      command:         (['get_history','get_member','get_stm','get_video_status','get_channel_info','recall_memory','set_reminder','get_server_stats','get_time','web_search','get_cross_server','create_poll','wiki_lookup','start_event','get_leaderboard','start_game','play_chess_move','djs_script','resolve_intent','youtube_clip','start_recording','stop_recording','react_to_message','set_boundary','set_note','none'] as const).includes(p.command) ? p.command : 'none',
       commandArgs:     p.commandArgs && typeof p.commandArgs === 'object' ? p.commandArgs : {},
       intent:          p.intent && typeof p.intent === 'object' ? p.intent : undefined,
       confidence:      typeof p.confidence === 'number' ? p.confidence : 1.0,
