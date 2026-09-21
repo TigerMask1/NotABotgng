@@ -3544,10 +3544,21 @@ async function runProactiveEngagement() {
 
         if (decision.action === 'speak' && decision.reply?.trim()) {
           decision = { ...decision, reply: resolveMentionNames(decision.reply) };
-          ps.strikes = 0;
+          // ── GHOSTING FIX: increment strikes NOW (when bot speaks into silence)
+          // strikes only get *reset* in handleMessage when a human actually replies.
+          // This means 3 unanswered proactive messages → lostInterest, not 3 AI-skips.
+          ps.strikes++;
+          console.log(`[Proactive] fired in #${channelName} (${guild.name}) — quiet ${quietHours}h — unanswered strike ${ps.strikes}/${PROACTIVE_MAX_STRIKES}`);
+          if (ps.strikes >= PROACTIVE_MAX_STRIKES) {
+            ps.lostInterest = true;
+            // back off for 48h before reconsidering — not forever, in case the server wakes up
+            const backoffUntil = now + 48 * 60 * 60_000;
+            ps.lastAt = backoffUntil;
+            ps.lostInterest = false; // allow retry after backoff, not permanent
+            console.log(`[Proactive] ghosted ${PROACTIVE_MAX_STRIKES}x in #${channelName} — backing off 48h`);
+          }
           goActive(bestChannelId, 'proactive start');
           Telemetry.track('PROACTIVE_START', { targetChannel: bestChannelId }, undefined, guild.id);
-          console.log(`[Proactive] fired in #${channelName} (${guild.name}) — quiet ${quietHours}h`);
 
           // +12 XP to whoever got @mentioned — bot sought them out specifically
           for (const m of recentMembers) {
@@ -3562,12 +3573,9 @@ async function runProactiveEngagement() {
             }
           }
         } else {
-          ps.strikes++;
-          console.log(`[Proactive] chose not to speak — strike ${ps.strikes}/${PROACTIVE_MAX_STRIKES} in #${channelName}`);
-          if (ps.strikes >= PROACTIVE_MAX_STRIKES) {
-            ps.lostInterest = true;
-            console.log(`[Proactive] lost interest in #${channelName} (${guild.name})`);
-          }
+          // AI chose not to speak (e.g. "nothing worth saying") — don't penalise,
+          // the channel might still be alive and the bot is just reading the room.
+          console.log(`[Proactive] chose not to speak — skipped #${channelName} (no strike added)`);
         }
 
         await sendDecision({ channel: ch, decision, channelId: bestChannelId, guildId: guild.id });
