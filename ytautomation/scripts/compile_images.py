@@ -242,32 +242,53 @@ def gen_vid(filename, output_path="../vertical_short.mp4"):
             clips.append(clip)
         image_idx += 1
         
-        # Audio
-        # 1. Background pop sound for message
-        default_snd = '../assets/sounds/mp3/message.mp3'
-        if os.path.exists(default_snd):
-            audio_clips.append(AudioFileClip(default_snd).set_start(current_time))
-            
-        # 2. Add the generated TTS Voice
-        if tts_file:
-            tts_path = os.path.join(os.path.dirname(filename), "tts", tts_file)
-            if os.path.exists(tts_path):
-                try:
-                    audio_clips.append(AudioFileClip(tts_path).set_start(current_time))
-                except Exception as e:
-                    print(f"  [TTS ERR] Failed to load {tts_file}: {e}")
-                    
-        # 3. Add custom meme tags/sounds
+        # ── AUDIO LAYER ──────────────────────────────────────────────────────
+        # Priority: TTS voice is the PRIMARY audio. Meme sound effects are
+        # secondary and should NOT overlap/drown out the voice.
+        # Old code always blasted message.mp3 + meme sound + TTS simultaneously.
+        # Fixed: TTS starts immediately, meme sound plays at END of line as a stinger.
+
+        has_tts = tts_file is not None
+        meme_sounds = []
         for tag in tags:
             tag = tag.strip()
             if not tag.startswith("zoom_") and tag != "tilt" and tag != "message":
-                # Supports both flat "sound" and category-relative "category/sound"
                 snd_path = f"../assets/sounds/mp3/{tag}.mp3"
                 if not os.path.exists(snd_path):
                     snd_path = f"../assets/sounds/mp3/{tag}.wav"
                 if os.path.exists(snd_path):
-                    audio_clips.append(AudioFileClip(snd_path).set_start(current_time))
-        
+                    meme_sounds.append(snd_path)
+
+        # 1. TTS voice — plays right at the start of this line's time slot
+        if has_tts:
+            tts_path = os.path.join(os.path.dirname(filename), "tts", tts_file)
+            if os.path.exists(tts_path):
+                try:
+                    tts_clip = AudioFileClip(tts_path).volumex(1.0)
+                    audio_clips.append(tts_clip.set_start(current_time))
+                except Exception as e:
+                    print(f"  [TTS ERR] Failed to load {tts_file}: {e}")
+
+        # 2. Meme stinger sound — plays at END of the line for punch, but only
+        #    if it's actually a meme sound (not "message"). Ducked slightly when TTS exists.
+        stinger_offset = max(0.0, duration - 0.4) if has_tts else 0.0
+        meme_volume = 0.55 if has_tts else 0.9  # duck meme when voice is talking
+        for snd_path in meme_sounds[:1]:  # max 1 meme sound per line — no stacking!
+            try:
+                snd_clip = AudioFileClip(snd_path).volumex(meme_volume)
+                audio_clips.append(snd_clip.set_start(current_time + stinger_offset))
+            except Exception as e:
+                print(f"  [SFX ERR] {snd_path}: {e}")
+
+        # 3. If NO TTS and NO meme sound — play a very quiet message ping so it's not silent
+        if not has_tts and not meme_sounds:
+            msg_snd = '../assets/sounds/mp3/message.mp3'
+            if os.path.exists(msg_snd):
+                try:
+                    audio_clips.append(AudioFileClip(msg_snd).volumex(0.3).set_start(current_time))
+                except Exception:
+                    pass
+
         current_time += duration
 
     # Removed hardcoded comment bait overlays to keep the video clean and focused on the story.
@@ -300,4 +321,7 @@ def gen_vid(filename, output_path="../vertical_short.mp4"):
     final_video.write_videofile(output_path, fps=24, codec="libx264", audio_codec="aac")
 
 if __name__ == "__main__":
-    gen_vid("../assets/example/generated_script.txt")
+    import sys
+    script_path = sys.argv[1] if len(sys.argv) > 1 else "../assets/example/generated_script.txt"
+    out_path = sys.argv[2] if len(sys.argv) > 2 else "vertical_short.mp4"
+    gen_vid(script_path, out_path)

@@ -279,7 +279,8 @@ CRITICAL REQUIREMENTS:
 0. TITLE AND PREMISE: 
    - First line MUST be a highly engaging, clickbaity YouTube title starting with `# TITLE: `. {'Include #discord at the end.' if IS_LONG else 'Include #shorts at the end.'}
    - Second line MUST be a premise summary starting with `# PREMISE: `. This defines the specific conflict.
-1. NO LONG LINES / NO CHATGPT SPEAK: Messages MUST be extremely short (3-7 words max). NO punctuation at the end of sentences. NO complex English. Use slang and abbreviations (rn, fr, tbh, idc, stfu).
+1. NO LONG LINES / NO CHATGPT SPEAK: Messages MUST be extremely short (2-5 words max). NO punctuation at the end of sentences. NO complex English. Use slang and abbreviations (rn, fr, tbh, idc, stfu).
+2. LENGTH RULE: {'Generate 65 to 80 messages.' if IS_LONG else 'EXACTLY 12 to 15 lines total. SHORT. PUNCHY. No filler.'}
 {CHAR_RULE}
 3. VARIETY & VIBE: Make the premise unhinged. E.g. NOTABOT deleting the server because someone said he has zero rizz. ducky getting doxxed. fatas eating the RAM.
 4. HOOK: The first 3 messages must instantly drop the viewer into absolute chaos. No "hello guys". Just straight into screaming or a crazy claim.
@@ -290,6 +291,7 @@ CRITICAL REQUIREMENTS:
    - Use phonetic spelling for funny sounds (`bruuuuh`, `naaaah`, `wait whattt`).
    - KEEP MESSAGES SHORT. Long paragraphs ruin the pacing.
 7. DURATION SPACINGS & SOUNDS: Append a duration and a SOUND NAME to EVERY SINGLE LINE using format: `$^<duration>#!<sound_name>`. Example: `IM COOKED$^1.5#!vine_boom` or `bro what rn$^2.0#!message`.
+   - DO NOT spam sounds! Use `#!message` for normal talking lines. Only use meme sounds (`vine_boom`, `laugh_track`) at the climax or punchlines!
    Available sounds: `message`, {sound_names}. Pick the sound that perfectly matches the emotion of the message!
 8. VIDEO CLIP INSERTS: Use MAX 1-2 CLIPs per script to show a reaction or b-roll. Format EXACTLY `# CLIP: <clip_name>`. 
    Available clips: {clip_names}. Pick the clip that perfectly matches the emotion!
@@ -310,7 +312,7 @@ L MANS$^1.5#!message
 UR JUST MAD I HAVE MORE RIZZ$^2.0#!airhorn
 
 dumby:
-what is a rizz$^2.0#!confusion
+what is a rizz$^2.0#!message
 
 # CLIP: mind_blown_guy
 

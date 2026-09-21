@@ -6,22 +6,49 @@ import edge_tts
 from moviepy.editor import AudioFileClip
 import re
 
+# ── VOICE MAP ─────────────────────────────────────────────────────────────────
+# Rate = speech speed. Pitch = Hz shift. Go extreme for comedy.
+# edge_tts pitch is in Hz relative. +50Hz = chipmunk. -50Hz = demon lord.
 VOICE_MAP = {
-    'notabot': {'voice': 'en-US-GuyNeural', 'rate': '+15%', 'pitch': '+5Hz'},
-    'ducky': {'voice': 'en-GB-RyanNeural', 'rate': '+25%', 'pitch': '+15Hz'},
-    'dumby': {'voice': 'en-US-SteffanNeural', 'rate': '-10%', 'pitch': '-15Hz'},
-    'fatas': {'voice': 'en-AU-WilliamNeural', 'rate': '+0%', 'pitch': '+0Hz'},
+    # NOTABOT: deep, aggressive, fast — sounds genuinely angry and unhinged
+    'notabot':  {'voice': 'en-US-GuyNeural',       'rate': '+25%', 'pitch': '-30Hz'},
+    # ducky: high pitched, panicked, fast — sounds like he's about to cry
+    'ducky':    {'voice': 'en-GB-RyanNeural',       'rate': '+35%', 'pitch': '+40Hz'},
+    # dumby: very slow, very deep, confused — sounds genuinely stupid
+    'dumby':    {'voice': 'en-US-SteffanNeural',    'rate': '-30%', 'pitch': '-45Hz'},
+    # fatas: extremely chill, slow, monotone — like talking in his sleep
+    'fatas':    {'voice': 'en-AU-WilliamNeural',    'rate': '-20%', 'pitch': '-10Hz'},
+    # chatgpt: weirdly cheerful, fast, slightly high — passive aggressive robot
+    'chatgpt':  {'voice': 'en-US-AvaNeural',        'rate': '+20%', 'pitch': '+20Hz'},
+    # groq: extremely fast, sharp — sounds like a speedrunner
+    'groq':     {'voice': 'en-US-AndrewNeural',     'rate': '+50%', 'pitch': '+5Hz'},
+    # claude: slow, smug, slightly high — condescending professor
+    'claude':   {'voice': 'en-US-BrianNeural',      'rate': '-10%', 'pitch': '+15Hz'},
 }
 DEFAULT_VOICE = {'voice': 'en-US-ChristopherNeural', 'rate': '+10%', 'pitch': '+0Hz'}
 
+
 async def generate_audio(text, output_path, voice_config):
     communicate = edge_tts.Communicate(
-        text, 
-        voice_config['voice'], 
-        rate=voice_config.get('rate', '+0%'), 
-        pitch=voice_config.get('pitch', '+0Hz')
+        text,
+        voice_config['voice'],
+        rate=voice_config.get('rate', '+0%'),
+        pitch=voice_config.get('pitch', '+0Hz'),
     )
     await communicate.save(output_path)
+
+
+def clean_for_tts(text: str) -> str:
+    """Strip script formatting tags, emojis, and markdown junk — leave only speakable text."""
+    # Remove ALL CAPS formatting markers but keep the words (they're expressive anyway)
+    # Strip emoji unicode ranges
+    text = re.sub(r'[^\x00-\x7F]+', '', text)
+    # Strip markdown bold/italic remnants
+    text = re.sub(r'[*_`~]', '', text)
+    # Collapse multiple spaces
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -46,71 +73,98 @@ def main():
 
     async def process_lines():
         nonlocal current_char, tts_counter
+
         for line in lines:
-            if not line.strip() or line.startswith('#'):
+            stripped = line.strip()
+
+            # Blank lines / comment lines / title lines — pass through unchanged
+            if not stripped or stripped.startswith('#'):
                 processed_lines.append(line)
                 continue
 
-            if line.endswith(':'):
-                current_char = line[:-1].strip().lower()
+            # Character header line like "NOTABOT:" or "ducky:"
+            if stripped.endswith(':') and '$^' not in stripped:
+                current_char = stripped[:-1].strip().lower()
                 processed_lines.append(line)
                 continue
 
-            # It's a dialogue line. Format is like: text$^duration#!sound
-            # Or just text
-            text_part = line
-            duration_part = ""
-            sound_part = ""
+            # Dialogue line — parse out text / duration / sound / existing tts tag
+            text_part = stripped
+            duration_part = ''
+            sound_part = ''
+            existing_tts = ''
 
             if '$^' in text_part:
-                parts = text_part.split('$^', 1)
-                text_part = parts[0]
-                rest = parts[1]
-                if '#!' in rest:
-                    d_parts = rest.split('#!', 1)
-                    duration_part = d_parts[0]
-                    sound_part = d_parts[1]
+                left, right = text_part.split('$^', 1)
+                text_part = left
+                # right could be: "1.5#!vine_boom" or "1.5#!vine_boom#@tts_1.mp3"
+                if '#@' in right:
+                    right, existing_tts = right.split('#@', 1)
+                    existing_tts = existing_tts.strip()
+                if '#!' in right:
+                    d, s = right.split('#!', 1)
+                    duration_part = d.strip()
+                    sound_part = s.strip()
                 else:
-                    duration_part = rest
+                    duration_part = right.strip()
             elif '#!' in text_part:
-                parts = text_part.split('#!', 1)
-                text_part = parts[0]
-                sound_part = parts[1]
+                left, s = text_part.split('#!', 1)
+                text_part = left
+                sound_part = s.strip()
 
-            # Generate TTS if text is not empty and only contains letters/numbers
-            clean_text = text_part.strip()
-            # Clean emojis or weird chars out of text for the TTS engine
-            tts_text = re.sub(r'[^\w\s\.,!\?\'"-]', '', clean_text)
-            
-            if len(tts_text) > 1:
+            # If a TTS file was already tagged (re-run scenario), keep the line
+            if existing_tts:
+                processed_lines.append(line)
+                continue
+
+            tts_text = clean_for_tts(text_part)
+
+            if len(tts_text) > 1 and current_char is not None:
                 tts_counter += 1
                 audio_filename = f"tts_{tts_counter}.mp3"
                 audio_path = os.path.join(tts_dir, audio_filename)
-                
+
                 v_config = VOICE_MAP.get(current_char, DEFAULT_VOICE)
-                print(f"Generating TTS for {current_char}: {tts_text}")
-                
+                print(f"  [TTS] {current_char} ({v_config['voice']} {v_config['rate']} {v_config['pitch']}): {tts_text[:60]}")
+
                 try:
                     await generate_audio(tts_text, audio_path, v_config)
-                    # Get exact length of generated audio
+
                     clip = AudioFileClip(audio_path)
-                    new_duration = round(clip.duration + 0.3, 2)  # add 0.3s padding for natural pause
+                    # Use exact TTS duration + tiny padding — the meme sound fires separately
+                    tts_duration = round(clip.duration + 0.2, 2)
                     clip.close()
-                    
-                    # Reconstruct line with exact duration and audio tag
-                    new_line = f"{clean_text}$^{new_duration}#!{sound_part}#@{audio_filename}"
+
+                    # Use whichever is longer: script duration or TTS duration
+                    try:
+                        script_duration = float(duration_part) if duration_part else 1.5
+                    except ValueError:
+                        script_duration = 1.5
+                    final_duration = max(script_duration, tts_duration)
+
+                    # Rebuild the line: text$^duration#!sound#@tts_file
+                    new_line = f"{text_part.strip()}$^{final_duration}"
+                    if sound_part:
+                        new_line += f"#!{sound_part}"
+                    new_line += f"#@{audio_filename}"
+
                     processed_lines.append(new_line)
                     continue
+
                 except Exception as e:
-                    print(f"Failed to generate TTS: {e}")
-            
+                    print(f"  [TTS FAIL] {e} — keeping original line")
+
+            # Fallback — keep line unchanged
             processed_lines.append(line)
 
     asyncio.run(process_lines())
 
-    # Save over the script
+    # Overwrite the script with TTS-tagged version
     with open(script_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(processed_lines))
+
+    print(f"  [TTS] Done — {tts_counter} audio files generated.")
+
 
 if __name__ == "__main__":
     main()
