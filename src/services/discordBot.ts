@@ -3719,8 +3719,8 @@ async function runColdOpen() {
 
       const isNewPerson = pick.isNew;
       const selfNote = isNewPerson
-        ? `you spotted ${pick.name} in ${guildName} — they are completely new and you've never talked before. greet them naturally like a normal person would when they notice someone new around. keep it super casual and short — a quick "hey" or "yo" or just tagging them with something friendly and low-pressure. @mention them so they actually see it. do NOT be formal or cringe, just human. if nothing feels natural to say, action:ignore.`
-        : `you're pinging ${pick.name} in ${guildName} — you know them a bit. say something quick and natural to get their attention, maybe a callback or a poke. @mention them. keep it one line. if nothing feels worth it, action:ignore.`;
+        ? `you spotted ${pick.name} in ${guildName} — they are completely new and you've never talked before. greet them naturally like a normal person would when they notice someone new around. keep it super casual and short — a quick "hey" or "yo" or something friendly and low-pressure. just say their NAME (not a @mention — that's handled separately), don't be formal or cringe, just human. if nothing feels natural to say, action:ignore.`
+        : `you're pinging ${pick.name} in ${guildName} — you know them a bit. say something quick and natural to get their attention, maybe a callback or a poke. just say their NAME (not a @mention — that's handled separately). keep it one line. if nothing feels worth it, action:ignore.`;
 
       const brainOpts: BrainOpts = {
         model: ACTIVE_MODEL,
@@ -3749,10 +3749,11 @@ async function runColdOpen() {
         return;
       }
 
-      // Force @mention into the reply if the bot didn't add it
+      // Deduplicate pings — the AI already mentions them in the reply text.
+      // Strip any duplicate leading <@userId> so we never fire the same ping twice.
       const mentionTag = `<@${pick.userId}>`;
-      const replyText = decision.reply.includes(mentionTag) ? decision.reply : `${mentionTag} ${decision.reply}`;
-      decision = { ...decision, reply: replyText };
+      const deduped = decision.reply.replace(new RegExp(`(${mentionTag}\\s*){2,}`, 'g'), `${mentionTag} `).trim();
+      decision = { ...decision, reply: deduped };
 
       await sendDecision({ channel: targetChannel as any, decision, channelId: chId, guildId: pick.guildId });
       console.log(`[ColdOpen] pinged ${pick.name} in #${targetChannel.name} (${guildName}) — isNew:${isNewPerson}`);
