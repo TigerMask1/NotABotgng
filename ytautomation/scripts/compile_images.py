@@ -280,15 +280,6 @@ def gen_vid(filename, output_path="../vertical_short.mp4"):
             except Exception as e:
                 print(f"  [SFX ERR] {snd_path}: {e}")
 
-        # 3. If NO TTS and NO meme sound — play a very quiet message ping so it's not silent
-        if not has_tts and not meme_sounds:
-            msg_snd = '../assets/sounds/mp3/message.mp3'
-            if os.path.exists(msg_snd):
-                try:
-                    audio_clips.append(AudioFileClip(msg_snd).volumex(0.3).set_start(current_time))
-                except Exception:
-                    pass
-
         current_time += duration
 
     # Removed hardcoded comment bait overlays to keep the video clean and focused on the story.

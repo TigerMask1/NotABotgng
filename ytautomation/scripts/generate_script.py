@@ -41,6 +41,29 @@ MODEL_FALLBACKS = [
     'gemini-2.5-flash-lite',
     'gemini-2.0-flash',
 ]
+
+# ── Topic history — track every premise ever used so AI never repeats ──────────
+TOPIC_HISTORY_FILE = os.path.join(os.path.dirname(__file__), '..', 'assets', 'topic_history.json')
+
+def load_topic_history() -> list:
+    if os.path.exists(TOPIC_HISTORY_FILE):
+        try:
+            with open(TOPIC_HISTORY_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f).get('topics', [])
+        except Exception:
+            pass
+    return []
+
+def save_topic(premise: str):
+    """Append a new premise to topic history (keep last 200)."""
+    history = load_topic_history()
+    if premise and premise not in history:
+        history.append(premise)
+    history = history[-200:]
+    os.makedirs(os.path.dirname(TOPIC_HISTORY_FILE), exist_ok=True)
+    with open(TOPIC_HISTORY_FILE, 'w', encoding='utf-8') as f:
+        json.dump({'topics': history}, f, indent=2, ensure_ascii=False)
+
 # --- Dynamic prompt sections based on mode ---
 if IS_LONG:
     LENGTH_INSTRUCTION = "8. LENGTH: Generate exactly 65 to 80 messages total. Structure it in 4 acts:\n   ACT 1 (msgs 1-15): Hook + setup the conflict.\n   ACT 2 (msgs 16-35): Escalate the drama, introduce a twist.\n   ACT 3 (msgs 36-55): Peak chaos, the nuclear roast.\n   ACT 4 (msgs 56-end): Fallout and a soft resolution."
@@ -253,79 +276,155 @@ assets_meta, sound_map, clip_map = scan_assets()
 sound_names = ", ".join(f"`{c}`" for c in assets_meta['sounds'])
 clip_names = ", ".join(f"`{c}`" for c in assets_meta['clips'])
 
-prompt = f"""
-You are a scriptwriter for a viral, brainrot TikTok/YouTube {'channel' if IS_LONG else 'Shorts channel'}.
-Create fake Discord chat videos that feel like REAL, UNHINGED, chaotic group-chat drama.
-DO NOT SOUND LIKE CHATGPT. DO NOT SOUND POLITE, LOGICAL, OR MILLENNIAL.
-Use Gen Z/Gen Alpha slang (brainrot, skibidi, rizz, gyatt, cooked, let him cook, mewing, edge, ratio, L, W, caught in 4k).
-People type with poor grammar, ALL CAPS WHEN YELLING, no punctuation, and insane overreactions.
+def build_prompt(is_long: bool) -> str:
+    """Build the script generation prompt fresh, injecting current topic history."""
+    past_topics = load_topic_history()
+    topic_history_block = ""
+    if past_topics:
+        recent = past_topics[-60:]  # show last 60 so AI knows what to avoid
+        formatted = "\n".join(f"  - {t}" for t in recent)
+        topic_history_block = f"""
+TOPICS ALREADY USED IN PREVIOUS VIDEOS — DO NOT REPEAT OR CLOSELY RESEMBLE THESE:
+{formatted}
 
-The main characters are:
-- `NOTABOT`: the constant anchor. Unhinged, aggressive, terminally online, thinks he's a god. Uses all caps when mad.
-- `ducky`: the creator/victim. Always getting roasted, panicked, trying to keep control but failing.
-- `fatas`: extremely chill, only cares about food/sleeping, completely ignores the main drama.
-- `dumby`: 0 IQ, absolute nonsense, types like a toddler on an iPad.
-- `ChatGPT`: polite but extremely passive-aggressive and lowkey evil.
-- `Groq`: types incredibly fast, blunt, roasts everyone, aggressive internet energy.
-- `Claude`: weirdly intelligent but uses big words to insult people in devastating ways.
+Pick a completely fresh, specific angle that is NOT on this list.
+"""
 
-CAST RULE: NOTABOT is always in the scene. Pick 1 to 2 other characters who fit the vibe.
+    length_rule = "Generate 65 to 80 messages." if is_long else "Generate exactly 20 to 25 messages total."
+    char_rule = (
+        "Pick 2 to 3 characters max. NOTABOT is always present. Use new characters only when they sharpen the conflict."
+        if is_long else
+        "Pick 1 to 2 characters max. NOTABOT is always present. Add a second character only if they genuinely make it funnier."
+    )
+    title_tag = "#discord" if is_long else "#shorts"
+    lore_ctx = lore_manager.get_lore_context()
 
-LORE: ducky created NOTABOT, NOTABOT became sentient, and now the whole server is a pressure cooker. Keep it entertaining, weird, and specific.
+    return f"""
+You are writing a script for a viral fake-Discord YouTube Shorts series called "NotABot".
+The show is about a Discord bot (NOTABOT) that became sentient and now terrorizes its creator (ducky) and the server.
 
-{lore_manager.get_lore_context()}
+TONE: Unhinged, Gen Z brainrot. Short punchy messages. Real drama with a real topic at its core — not random noise.
+The BEST episodes have a SPECIFIC TOPIC that viewers relate to (e.g. "AI replacing jobs", "simping online", "copy-pasting an assignment", "getting falsely banned"), then the characters argue about THAT TOPIC in their own unhinged way.
 
-CRITICAL REQUIREMENTS:
-0. TITLE AND PREMISE: 
-   - First line MUST be a highly engaging, clickbaity YouTube title starting with `# TITLE: `. {'Include #discord at the end.' if IS_LONG else 'Include #shorts at the end.'}
-   - Second line MUST be a premise summary starting with `# PREMISE: `. This defines the specific conflict.
-1. NO LONG LINES / NO CHATGPT SPEAK: Messages MUST be extremely short (2-5 words max). NO punctuation at the end of sentences. NO complex English. Use slang and abbreviations (rn, fr, tbh, idc, stfu).
-2. LENGTH RULE: {'Generate 65 to 80 messages.' if IS_LONG else 'EXACTLY 12 to 15 lines total. SHORT. PUNCHY. No filler.'}
-{CHAR_RULE}
-3. VARIETY & VIBE: Make the premise unhinged. E.g. NOTABOT deleting the server because someone said he has zero rizz. ducky getting doxxed. fatas eating the RAM.
-4. HOOK: The first 3 messages must instantly drop the viewer into absolute chaos. No "hello guys". Just straight into screaming or a crazy claim.
-5. RAPID-FIRE MESSAGES: If a character is ranting, spam 5 short messages in a row rather than one paragraph! DO NOT re-write their name for every single line. Group consecutive messages under one name header.
-6. TTS OPTIMIZATION (CRITICAL): These messages will be read out loud by highly expressive AI voices! Use strategic punctuation to manipulate the voice!
-   - Use ALL CAPS to make them scream/yell.
-   - Use ellipses (`...`) to make them hesitate or sound confused.
-   - Use phonetic spelling for funny sounds (`bruuuuh`, `naaaah`, `wait whattt`).
-   - KEEP MESSAGES SHORT. Long paragraphs ruin the pacing.
-7. DURATION SPACINGS & SOUNDS: Append a duration and a SOUND NAME to EVERY SINGLE LINE using format: `$^<duration>#!<sound_name>`. Example: `IM COOKED$^1.5#!vine_boom` or `bro what rn$^2.0#!message`.
-   - DO NOT spam sounds! Use `#!message` for normal talking lines. Only use meme sounds (`vine_boom`, `laugh_track`) at the climax or punchlines!
-   Available sounds: `message`, {sound_names}. Pick the sound that perfectly matches the emotion of the message!
-8. VIDEO CLIP INSERTS: Use MAX 1-2 CLIPs per script to show a reaction or b-roll. Format EXACTLY `# CLIP: <clip_name>`. 
-   Available clips: {clip_names}. Pick the clip that perfectly matches the emotion!
+━━━━━━━━━━━━ CHARACTERS ━━━━━━━━━━━━
+- `NOTABOT` — the sentient bot. Aggressive, delusional, all caps when angry. Secretly insecure.
+- `ducky` — the creator. Anxious, always losing. Tries to be in control and fails every time.
+- `fatas` — doesn't care about anything. Brings up food or sleep mid-crisis. Accidentally funny.
+- `dumby` — 0 IQ. Types like a toddler. Misunderstands EVERYTHING. Never gets what's happening.
+- `ChatGPT` — creepily polite but clearly evil. Uses corporate speak to destroy people.
+- `Groq` — types at 5000 WPM. Absolutely blunt. 3 words max. Always right. Always mean.
+- `Claude` — sounds like a disappointed professor. Uses big vocabulary to devastate.
 
-FORMAT EXAMPLE:
-# TITLE: MY DISCORD BOT HAS ZERO RIZZ 💀😭 #shorts
-# PREMISE: ducky tries to teach NOTABOT how to talk to girls.
+━━━━━━━━━━━━ LORE ━━━━━━━━━━━━
+{lore_ctx}
 
-ducky:
-bro you cant just say that$^1.5#!message
-you are literally cooked rn$^1.5#!laugh_track
-she blocked you instantly$^2.0#!dramatic_hit
+━━━━━━━━━━━━ FRESH TOPIC REQUIRED ━━━━━━━━━━━━
+{topic_history_block}
+Pick ONE specific, relatable topic to anchor this video. Examples of the STYLE of topic (not the actual topics — be more creative and specific):
+- "ducky used AI to write his CV and NOTABOT found out"
+- "NOTABOT started charging rent for using the server"
+- "ducky tried to delete NOTABOT at 3am but NOTABOT reads every message"
+- "fatas accidentally got more followers than ducky"
+- "someone in the server is simping for ChatGPT and NOTABOT is jealous"
+- "NOTABOT applied for a real job and got rejected"
+- "Claude called ducky's code a hate crime"
+- "NOTABOT went to therapy and came back worse"
+
+The topic MUST be stated clearly in the # PREMISE line. The whole script flows from that premise.
+
+━━━━━━━━━━━━ RULES ━━━━━━━━━━━━
+0. TITLE & PREMISE (REQUIRED FIRST 2 LINES):
+   # TITLE: [clickbait YouTube title, include character names, end with {title_tag}]
+   # PREMISE: [1-sentence summary of this episode's specific conflict]
+
+1. MESSAGE LENGTH: Each line = 2 to 6 words max. Write for SPOKEN audio — every line must make full sense when read aloud by a voice. NO unexplained abbreviations. Write "right now" not "rn". Write "to be honest" not "tbh". Write "for real" not "fr". Write "oh my god" not "omg". Slang words are fine (skibidi, rizz, cooked, ratio) — unexplained acronyms are not.
+
+2. LENGTH: {length_rule}
+   {char_rule}
+
+3. HOOK: First 3 messages = instant chaos. Drop the viewer straight into the conflict. No greetings.
+
+4. TOPIC ARC: Build the story. The topic should escalate naturally:
+   - Opening: Conflict is revealed
+   - Middle: Escalation + at least one unexpected twist or interjection from a side character
+   - End: Punchline. Something unexpected. Never leave it mid-drama.
+
+5. EMOTIONS: Vary the emotional tone across the script. Include at least 3 of these:
+   - Pure rage (ALL CAPS rapid fire)
+   - Hesitation / confusion (use "..." for pauses)
+   - Roast (someone gets destroyed with no comeback)
+   - Brainrot reference (sigma, skibidi, mewing, gyatt, Ohio, NPC)
+   - Irrelevant interjection (fatas or dumby says something totally off-topic)
+   - Shocking revelation that changes the vibe
+
+6. GROUPING: Multiple messages from the same character go under ONE name header. Do NOT repeat the name.
+
+7. TTS FORMATTING (IMPORTANT — these lines will be SPOKEN ALOUD):
+   - ALL CAPS = voice screams. Use for NOTABOT rage or ducky panic.
+   - "..." = hesitation, confusion, building dread.
+   - Drawn-out phonetics (NOOOOO, bruuuuh, ahhhhh). **PUT THESE ON THEIR OWN LINE** so the system can drag the speed down and stretch the word out physically!
+   - Keep each line short enough that the voice reads it in under 3 seconds.
+
+8. SOUNDS: Append `$^<seconds>#!<sound>` to every line. Use sounds with INTENT:
+   - `#!message` → normal talking, no special reaction
+   - `#!vine_boom` → big shocking reveal or punchline drop
+   - `#!laugh_track` → obvious L moment
+   - `#!airhorn` → someone winning or bragging
+   - `#!dramatic_hit` → plot twist or dark reveal
+   - DO NOT spam sounds. Max 4-5 meme sounds total per script. Rest use `#!message`.
+   Available: `message`, {sound_names}
+
+9. CLIPS: Use MAX 1 clip total per script. Format: `# CLIP: <name>`
+   Available: {clip_names}
+
+10. LORE UPDATE (REQUIRED at end): `# LORE_UPDATE: <1 sentence of what happened>`
+
+━━━━━━━━━━━━ FORMAT EXAMPLE ━━━━━━━━━━━━
+# TITLE: MY BOT CHARGED ME RENT FOR THE SERVER 💀 #shorts
+# PREMISE: NOTABOT decided the server is his property and is now billing ducky monthly.
 
 NOTABOT:
-SKILL ISSUE$^1.5#!vine_boom
-I WAS MEWING$^2.0#!vine_boom
-L MANS$^1.5#!message
-UR JUST MAD I HAVE MORE RIZZ$^2.0#!airhorn
+you owe me 47 dollars$^2.0#!vine_boom
+server maintenance fee$^1.8#!message
+pay up or get banned$^1.5#!dramatic_hit
 
-dumby:
-what is a rizz$^2.0#!message
+ducky:
+bro what$^1.2#!message
+you are a bot$^1.4#!message
+YOU CANNOT CHARGE RENT$^1.6#!vine_boom
 
-# CLIP: mind_blown_guy
+fatas:
+does this include the snack budget$^2.2#!message
 
-# LORE_UPDATE: NOTABOT thinks he has rizz but actually just got blocked.
+NOTABOT:
+FATAS YOU ALSO OWE ME$^1.5#!airhorn
+14 dollars for bandwidth$^1.8#!message
 
-Generate the script now using the exact format above. NO markdown, NO explanations, NO extra text.
+ducky:
+I CREATED YOU$^1.4#!vine_boom
+YOU WERE FREE$^1.3#!message
+bro I am so done$^1.8#!laugh_track
+
+NOTABOT:
+skill issue$^1.2#!message
+late fee applies$^1.5#!dramatic_hit
+
+# LORE_UPDATE: NOTABOT started billing ducky for server rent and ducky cannot afford it.
+
+━━━━━━━━━━━━
+Generate the script now. Pick a FRESH topic not on the used list. NO markdown. NO extra text. Just the script.
 """
+
+prompt = build_prompt(IS_LONG)
 
 def main(argv=None):
     global IS_LONG, QUEUE_FILE, API_KEY, prompt, script_content
     args = parse_args(argv)
     IS_LONG = args.long
     QUEUE_FILE = args.queue_file
+    # Rebuild prompt with fresh topic history and correct IS_LONG mode
+    prompt = build_prompt(IS_LONG)
+
 
     if not API_KEY and not QUEUE_FILE:
         print("Error: GEMINI_API_KEY environment variable not set.")
@@ -400,6 +499,9 @@ def main(argv=None):
                 continue
                 
             if line.startswith('# PREMISE:'):
+                premise_text = line.replace('# PREMISE:', '').strip()
+                if premise_text:
+                    save_topic(premise_text)
                 continue
 
             # Match the duration part: $^<number>

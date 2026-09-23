@@ -27,7 +27,7 @@ const DEBUG_LOG_REQUESTS = process.env.DEBUG_LOG_REQUESTS === 'true';
 //   NOTABOT_ACTIVE_MODEL  — used for every message while engaged (fast + cheap)
 //   NOTABOT_PASSIVE_MODEL — used for 5-min background channel scans (smarter)
 //   NOTABOT_BG_MODEL      — used for utility jobs: profiler, compress, history
-const ACTIVE_MODEL  = process.env.NOTABOT_ACTIVE_MODEL  || 'gemini-3.5-flash-lite'; // upgraded from 3.1
+const ACTIVE_MODEL  = process.env.NOTABOT_ACTIVE_MODEL  || 'gemini-3.1-flash-lite';
 const PASSIVE_MODEL = process.env.NOTABOT_PASSIVE_MODEL || 'gemma-4-26b-a4b-it';
 const BG_MODEL      = process.env.NOTABOT_BG_MODEL      || 'gemma-4-31b-it';
 
@@ -4531,7 +4531,7 @@ async function handleMessage(msg: Message) {
       const st = getChState(channelId);
       const msSinceSpoke = st.lastBotMsgAt ? Date.now() - st.lastBotMsgAt : Infinity;
       const isReplyTarget = st.lastRepliedToSenderId === msg.author.id;
-      if (!mentioned && msSinceSpoke < 4000 && (msg.author.bot || isReplyTarget)) {
+      if (!mentioned && msSinceSpoke < 4000 && (msg.author.bot || isReplyTarget) && msg.author.id !== getBusinessBotId()) {
         return;
       }
       // [System Note] DO NOT REMOVE: If this message is a human replying to ANOTHER human,
@@ -4697,7 +4697,7 @@ export async function startBot(token: string) {
       ? guild.systemChannel
       : guild.channels.cache.find(c => c.isTextBased() && !c.isDMBased() && (c as any).permissionsFor(guild.members.me!)?.has(PermissionFlagsBits.SendMessages)) as TextChannel | undefined;
 
-    if (target && gemini.canCall()) {
+    if (false && target && gemini.canCall()) {
       const chId = target.id;
       const brainOpts: BrainOpts = {
         model: ACTIVE_MODEL,
@@ -4923,3 +4923,4 @@ export async function startBot(token: string) {
 
 export function stopBot() { botClient?.destroy(); botClient = null; globallyMuted = false; }
 export function getBotStatus() { return !botClient ? 'stopped' : globallyMuted ? 'muted' : 'running'; }
+

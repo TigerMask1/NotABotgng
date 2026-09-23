@@ -6,26 +6,151 @@ import edge_tts
 from moviepy.editor import AudioFileClip
 import re
 
-# ── VOICE MAP ─────────────────────────────────────────────────────────────────
-# Rate = speech speed. Pitch = Hz shift. Go extreme for comedy.
-# edge_tts pitch is in Hz relative. +50Hz = chipmunk. -50Hz = demon lord.
+# ── BASE VOICE MAP ────────────────────────────────────────────────────────────
+# These are the CHARACTER DEFAULTS. Per-line emotion adjustments are applied on top.
 VOICE_MAP = {
-    # NOTABOT: deep, aggressive, fast — sounds genuinely angry and unhinged
-    'notabot':  {'voice': 'en-US-GuyNeural',       'rate': '+25%', 'pitch': '-30Hz'},
-    # ducky: high pitched, panicked, fast — sounds like he's about to cry
-    'ducky':    {'voice': 'en-GB-RyanNeural',       'rate': '+35%', 'pitch': '+40Hz'},
-    # dumby: very slow, very deep, confused — sounds genuinely stupid
-    'dumby':    {'voice': 'en-US-SteffanNeural',    'rate': '-30%', 'pitch': '-45Hz'},
-    # fatas: extremely chill, slow, monotone — like talking in his sleep
-    'fatas':    {'voice': 'en-AU-WilliamNeural',    'rate': '-20%', 'pitch': '-10Hz'},
-    # chatgpt: weirdly cheerful, fast, slightly high — passive aggressive robot
-    'chatgpt':  {'voice': 'en-US-AvaNeural',        'rate': '+20%', 'pitch': '+20Hz'},
-    # groq: extremely fast, sharp — sounds like a speedrunner
-    'groq':     {'voice': 'en-US-AndrewNeural',     'rate': '+50%', 'pitch': '+5Hz'},
-    # claude: slow, smug, slightly high — condescending professor
-    'claude':   {'voice': 'en-US-BrianNeural',      'rate': '-10%', 'pitch': '+15Hz'},
+    # NOTABOT: deep, authoritative, moderately fast — varies wildly with emotion
+    'notabot':  {'voice': 'en-US-GuyNeural',       'rate': '+15%', 'pitch': '-25Hz'},
+    # ducky: naturally a bit higher, panicky — goes squeaky when scared
+    'ducky':    {'voice': 'en-GB-RyanNeural',       'rate': '+20%', 'pitch': '+25Hz'},
+    # dumby: slow, deep, confused — like a toddler reading for the first time
+    'dumby':    {'voice': 'en-US-SteffanNeural',    'rate': '-25%', 'pitch': '-40Hz'},
+    # fatas: dead slow, totally unbothered — sounds half asleep
+    'fatas':    {'voice': 'en-AU-WilliamNeural',    'rate': '-18%', 'pitch': '-8Hz'},
+    # chatgpt: upbeat robot — passive aggressive cheerfulness
+    'chatgpt':  {'voice': 'en-US-AvaNeural',        'rate': '+18%', 'pitch': '+18Hz'},
+    # groq: lightning fast, clipped, aggressive — sounds like a speedrunner
+    'groq':     {'voice': 'en-US-AndrewNeural',     'rate': '+45%', 'pitch': '+5Hz'},
+    # claude: measured, slightly slow, smug — disappointed professor vibes
+    'claude':   {'voice': 'en-US-BrianNeural',      'rate': '-8%',  'pitch': '+12Hz'},
 }
 DEFAULT_VOICE = {'voice': 'en-US-ChristopherNeural', 'rate': '+10%', 'pitch': '+0Hz'}
+
+
+# ── ABBREVIATION → FULL FORM ───────────────────────────────────────────────────
+# The SCREEN shows the shortform; the VOICE says the full form.
+# TTS reads these letter-by-letter otherwise, which sounds terrible.
+ABBREVIATIONS = {
+    r'\brn\b':     'right now',
+    r'\bfr\b':     'for real',
+    r'\btbh\b':    'to be honest',
+    r'\bngl\b':    'not gonna lie',
+    r'\bidk\b':    "I don't know",
+    r'\bidc\b':    "I don't care",
+    r'\bstfu\b':   'shut up',
+    r'\bomg\b':    'oh my god',
+    r'\blol\b':    'laughing out loud',
+    r'\blmao\b':   'laughing my ass off',
+    r'\bpls\b':    'please',
+    r'\bbrb\b':    'be right back',
+    r'\bbtw\b':    'by the way',
+    r'\bimo\b':    'in my opinion',
+    r'\bwdym\b':   'what do you mean',
+    r'\bwth\b':    'what the heck',
+    r'\bwtf\b':    'what the heck',  # keep it clean-ish for TTS
+    r'\bnpc\b':    'en-pee-see',
+    r'\bbro\b':    'bro',            # keep, it's a real word now
+    r'\b(?<!\w)u\b':  'you',        # standalone "u" → "you"
+    r'\bur\b':     'your',
+    r'\bw\b':      'win',
+    r'\bl\b':      'loss',
+    r'\bgg\b':     'good game',
+    r'\baura\b':   'aura',          # keep, it's a real word in this context
+}
+
+def expand_abbreviations(text: str) -> str:
+    """Expand shortforms so TTS says them correctly. Case-insensitive."""
+    result = text
+    for pattern, replacement in ABBREVIATIONS.items():
+        result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
+    return result
+
+
+# ── EMOTION-AWARE VOICE ADJUSTMENT ────────────────────────────────────────────
+# Reads cues from the RAW TEXT (not expanded) and bumps pitch/rate to match emotion.
+# This gives each LINE its own energy on top of the character's base voice.
+
+def get_emotion_adjustment(raw_text: str) -> tuple[int, int]:
+    """
+    Returns (pitch_delta_hz, rate_delta_percent) to add on top of base voice.
+    Detects emotion signals directly from the text before abbreviation expansion.
+    """
+    upper_count = sum(1 for c in raw_text if c.isupper() and c.isalpha())
+    total_alpha = sum(1 for c in raw_text if c.isalpha())
+    caps_ratio = upper_count / total_alpha if total_alpha > 0 else 0
+
+    pitch_delta = 0
+    rate_delta = 0
+
+    # ── SCREAMING: mostly caps, 5+ chars ────────────────────────────────
+    # Goes for both NOTABOT rage AND ducky panic
+    if caps_ratio >= 0.75 and total_alpha >= 5:
+        pitch_delta += 12     # noticeably higher/more intense
+        rate_delta += 20      # faster, more urgent
+
+    # ── SUPER INTENSE SCREAMING: all caps, long line ─────────────────────
+    if caps_ratio >= 0.9 and total_alpha >= 10:
+        pitch_delta += 8      # stack on top of the above
+        rate_delta += 10
+
+    # ── HESITATION/DREAD: ellipsis ───────────────────────────────────────
+    if '...' in raw_text:
+        rate_delta -= 18      # slow down significantly
+        # don't touch pitch — the slowdown creates the eerie feeling
+
+    # ── DRAWN-OUT VOWELS (Stretching the word): NOOOOO, bruuuuh, ahhhhh ────────
+    if re.search(r'(.)\1{3,}', raw_text):
+        pitch_delta += 10
+        
+        # If the entire line is basically just the dragged out word (less than 3 words)
+        # We can drop the speed massively to physically "drag" the audio out
+        if word_count <= 2:
+            rate_delta -= 40  # Massive slowdown to drag the word
+        else:
+            rate_delta -= 15  # Moderate slowdown if it's part of a larger sentence
+
+    # ── QUESTIONING/DISBELIEF: ??? or wait what ───────────────────────────
+    if '???' in raw_text or raw_text.strip().endswith('???'):
+        pitch_delta += 8
+
+    # ── VERY SHORT PUNCHLINE (1-2 words, probably a roast) ───────────────
+    word_count = len(raw_text.strip().split())
+    if word_count <= 2 and total_alpha >= 2:
+        rate_delta += 5       # punchy and snappy
+
+    # ── TOTALLY CALM / LOWERCASE / SHORT ────────────────────────────────
+    if caps_ratio < 0.1 and total_alpha >= 3:
+        rate_delta -= 5       # slightly more chill
+        pitch_delta -= 3
+
+    return pitch_delta, rate_delta
+
+
+def apply_adjustment(base_config: dict, pitch_delta: int, rate_delta: int) -> dict:
+    """
+    Combine base voice config with per-line emotion deltas.
+    Returns a new dict — doesn't mutate the original.
+    """
+    def parse_hz(s):
+        return int(re.search(r'[-+]?\d+', s).group())
+
+    def parse_rate(s):
+        return int(re.search(r'[-+]?\d+', s).group())
+
+    base_pitch = parse_hz(base_config.get('pitch', '+0Hz'))
+    base_rate = parse_rate(base_config.get('rate', '+0%'))
+
+    new_pitch = max(-50, min(50, base_pitch + pitch_delta))
+    new_rate = max(-50, min(60, base_rate + rate_delta))
+
+    pitch_str = f"+{new_pitch}Hz" if new_pitch >= 0 else f"{new_pitch}Hz"
+    rate_str  = f"+{new_rate}%" if new_rate >= 0 else f"{new_rate}%"
+
+    return {
+        'voice': base_config['voice'],
+        'rate':  rate_str,
+        'pitch': pitch_str,
+    }
 
 
 async def generate_audio(text, output_path, voice_config):
@@ -39,14 +164,15 @@ async def generate_audio(text, output_path, voice_config):
 
 
 def clean_for_tts(text: str) -> str:
-    """Strip script formatting tags, emojis, and markdown junk — leave only speakable text."""
-    # Remove ALL CAPS formatting markers but keep the words (they're expressive anyway)
-    # Strip emoji unicode ranges
+    """Strip script formatting tags and non-ASCII. Then expand abbreviations."""
+    # Strip emoji / non-ASCII
     text = re.sub(r'[^\x00-\x7F]+', '', text)
-    # Strip markdown bold/italic remnants
+    # Strip markdown
     text = re.sub(r'[*_`~]', '', text)
-    # Collapse multiple spaces
+    # Collapse spaces
     text = re.sub(r'\s+', ' ', text).strip()
+    # Expand abbreviations so TTS speaks full words
+    text = expand_abbreviations(text)
     return text
 
 
@@ -77,7 +203,7 @@ def main():
         for line in lines:
             stripped = line.strip()
 
-            # Blank lines / comment lines / title lines — pass through unchanged
+            # Blank lines / comment lines — pass through unchanged
             if not stripped or stripped.startswith('#'):
                 processed_lines.append(line)
                 continue
@@ -97,7 +223,6 @@ def main():
             if '$^' in text_part:
                 left, right = text_part.split('$^', 1)
                 text_part = left
-                # right could be: "1.5#!vine_boom" or "1.5#!vine_boom#@tts_1.mp3"
                 if '#@' in right:
                     right, existing_tts = right.split('#@', 1)
                     existing_tts = existing_tts.strip()
@@ -112,38 +237,47 @@ def main():
                 text_part = left
                 sound_part = s.strip()
 
-            # If a TTS file was already tagged (re-run scenario), keep the line
+            # Already has TTS tag (re-run) — keep as-is
             if existing_tts:
                 processed_lines.append(line)
                 continue
 
-            tts_text = clean_for_tts(text_part)
+            raw_text = text_part.strip()
+            tts_text = clean_for_tts(raw_text)
 
             if len(tts_text) > 1 and current_char is not None:
                 tts_counter += 1
                 audio_filename = f"tts_{tts_counter}.mp3"
                 audio_path = os.path.join(tts_dir, audio_filename)
 
-                v_config = VOICE_MAP.get(current_char, DEFAULT_VOICE)
-                print(f"  [TTS] {current_char} ({v_config['voice']} {v_config['rate']} {v_config['pitch']}): {tts_text[:60]}")
+                # Base voice for this character
+                base_config = VOICE_MAP.get(current_char, DEFAULT_VOICE)
+
+                # Emotion adjustment based on raw line text
+                pitch_delta, rate_delta = get_emotion_adjustment(raw_text)
+                final_config = apply_adjustment(base_config, pitch_delta, rate_delta)
+
+                emotion_tag = ""
+                if pitch_delta > 10 or rate_delta > 15:
+                    emotion_tag = " [SCREAM]"
+                elif pitch_delta < 0 or rate_delta < -10:
+                    emotion_tag = " [hesitant]"
+
+                print(f"  [TTS] {current_char}{emotion_tag} ({final_config['voice']} {final_config['rate']} {final_config['pitch']}): {tts_text[:60]}")
 
                 try:
-                    await generate_audio(tts_text, audio_path, v_config)
+                    await generate_audio(tts_text, audio_path, final_config)
 
                     clip = AudioFileClip(audio_path)
-                    # Use exact TTS duration + tiny padding — the meme sound fires separately
-                    tts_duration = round(clip.duration + 0.2, 2)
+                    # Frame duration = exact TTS length + 0.15s tail (no more desync!)
+                    tts_duration = round(clip.duration + 0.15, 2)
                     clip.close()
 
-                    # Use whichever is longer: script duration or TTS duration
-                    try:
-                        script_duration = float(duration_part) if duration_part else 1.5
-                    except ValueError:
-                        script_duration = 1.5
-                    final_duration = max(script_duration, tts_duration)
+                    # Always use TTS duration — ignore the AI-guessed duration
+                    final_duration = tts_duration
 
-                    # Rebuild the line: text$^duration#!sound#@tts_file
-                    new_line = f"{text_part.strip()}$^{final_duration}"
+                    # Rebuild line: text$^duration#!sound#@tts_file
+                    new_line = f"{raw_text}$^{final_duration}"
                     if sound_part:
                         new_line += f"#!{sound_part}"
                     new_line += f"#@{audio_filename}"
@@ -154,7 +288,7 @@ def main():
                 except Exception as e:
                     print(f"  [TTS FAIL] {e} — keeping original line")
 
-            # Fallback — keep line unchanged
+            # Fallback — keep unchanged
             processed_lines.append(line)
 
     asyncio.run(process_lines())
